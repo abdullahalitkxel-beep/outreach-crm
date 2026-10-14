@@ -1,0 +1,14 @@
+# your data and secrets never go to GitHub
+.env
+settings.yaml
+*.db
+.bot.lock
+logs/
+app.log
+bot.log
+# build output
+__pycache__/
+build/
+dist/
+*.spec
+.venv/

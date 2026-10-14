@@ -1,0 +1,286 @@
+# =====================================================================
+#  NeoSOFT outreach — configuration
+#  Items marked TODO still need your input before going live.
+# =====================================================================
+
+# ---- What you sell (the AI uses this to write each lead's opening line)
+offer: >
+  NeoSOFT provides custom product engineering, AI/GenAI, cloud and DevOps, and QA,
+  plus dedicated engineering teams (Java, .NET, Python, React, Node, Flutter and more)
+  on a team-augmentation model. Ideal clients are mid-size and enterprise companies
+  (and software product companies) that need to scale engineering without hiring in-house.
+  Proof: 1,500+ clients in 50+ countries, a 4,000+ engineer talent pool, CMMI Level 5.
+
+database: outreach.db
+currency: "$"
+sender_address: "NeoSOFT, 8 The Green, #13906, Dover, DE 19901, USA"
+
+# ---- SAFETY SWITCHES -------------------------------------------------
+# Review mode: every email becomes a draft in the CRM's Review page and only
+# sends after you approve it. Keep this on until you trust the output.
+review:
+  enabled: true
+
+# Test mode: emails are sent for real, but ALL of them go to redirect_to instead
+# of the lead (subject shows who it was meant for). Use this while inboxes warm up.
+# Turn enabled to false only when you are ready to go live.
+test_mode:
+  enabled: true
+  redirect_to: ""        # TODO: your own address, e.g. you@gmail.com
+
+# ---- When to send (prospects' time zone)
+schedule:
+  timezone: America/New_York
+  days: [1, 2, 3, 4, 5]        # Mon-Fri
+  start_hour: 9
+  end_hour: 17
+
+delay_between_sends_seconds: [60, 180]
+reply_lookback_days: 14
+
+# ---- Inboxes (passwords go in .env as SENDER1_PASSWORD, SENDER2_PASSWORD ...)
+senders:
+  - email: you@your-outreach-domain.com      # TODO
+    name: Your Name                          # TODO: the name prospects will see
+    smtp_host: smtp.example.com              # TODO: from your email provider
+    smtp_port: 587
+    imap_host: imap.example.com              # TODO
+    password_env: SENDER1_PASSWORD
+    daily_limit: 10      # inboxes are new: start at 10, raise ~5/week toward 30
+  # - email: second@your-outreach-domain.com
+  #   name: Your Name
+  #   smtp_host: smtp.example.com
+  #   smtp_port: 587
+  #   imap_host: imap.example.com
+  #   password_env: SENDER2_PASSWORD
+  #   daily_limit: 10
+
+# ---- AI
+models:
+  personalize: claude-haiku-5-5
+  classify: claude-haiku-5-5
+
+personalization:
+  enabled: true
+  fallback_line: "Growing teams like {company} often hit a wall scaling engineering without slowing the roadmap."
+
+# ---- Apollo lead sourcing ------------------------------------------------
+# apollo-preview is free; apollo-pull spends ~1 credit per person enriched.
+# Industry names must match Apollo's list exactly — run apollo-preview and
+# adjust any search that shows 0 matches.
+apollo:
+  max_per_pull: 25                   # new leads per apollo-pull run
+  allowed_email_statuses: [verified] # only Apollo-verified emails
+  common_filters:
+    person_titles: [CTO, Chief Technology Officer, VP Engineering, VP of Engineering,
+                    Head of Engineering, Head of Product, Head of IT, VP Technology,
+                    Director of Engineering]
+    person_seniorities: [c_suite, vp, head, director, founder]
+    organization_locations: [United States, United Kingdom, United Arab Emirates]
+    # Australia left out on purpose: its Spam Act generally requires consent for
+    # commercial email. Add it only after checking with your legal team.
+    organization_num_employees_ranges: ["201,500", "501,1000", "1001,5000", "5001,10000"]
+    contact_email_status: [verified]
+  searches:
+    - name: Fintech & financial services
+      filters:
+        organization_industries: [financial services, banking]
+    - name: E-commerce & retail
+      filters:
+        organization_industries: [retail, internet]
+    - name: Healthcare
+      filters:
+        organization_industries: [hospital & health care, health, wellness & fitness]
+    - name: Logistics
+      filters:
+        organization_industries: [logistics & supply chain, transportation/trucking/railroad]
+    - name: Real estate
+      filters:
+        organization_industries: [real estate]
+    - name: Software product companies (ISVs)
+      filters:
+        organization_industries: [computer software]
+        person_titles: [CTO, Co-Founder, Founder, VP Engineering, Head of Product]
+
+# ---- Company facts used inside the email templates. CONFIRM THESE before going live:
+#      the original templates promised a free proof of concept and a two-week start.
+facts:
+  team_size: "4,000+ engineers"
+  proof_point: "CMMI Level 5, with 1,500+ clients in 50+ countries"
+  trial_offer: "a no-cost 40-hour proof of concept"
+  lead_time: "two weeks"
+  stacks: "front-end (React, Angular, Vue.js), back-end (Java, .NET, Python, Node, Go) and mobile (iOS, Android, Flutter)"
+
+# ---- The sequence, built from "Email Touchpoints" (templates adapted to NeoSOFT).
+#      Each step can have several VARIANTS: each lead gets one, chosen evenly, and
+#      Reports → "Template performance" shows which one gets more replies.
+#      Placeholders: {first_name} {company} {title} {personal_line} (AI-written line)
+#      {sender_name} and the facts above: {team_size} {proof_point} {trial_offer} {lead_time} {stacks}.
+#      Follow-ups are sent as replies in the same thread.
+sequence:
+  - delay_days: 0
+    variants:
+      - name: "Transparent intro (touchpoints 1, 12)"
+        enabled: true
+        subject: "Development partner for {company}?"
+        body: |
+          Hi {first_name}, to be transparent, this is a cold email and might take you a few minutes to qualify us as your potential software development partner.
+
+          {personal_line}
+
+          At NeoSOFT, we can help you scale your development efforts with our regularly upskilled, seasoned developers, with expertise across all modern technology stacks.
+
+          With a pool of {team_size} and the ability to start within {lead_time}, we're happy to go through your evaluation process, including technical interviews and coding tests. Or we can start with {trial_offer}, no strings attached.
+
+          Timing is probably off, but would you be open to seeing how you could access a larger pool of developers?
+
+          {sender_name}
+      - name: "Stacks + proof of concept (touchpoints 5, 14, 15, 29)"
+        enabled: true
+        subject: "{first_name}, quick question"
+        body: |
+          Hi {first_name}, upfront: this is a cold email and may take 2-3 minutes to explore if we are the right fit for each other.
+
+          {personal_line}
+
+          You can benefit from our team of {team_size} specializing in {stacks}.
+
+          To make it an easy fit, you can try us with {trial_offer} and only move forward if you like our work.
+
+          Would it be a terrible idea to have a short email exchange to see if we're a fit? Then you can decide if a longer conversation is worthwhile, or not.
+
+          Let me know either way, {first_name}.
+
+          {sender_name}
+      - name: "Cut to the chase (touchpoint 17)"
+        enabled: true
+        subject: "Software development for {company}"
+        body: |
+          Hi {first_name},
+
+          I respect your time and will cut right to the chase. Are you looking for software development services at the moment or in the near future?
+
+          {personal_line}
+
+          As an established development center ({proof_point}), NeoSOFT lets you leverage seasoned engineers to build quality software products.
+
+          Would a short email exchange make sense to determine if we're a good fit?
+
+          {sender_name}
+      - name: "Considerate qualifier (touchpoints 7, 8)"
+        enabled: false
+        subject: "{company} + NeoSOFT"
+        body: |
+          Hi {first_name},
+
+          I know you must be getting tons of cold emails every day, with salespeople chasing 30 minutes on your calendar.
+
+          I'll try to be considerate: you can qualify us and let me know if you see a fit. If not, I'll get out of your hair.
+
+          Quick intro: NeoSOFT is {proof_point}. You can leverage our expertise to add velocity to your projects in:
+
+          1. Custom product engineering (modern and legacy stacks)
+          2. AI and GenAI
+          3. Cloud and DevOps
+          4. QA and testing
+          5. Dedicated engineering teams
+
+          Happy to start with {trial_offer} so you can try us before engaging on a larger project.
+
+          Would you be interested in discussing this further?
+
+          {sender_name}
+      - name: "Talent crunch (touchpoints 9, 11)"
+        enabled: false
+        subject: "Scaling engineering at {company}"
+        body: |
+          Hi {first_name}, to be transparent, this is a cold email and might take you a few minutes to qualify us as your potential software development partner.
+
+          Is your team spreading itself thin finding the right talent? At NeoSOFT, we can help you scale your development efforts up or down at will with our regularly upskilled, seasoned developers.
+
+          With a pool of {team_size} and the ability to start within {lead_time}, we're happy to go through your evaluation process, including technical interviews and coding tests. Or simply start with {trial_offer}, no strings attached.
+
+          Would it be a terrible idea to send you more information about our engagement models and pricing? If not, let me know and I'll remove your company from future emails.
+
+          Either way, good luck with your endeavours.
+
+          {sender_name}
+      - name: "Business goals (touchpoint 18)"
+        enabled: false
+        subject: "Technology choices at {company}"
+        body: |
+          Hi {first_name},
+
+          Do you need help choosing and implementing technologies that align with your business goals?
+
+          Aligning technical teams with business strategy is one of the top challenges executives face today. You can leverage our engineering talent to choose and build winning products.
+
+          In brief:
+          - You can test our engineers with {trial_offer}
+          - Experienced in staff augmentation and end-to-end development
+          - {team_size} covering {stacks}
+          - {proof_point}
+
+          Let me know either way.
+
+          {sender_name}
+      - name: "Tech needs (touchpoint 16)"
+        enabled: false
+        subject: "Help with {company}'s technology needs?"
+        body: |
+          Hi {first_name},
+
+          Do you need help with your technology needs? You can benefit from our skilled team of engineers experienced in most web and mobile technologies.
+
+          A quick introduction: NeoSOFT has {team_size} and is {proof_point}. If you want to try our services, I can offer you {trial_offer}, all in good faith.
+
+          {first_name}, would it be completely useless to share more info on our expertise and pricing?
+
+          {sender_name}
+
+  - delay_days: 3
+    variants:
+      - name: "Being upfront (touchpoints 3, 13)"
+        enabled: true
+        body: |
+          {first_name}, being upfront: are you looking for development assistance? If so, do you mind if we have a short email exchange to see if we're a fit? Or not.
+
+          To be brief, we're a software house with {team_size} working across {stacks}.
+
+          We offer {trial_offer} so you can test us and only move forward if you like the work.
+
+          Can you let me know what you decide?
+
+          {sender_name}
+      - name: "Scale this year (touchpoints 4, 6, 10)"
+        enabled: true
+        body: |
+          {first_name}, what are you doing to scale your development efforts this year? Your competitors are widening their reach across the globe to find the right talent.
+
+          Our seasoned developers cover {stacks}. Happy to go through your evaluation process of technical interviews and tests, or start with {trial_offer}, no strings attached.
+
+          Open to learning more?
+
+          {sender_name}
+
+  - delay_days: 5
+    variants:
+      - name: "No-risk trial, last note (touchpoint 2)"
+        enabled: true
+        body: |
+          Hi {first_name},
+
+          I know onboarding a new development partner can be tricky, but there is a way around it.
+
+          It typically takes about 40 hours to onboard a new development resource. With {trial_offer}, you essentially get a proof of concept before engaging us on a larger project.
+
+          Would it be a terrible idea to explore how you can find a reliable development partner without spending a dime? Or you can always say no and I won't bother you with more follow-ups.
+
+          Either way, good luck with your plans this year.
+
+          {sender_name}
+
+footer: |
+  --
+  {sender_name} · {sender_address}
+  Not relevant? Reply "unsubscribe" and I won't email again.
