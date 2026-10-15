@@ -12,6 +12,15 @@ offer: >
   Proof: 1,500+ clients in 50+ countries, a 4,000+ engineer talent pool, CMMI Level 5.
 
 database: outreach.db
+
+# ---- Publisher & legal details (shown in the app, the installer and the legal documents)
+publisher: BlacSwanken
+legal:
+  company_name: ""     # exact registered name, e.g. "BlacSwanken (Private) Limited"
+  address: ""          # registered business address
+  contact_email: "omar@blacswanken.com"    # legal & privacy contact
+  version: "1.0"
+  effective_date: "2026-10-15"
 currency: "$"
 sender_address: "NeoSOFT, 8 The Green, #13906, Dover, DE 19901, USA"
 
@@ -59,6 +68,11 @@ senders:
 models:
   personalize: claude-haiku-5-5
   classify: claude-haiku-5-5
+
+# AI reply sorting sends the text of replies to Anthropic. Off by default: replies are then sorted
+# on this computer with keyword rules. Switch on in Settings → AI & Apollo keys.
+ai_reply_sorting:
+  enabled: false
 
 personalization:
   enabled: true

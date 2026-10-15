@@ -11,6 +11,11 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      STORE_IDENTITY_NAME: ${{ vars.STORE_IDENTITY_NAME }}
+      STORE_PUBLISHER: ${{ vars.STORE_PUBLISHER }}
+      STORE_PUBLISHER_DISPLAY: ${{ vars.STORE_PUBLISHER_DISPLAY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -21,31 +26,134 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt pip-licenses
+
+      # A bootloader compiled here (instead of the stock pre-built one) is far less likely to be
+      # mistaken for malware by antivirus heuristics.
+      - name: Install PyInstaller with a freshly compiled bootloader
+        id: bootloader
+        continue-on-error: true
+        env:
+          PYINSTALLER_COMPILE_BOOTLOADER: "1"
+        run: pip install --no-binary pyinstaller pyinstaller
+
+      - name: Fall back to the standard PyInstaller
+        if: steps.bootloader.outcome == 'failure'
+        run: |
+          pip install pyinstaller
+          echo "::warning title=Bootloader::Compiling the bootloader failed; used the standard pre-built one."
+
+      - name: Prepare version info, licence text, Store manifest, third-party notices
+        run: python packaging/prepare.py ${{ github.run_number }}
 
       - name: Test from source
         run: python tests/smoke_test.py app.py
 
-      - name: Build OutreachCRM.exe
+      - name: Build app (folder build)
         run: >
-          pyinstaller --noconfirm --onefile --windowed --name OutreachCRM
+          pyinstaller --noconfirm --onedir --windowed --noupx --name OutreachCRM
           --icon assets/icon.ico
+          --version-file build/version_info.txt
           --add-data "config.yaml;."
           --add-data ".env.example;."
+          --add-data "version.txt;."
+          --add-data "legal;legal"
+          --add-data "assets/icon.png;assets"
           --hidden-import apollo
+          --hidden-import legal
+          --hidden-import secretstore
           --hidden-import bs4
           --hidden-import openpyxl
+          --hidden-import pystray._win32
           --collect-submodules anthropic
           --collect-data tzdata
           app.py
 
-      - name: Test the built .exe
-        run: python tests/smoke_test.py dist/OutreachCRM.exe
+      - name: Check publisher details in the program file
+        shell: pwsh
+        run: |
+          $v = (Get-Item dist\OutreachCRM\OutreachCRM.exe).VersionInfo
+          $summary = "Company: $($v.CompanyName) | Product: $($v.ProductName) | Version: $($v.FileVersion) | $($v.LegalCopyright)"
+          Write-Host $summary
+          Write-Host "::notice title=File properties::$summary"
+          if ($v.CompanyName -notmatch 'BlacSwanken') { throw "Publisher missing from file properties" }
+
+      - name: Test the built app
+        run: python tests/smoke_test.py dist/OutreachCRM/OutreachCRM.exe
+
+      - name: Build installer (OutreachCRM-Setup.exe)
+        shell: pwsh
+        run: |
+          $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $guess = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            if (-not (Test-Path $guess)) { choco install innosetup -y --no-progress | Out-Null }
+            $iscc = $guess
+          } else { $iscc = $iscc.Source }
+          $ver = Get-Content version.txt
+          $pub = python -c "import yaml;c=yaml.safe_load(open('config.yaml',encoding='utf-8'));print((c.get('legal') or {}).get('company_name') or c.get('publisher') or 'BlacSwanken')"
+          & $iscc "/DAppVersion=$ver" "/DPublisher=$pub" packaging\installer.iss
+          if ($LASTEXITCODE) { throw "Inno Setup failed" }
+
+      - name: Test the installer (install, run, check Windows "Installed apps" entry, uninstall)
+        shell: pwsh
+        run: |
+          Start-Process dist\OutreachCRM-Setup.exe -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER" -Wait
+          $exe = "$env:LOCALAPPDATA\Programs\Outreach CRM\OutreachCRM.exe"
+          if (-not (Test-Path $exe)) { throw "installer did not install the app" }
+          $entry = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" | Where-Object { $_.DisplayName -eq "Outreach CRM" }
+          Write-Host "::notice title=Installed apps entry::$($entry.DisplayName) $($entry.DisplayVersion) by $($entry.Publisher)"
+          if ($entry.Publisher -notmatch 'BlacSwanken') { throw "Publisher missing from Installed apps" }
+          python tests/smoke_test.py "$exe"
+          if ($LASTEXITCODE) { throw "smoke test failed on installed app" }
+          Start-Process "$env:LOCALAPPDATA\Programs\Outreach CRM\unins000.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES" -Wait
+          if (Test-Path $exe) { throw "uninstall left the app behind" }
+
+      - name: Build Microsoft Store package (OutreachCRM-Store.msix)
+        shell: pwsh
+        run: packaging\msix.ps1 -Mode pack
+
+      - name: Test the Store package (install test-signed copy, run, uninstall)
+        shell: pwsh
+        env:
+          SMOKE_TMP: ${{ github.workspace }}\smoke
+        run: |
+          New-Item $env:SMOKE_TMP -ItemType Directory -Force | Out-Null
+          packaging\msix.ps1 -Mode installtest
+          python tests/smoke_test.py "$env:LOCALAPPDATA\Microsoft\WindowsApps\OutreachCRM.exe"
+          $rc = $LASTEXITCODE
+          packaging\msix.ps1 -Mode uninstall
+          if ($rc) { throw "smoke test failed on the Store package" }
+
+      - name: Windows App Certification Kit (Store pre-check)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $appcert = "${env:ProgramFiles(x86)}\Windows Kits\10\App Certification Kit\appcert.exe"
+          if (-not (Test-Path $appcert)) { Write-Host "::warning title=App Certification Kit::Not installed on this runner"; exit 0 }
+          & $appcert reset | Out-Null
+          & $appcert test -appxpackagepath "$pwd\build\OutreachCRM-citest.msix" -reportoutputpath "$pwd\build\wack.xml"
+          python packaging/wack_summary.py build/wack.xml
+
+      - name: Microsoft Defender scan
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          if (-not (Test-Path $mp)) { Write-Host "::warning title=Defender::Not available on this runner"; exit 0 }
+          & $mp -SignatureUpdate | Out-Null
+          & $mp -Scan -ScanType 3 -File "$pwd\dist" -DisableRemediation | Tee-Object build\defender.txt
+          $code = $LASTEXITCODE
+          if ($code -eq 0) { Write-Host "::notice title=Defender::No threats found in the app, installer or Store package" }
+          elseif ($code -eq 2) { Write-Host "::error title=Defender::Threats reported: $(Get-Content build\defender.txt -Raw)"; exit 1 }
+          else { Write-Host "::warning title=Defender::Scan could not run (exit $code)" }
 
       - uses: actions/upload-artifact@v4
         with:
           name: OutreachCRM-windows
-          path: dist/OutreachCRM.exe
+          path: |
+            dist/OutreachCRM-Setup.exe
+            dist/OutreachCRM-Store.msix
 
       - name: Publish release (only after every test passed)
         if: github.ref == 'refs/heads/main'
@@ -56,7 +164,11 @@ jobs:
           target_commitish: ${{ github.sha }}
           make_latest: true
           body: |
-            Download **OutreachCRM.exe** below and double-click it.
-            First time: if Windows shows "Windows protected your PC", click **More info → Run anyway** (the app isn't code-signed).
-            Your data stays in %APPDATA%\OutreachCRM, so replacing the .exe with a newer version keeps everything.
-          files: dist/OutreachCRM.exe
+            **OutreachCRM-Setup.exe**: install on your PC (per-user, no admin rights needed). Shows the licence agreement and registers BlacSwanken as publisher.
+            **OutreachCRM-Store.msix**: upload this to Microsoft Partner Center for the Store listing. (It isn't meant to be double-clicked; the Store signs it.)
+
+            Until the Store version is live, Windows may show "Windows protected your PC" for the installer: click **More info → Run anyway**.
+            Your data stays in %APPDATA%\OutreachCRM, so updating keeps everything.
+          files: |
+            dist/OutreachCRM-Setup.exe
+            dist/OutreachCRM-Store.msix

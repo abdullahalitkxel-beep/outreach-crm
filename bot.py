@@ -40,9 +40,30 @@ from dotenv import load_dotenv
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 
 
+def _package_family():
+    """Package family name when running as a Microsoft Store (MSIX) app, else None."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        n = wintypes.UINT(0)
+        if ctypes.windll.kernel32.GetCurrentPackageFamilyName(ctypes.byref(n), None) == 15700:  # no package
+            return None
+        buf = ctypes.create_unicode_buffer(n.value)
+        if ctypes.windll.kernel32.GetCurrentPackageFamilyName(ctypes.byref(n), buf) == 0:
+            return buf.value
+    except Exception:
+        pass
+    return None
+
+
 def _data_dir():
+    pfn = None if os.getenv("OUTREACH_HOME") else _package_family()
     if os.getenv("OUTREACH_HOME"):
         d = Path(os.environ["OUTREACH_HOME"])
+    elif pfn:  # Store app: the package's own data folder (removed cleanly on uninstall)
+        d = Path(os.getenv("LOCALAPPDATA", Path.home())) / "Packages" / pfn / "LocalState" / "OutreachCRM"
     elif getattr(sys, "frozen", False):
         if sys.platform == "win32":
             d = Path(os.getenv("APPDATA", Path.home())) / "OutreachCRM"
@@ -60,7 +81,16 @@ def _data_dir():
 
 
 DATA = _data_dir()
-load_dotenv(DATA / ".env")
+load_dotenv(DATA / ".env")  # non-secret overrides only; secrets live encrypted in secrets.dat
+
+from secretstore import SecretStore  # noqa: E402
+
+SECRETS = SecretStore(DATA)
+try:
+    SECRETS.migrate_env_file(DATA / ".env")
+except Exception as _e:
+    print("secrets migration:", _e, file=sys.stderr)
+SECRETS.apply_to_environ()
 log = logging.getLogger("outreach")
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -317,25 +347,28 @@ def fetch_site_text(url, limit=4000):
 
 
 def personalize(cfg, lead):
+    """One personalised opening line. Privacy: the AI only sees business information — the company's
+    public website text, company name, job title and industry — never the contact's name, email,
+    LinkedIn or other personal details."""
     pc = cfg["personalization"]
     fallback = pc["fallback_line"].format_map(SafeDict(company=short_company(lead["company"]) or "your team"))
     if not pc.get("enabled"):
         return fallback
     site = fetch_site_text(lead["website"])
     extra = json.loads(lead["extra"] or "{}")
-    prompt = f"""You write the opening line of a cold email.
+    business = {k: extra[k] for k in ("title", "industry") if extra.get(k)}
+    prompt = f"""You write the opening line of a B2B cold email.
 
 What we offer: {cfg['offer']}
 
-Prospect:
-- Name: {lead['first_name'] or 'unknown'}
-- Company: {lead['company'] or 'unknown'}
-- Other info: {json.dumps(extra) if extra else 'none'}
-- Website text: {site or 'not available'}
+The prospect's company:
+- Company: {short_company(lead['company']) or 'unknown'}
+- Recipient's job title and industry: {json.dumps(business) if business else 'unknown'}
+- Text from the company's public website: {site or 'not available'}
 
-Write ONE sentence (max 30 words) that shows we looked at their business specifically
-and leads naturally toward our offer. Rules: reference a concrete detail from the info
-above; no flattery clichés ("I love what you're doing"); no questions; never invent facts.
+Write ONE sentence (max 30 words) addressed to the recipient that shows we looked at their company
+specifically and leads naturally toward our offer. Rules: reference a concrete detail from the info
+above; don't use any person's name; no flattery clichés; no questions; never invent facts.
 If there isn't enough specific information, output exactly: NONE
 Output only the sentence."""
     line = llm(cfg, "personalize", prompt)
@@ -351,6 +384,8 @@ def classify_reply(cfg, msg, body):
     auto = (msg.get("Auto-Submitted", "") + msg.get("X-Autoreply", "")).lower()
     if auto and auto != "no":
         return "out_of_office"
+    if not (cfg.get("ai_reply_sorting") or {}).get("enabled"):
+        return keyword_label(low)  # default: sorted on this computer; reply text isn't sent anywhere
     prompt = f"""Classify this reply to a cold sales email. Answer with exactly one label from:
 {', '.join(REPLY_LABELS)}
 (referral = they point us to someone else; other = anything that needs a human look)
@@ -430,7 +465,9 @@ def send_email(sender, to, subject, body, in_reply_to=None, dry_run=False):
 
     port = sender.get("smtp_port", 587)
     user = sender.get("username", sender["email"])
-    if sender.get("smtp_security") == "none":  # local test servers only
+    if sender.get("smtp_security") == "none":  # local test mail servers only — never sends credentials
+        if sender["smtp_host"] not in ("127.0.0.1", "localhost", "::1"):
+            raise ValueError("Unencrypted SMTP is only allowed for a local test server")
         with smtplib.SMTP(sender["smtp_host"], port, timeout=30) as s:
             s.send_message(msg)
     elif port == 465:
@@ -493,6 +530,10 @@ def regenerate_draft(cfg, con, draft_id):
 
 
 def cmd_run(cfg, con, args):
+    lg_ver = str((cfg.get("legal") or {}).get("version", "1.0"))
+    if str((cfg.get("legal_acceptance") or {}).get("version")) != lg_ver and not args.dry_run:
+        print("PROBLEM: Open Outreach CRM and accept the Terms of Use first.")
+        sys.exit(1)
     if not args.force and not in_send_window(cfg):
         print("Outside the sending window; nothing sent (use --force to override).")
         return
@@ -898,7 +939,7 @@ def cmd_suppress(cfg, con, args):
 def cmd_selfcheck(cfg, con, args):
     """Verify every library the app loads on demand is present (used by the Windows build test)."""
     problems = []
-    for mod in ("anthropic", "bs4", "openpyxl", "yaml", "requests", "dotenv", "flask", "apollo"):
+    for mod in ("anthropic", "bs4", "openpyxl", "yaml", "requests", "dotenv", "flask", "apollo", "legal", "secretstore", "pystray", "PIL"):
         try:
             __import__(mod)
         except Exception as e:
@@ -908,6 +949,24 @@ def cmd_selfcheck(cfg, con, args):
         in_send_window(cfg)
     except Exception as e:
         problems.append(f"time zones: {e}")
+    try:  # secrets round-trip through the encrypted store
+        import secretstore
+        st = secretstore.SecretStore(DATA)
+        before = st.load()
+        st.set("SELFCHECK_PROBE", "probe-1234")
+        assert secretstore.SecretStore(DATA).load().get("SELFCHECK_PROBE") == "probe-1234"
+        assert b"probe-1234" not in (DATA / "secrets.dat").read_bytes() or not secretstore.ENCRYPTED
+        st.save(before)
+        print("secrets: encrypted with Windows DPAPI" if secretstore.ENCRYPTED else "secrets: development mode (not encrypted)")
+    except Exception as e:
+        problems.append(f"secret store: {e}")
+    try:
+        import legal
+        for d in legal.DOCS:
+            assert "{{" not in legal.source(d, cfg)
+        print("legal documents: OK, version", legal.app_version())
+    except Exception as e:
+        problems.append(f"legal documents: {e}")
     for p in problems:
         print("PROBLEM:", p)
     print("SELFCHECK OK" if not problems else "SELFCHECK FAILED")

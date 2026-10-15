@@ -152,6 +152,7 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
 .switch input{display:none}.switch span{width:36px;height:20px;border-radius:10px;background:#c9c9c9;position:relative;flex:none;transition:.2s}
 .switch span:after{content:"";position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:2px;left:2px;transition:.2s}
 .switch input:checked+span{background:var(--brand)}.switch input:checked+span:after{left:18px}
+.legal h1{font-size:22px;margin-bottom:4px}.legal h2{font-size:16px;margin:22px 0 6px}.legal p,.legal li{line-height:1.6}
 /* tour */
 #tour-dim{position:fixed;inset:0;z-index:90;display:none}
 #tour-spot{position:fixed;z-index:91;border-radius:6px;box-shadow:0 0 0 9999px rgba(8,7,7,.55);transition:all .25s;pointer-events:none}
@@ -175,17 +176,18 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
     <a href="{{ url_for('setup') }}">Getting started checklist</a>
     <button onclick="resetHelp()">Show all help tips again</button>
     <a href="{{ url_for('settings') }}">Settings</a>
+    <a href="{{ url_for('about') }}">About &amp; legal</a>
     <form method="post" action="{{ url_for('quit_app') }}" onsubmit="return confirm('Stop Outreach CRM? Automatic runs stop until you open it again.')"><button>Quit the app</button></form>
    </div>
   </div>
  </div>
 </div>
-<nav class="nav">
+{% if request.endpoint != 'welcome' %}<nav class="nav">
  <span class="app"><svg width="18" height="18" viewBox="0 0 24 24"><path d="M4 4h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4zM4 10h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4zM4 16h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4z"/></svg>Outreach</span>
  {% for ep, label, extra in nav_items %}
  <a class="tab {{ 'on' if active == ep }}" id="nav-{{ ep }}" href="{{ url_for(ep) }}">{{ label }}{% if extra %} <span class="pill">{{ extra }}</span>{% endif %}</a>
  {% endfor %}
-</nav>
+</nav>{% endif %}
 <main>
 {% if request.args.get('msg') %}<div class="toast {{ 'err' if request.args.get('err') }}">{{ request.args.get('msg') }}</div>{% endif %}
 {% block body %}{% endblock %}
@@ -193,6 +195,9 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
 <div id="tour-dim"><div id="tour-spot"></div><div id="tour-pop"><h3></h3><p></p><div class="ft"><span></span>
 <button class="btn sm" id="tour-skip">Skip</button><button class="btn sm" id="tour-back">Back</button><button class="btn brand sm" id="tour-next">Next</button></div></div></div>
 <script>
+// ---- tell the app this window is open (it quits ~45s after the last window closes, unless auto-run is on)
+function beat(){ try{ fetch('/heartbeat',{method:'POST',keepalive:true}); }catch(e){} }
+beat(); setInterval(beat, 10000);
 // ---- dismissible help boxes
 function ls(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v)}catch(e){return null}}
 document.querySelectorAll('.help[data-id]').forEach(function(h){
@@ -248,7 +253,7 @@ document.getElementById('tour-next').onclick=function(){ if(ti===TOUR.length-1){
 document.getElementById('tour-back').onclick=function(){ if(ti>0){ti--;placeTour();} };
 document.getElementById('tour-skip').onclick=endTour;
 addEventListener('resize',function(){ if(document.getElementById('tour-dim').style.display==='block') placeTour(); });
-addEventListener('load',function(){ startTour(false); });
+addEventListener('load',function(){ if(location.pathname.indexOf('/welcome')!==0 && location.pathname.indexOf('/legal')!==0) startTour(false); });
 </script>
 {% block scripts %}{% endblock %}
 </body></html>"""
@@ -367,7 +372,7 @@ LEADS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block tit
  <div class="card-h"><h2>{{ rows|length }} lead(s){% if rows|length == 500 %} (first 500){% endif %}</h2>
   <select name="action" style="width:auto"><option value="">Bulk action…</option>
    {% for s in stages if s not in ('converted',) %}<option value="stage:{{ s }}">Change stage to {{ s|title }}</option>{% endfor %}
-   <option value="pause">Pause emails</option><option value="resume">Resume emails</option><option value="suppress">Do not contact</option></select>
+   <option value="pause">Pause emails</option><option value="resume">Resume emails</option><option value="suppress">Do not contact</option><option value="delete">Delete permanently</option></select>
   <button class="btn" onclick="return this.form.action.value ? confirm('Apply to the selected leads?') : false">Apply</button></div>
  {% if rows %}<div class="scroll"><table class="tbl"><thead><tr><th><input type="checkbox" id="selall" style="width:auto"></th>
   {% for key, label in [('name','Name'),('fit','Fit'),('title','Title'),('company','Company'),('stage','Stage'),('status','Emails'),('source','Source'),('created','Created')] %}
@@ -376,7 +381,8 @@ LEADS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block tit
   <td><a href="{{ url_for('lead', lead_id=l.id) }}"><b>{{ l.name }}</b></a><br><span class="muted">{{ l.email }}</span></td>
   <td>{{ m.fit(l.fit) }}</td><td>{{ l.title }}</td><td>{{ l.company }}</td><td>{{ m.stage_badge(l.stage) }}</td>
   <td>{{ m.status_badge(l.status, status_labels) }}</td><td class="muted">{{ l.source }}</td><td class="nowrap muted">{{ l.created_at[:10] }}</td></tr>{% endfor %}</tbody></table></div>
- {% else %}<div class="empty"><b>No leads match</b>Import a spreadsheet, add one by hand, or use <i>Find leads in Apollo</i>.<br><br><a class="btn brand" href="{{ url_for('import_page') }}">Import leads</a></div>{% endif %}
+ {% else %}<div class="empty"><b>No leads match</b>Import a spreadsheet, add one by hand, or use <i>Find leads in Apollo</i>.<br><br><a class="btn brand" href="{{ url_for('import_page') }}">Import leads</a>
+ <button class="btn" formaction="{{ url_for('sample_load') }}" formmethod="post">Add sample leads</button></div>{% endif %}
 </form>
 {% endif %}
 {% endblock %}"""
@@ -451,6 +457,11 @@ LEAD = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block titl
   <form method="post" action="{{ url_for('lead_stage', lead_id=l.id) }}" style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line2)">
    <span class="muted">Not a fit?</span> <button class="btn" name="stage" value="unqualified">Mark as unqualified</button></form>
  </div></div>{% endif %}
+ <div class="card"><div class="card-h"><h2>Delete this lead</h2></div><div class="card-b">
+  <form method="post" action="{{ url_for('delete_lead', lead_id=l.id) }}" onsubmit="return confirm('Permanently delete {{ l.name }} and all their emails, notes and history?')">
+  <p class="muted" style="margin-top:0">Erases the contact and their entire history, e.g. when they ask you to delete their data.</p>
+  <label style="display:flex;gap:6px;align-items:center;color:var(--ink)"><input type="checkbox" name="keep_blocked" value="1" checked style="width:auto"> Keep their address on the do-not-contact list so they're never emailed or imported again</label>
+  <button class="btn danger" style="margin-top:10px">Delete permanently</button></form></div></div>
 </div><div>
  {% with lead_id=l.id, opp_id=None %}""" + COMPOSER + r"""{% endwith %}
  <div class="card"><div class="card-h"><h2>Activity</h2></div><div class="card-b">""" + TIMELINE + r"""</div></div>
@@ -595,6 +606,7 @@ SETUP = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block tit
  {% if s.action %}<form method="post" action="{{ url_for('job_start') }}" style="display:inline"><input type="hidden" name="cmd" value="{{ s.action }}">{% if s.arg %}<input type="hidden" name="max" value="{{ s.arg }}">{% endif %}
   <button class="btn {{ 'brand' if not s.ok and loop.index0 == next_idx }}" {{ 'disabled' if s.blocked and not s.ok }}>{{ s.button }}</button></form>{% endif %}
  {% if s.link %}<a class="btn {{ 'brand' if not s.ok and loop.index0 == next_idx }}" href="{{ s.link }}">{{ s.link_text }}</a>{% endif %}
+ {% if s.sample %}<form method="post" action="{{ url_for('sample_remove' if s.has_sample else 'sample_load') }}" style="display:inline"><button class="btn">{{ 'Remove sample leads' if s.has_sample else 'Add sample leads' }}</button></form>{% endif %}
  {% if s.blocked and not s.ok %}<span class="muted"> Finish step {{ s.blocked }} first.</span>{% endif %}
 </div></div>{% endfor %}</div>
 {% endblock %}"""
@@ -685,9 +697,9 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <p class="hint">Keep this on while your inboxes warm up. Subjects show who each email was meant for. Turn it off to go live.</p>
  <label class="switch"><input type="checkbox" name="review" {{ 'checked' if (c.review or {}).enabled }}><span></span><b>Review before sending</b> &mdash; every email waits for my approval</label>
  <p class="hint">Recommended for at least the first few weeks.</p>
- <label class="switch"><input type="checkbox" name="autorun" {{ 'checked' if (c.autorun or {}).enabled }}><span></span><b>Run automatically</b> while the app is open</label>
+ <label class="switch"><input type="checkbox" name="autorun" {{ 'checked' if (c.autorun or {}).enabled }}><span></span><b>Run automatically</b> and keep running in the background</label>
  <div style="max-width:220px"><label>Every</label><select name="every_minutes">{% for mins, lbl in [(30,'30 minutes'),(60,'hour'),(120,'2 hours'),(240,'4 hours')] %}<option value="{{ mins }}" {{ 'selected' if (c.autorun or {}).every_minutes == mins or (not (c.autorun or {}).every_minutes and mins == 60) }}>{{ lbl }}</option>{% endfor %}</select></div>
- <p class="hint">Each run drafts emails for due leads, sends approved ones (only in your sending hours, unless test mode is on) and checks for replies.</p>
+ <p class="hint">Each run drafts emails for due leads, sends approved ones (only in your sending hours, unless test mode is on) and checks for replies. When this is on, closing the window leaves the app running with an icon next to the clock (right-click it to open or quit). When it's off, closing the window quits the app.</p>
  <button class="btn brand" style="margin-top:12px">Save</button></form></div></div>
 
 {% elif tab == 'keys' %}
@@ -696,6 +708,8 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <label>Anthropic API key {% if keys.ANTHROPIC_API_KEY %}<span class="badge b-ok">saved {{ keys.ANTHROPIC_API_KEY }}</span>{% endif %}</label>
  <div class="inline"><input name="ANTHROPIC_API_KEY" type="password" autocomplete="off" placeholder="sk-ant-…"><button class="btn" name="test" value="ai" style="flex:0">Save &amp; test</button></div>
  <p class="hint">Writes each lead's personalised opening line and sorts replies. Get one at <a href="https://console.anthropic.com" target="_blank" rel="noopener">console.anthropic.com</a> → API keys.</p>
+ <label class="switch"><input type="checkbox" name="ai_reply_sorting" {{ 'checked' if (c.ai_reply_sorting or {}).enabled }}><span></span><b>Use AI to sort replies</b> (optional)</label>
+ <p class="hint">Off: replies are sorted on this computer with keyword rules, and their text isn't sent anywhere. On: reply text is sent to Anthropic for more accurate sorting. Openers never include the contact's name or email; the AI only sees their company's website, company name and job title.</p>
  <label>Apollo API key (optional) {% if keys.APOLLO_API_KEY %}<span class="badge b-ok">saved {{ keys.APOLLO_API_KEY }}</span>{% endif %}</label>
  <div class="inline"><input name="APOLLO_API_KEY" type="password" autocomplete="off" placeholder="Apollo key"><button class="btn" name="test" value="apollo" style="flex:0">Save &amp; test</button></div>
  <p class="hint">Finds new leads with verified emails. In Apollo: Settings → Integrations → API.</p>
@@ -770,9 +784,63 @@ document.querySelectorAll('select.prov').forEach(function(sel){ sel.onchange=fun
 }});
 </script>{% endblock %}"""
 
+WELCOME = r"""{% extends 'base.html' %}{% block title %}Welcome to Outreach CRM{% endblock %}{% block body %}
+<div class="card" style="max-width:760px;margin:24px auto"><div class="card-b" style="padding:28px 32px">
+ <div style="display:flex;gap:14px;align-items:center"><div class="logo" style="width:48px;height:48px;font-size:22px">O</div>
+ <div><h1 style="font-size:22px">Welcome to Outreach CRM</h1><div class="muted">by {{ publisher }} · version {{ app_version }}</div></div></div>
+ <p style="margin-top:18px">Before you start, please read and accept the terms. Short version:</p>
+ <ul style="line-height:1.8">
+  <li><b>Your data stays on this computer.</b> {{ publisher }} never receives it. No accounts, no tracking.</li>
+  <li><b>You are the sender.</b> Emails go out from your own inbox, and you're responsible for following anti-spam and privacy laws.</li>
+  <li><b>Nothing is sent until you approve it.</b> Test mode and review mode are on from the start.</li>
+  <li>Data is shared only with services you choose to connect (your email provider, and optionally Anthropic, Apollo and Slack).</li>
+ </ul>
+ <p><a href="{{ url_for('legal_doc', doc='terms') }}" target="_blank">Terms of Use</a> · <a href="{{ url_for('legal_doc', doc='privacy') }}" target="_blank">Privacy Policy</a> · <a href="{{ url_for('legal_doc', doc='acceptable-use') }}" target="_blank">Acceptable Use Policy</a> · <a href="{{ url_for('legal_doc', doc='third-party') }}" target="_blank">Third-Party Notices</a></p>
+ {% if accepted %}<div class="toast">You've accepted these terms. <a href="{{ url_for('home') }}" style="color:#fff;text-decoration:underline">Go to the app</a></div>{% else %}
+ <form method="post" action="{{ url_for('accept_terms') }}">
+  <label style="display:flex;gap:10px;align-items:flex-start;color:var(--ink);font-size:14px;margin-top:16px"><input type="checkbox" name="agree" value="1" style="width:auto;margin-top:3px">
+  <span>I have read and accept the Terms of Use and the Acceptable Use Policy, and I have read the Privacy Policy.</span></label>
+  <button class="btn brand" style="margin-top:16px;height:38px;padding:0 22px">Accept and continue</button>
+  <span class="muted" style="margin-left:10px">Don't agree? Close the app and uninstall it.</span>
+ </form>{% endif %}
+</div></div>
+{% endblock %}"""
+
+LEGAL = r"""{% extends 'base.html' %}{% block title %}{{ title }}{% endblock %}{% block body %}
+<div class="card legal" style="max-width:900px;margin:0 auto"><div class="card-b" style="padding:24px 32px">
+<p class="muted" style="margin-top:0"><a href="{{ url_for('about') }}">← About &amp; legal</a></p>
+{% if body %}{{ body|safe }}{% else %}<h1>{{ title }}</h1><p class="muted">Outreach CRM includes the open-source software listed below. Each component is licensed under its own terms, reproduced here.</p><pre class="log" style="background:#f8f8f8;color:var(--ink);max-height:none">{{ text }}</pre>{% endif %}
+</div></div>
+{% endblock %}"""
+
+ABOUT = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}About{% endblock %}{% block body %}
+{% call m.header('t-setup', 'i', 'About', 'Outreach CRM') %}{% endcall %}
+<div class="cols"><div>
+ <div class="card"><div class="card-h"><h2>About this app</h2></div><div class="card-b"><table class="tbl">
+  <tr><td class="muted" style="width:180px">Product</td><td>Outreach CRM</td></tr>
+  <tr><td class="muted">Version</td><td>{{ version }}</td></tr>
+  <tr><td class="muted">Publisher</td><td>{{ lg.company_name }}</td></tr>
+  <tr><td class="muted">Contact</td><td>{{ lg.contact_email }}</td></tr>
+  <tr><td class="muted">Terms accepted</td><td>{{ accepted_at[:16].replace('T', ' ') ~ ' UTC' if accepted_at else 'Not yet' }}</td></tr>
+ </table></div></div>
+ <div class="card"><div class="card-h"><h2>Your data</h2></div><div class="card-b">
+  <p style="margin-top:0">Everything is stored on this computer, in:<br><code>{{ data_dir }}</code></p>
+  <p>Passwords and API keys: {% if encrypted %}<span class="badge b-ok">encrypted with Windows Data Protection</span>{% else %}<span class="badge b-warn">stored with owner-only file permissions (development mode)</span>{% endif %}</p>
+  <form method="post" action="{{ url_for('open_data_folder') }}"><button class="btn">Open data folder</button> <a class="btn" href="{{ url_for('export') }}">Export leads (CSV)</a></form>
+  <p class="hint">Back up <code>outreach.db</code> from that folder to keep a copy of your CRM.</p></div></div>
+</div><div>
+ <div class="card"><div class="card-h"><h2>Legal</h2></div><div class="card-b" style="line-height:2">
+  <a href="{{ url_for('legal_doc', doc='terms') }}">Terms of Use</a><br>
+  <a href="{{ url_for('legal_doc', doc='privacy') }}">Privacy Policy</a><br>
+  <a href="{{ url_for('legal_doc', doc='acceptable-use') }}">Acceptable Use Policy</a><br>
+  <a href="{{ url_for('legal_doc', doc='third-party') }}">Third-Party Notices</a></div></div>
+ <div class="card"><div class="card-b muted" style="font-size:12px">© 2026 {{ lg.company_name }}. All rights reserved. Outreach CRM is not affiliated with Salesforce, Microsoft, Google, Anthropic or Apollo.io.</div></div>
+</div></div>
+{% endblock %}"""
+
 TEMPLATES = {
     "base.html": BASE, "macros.html": MACROS, "home.html": HOME, "leads.html": LEADS, "lead.html": LEAD,
     "accounts.html": ACCOUNTS, "account.html": ACCOUNT, "opps.html": OPPS, "opp.html": OPP,
     "tasks.html": TASKS, "reports.html": REPORTS, "review.html": REVIEW, "setup.html": SETUP,
-    "job.html": JOB, "settings.html": SETTINGS, "jobs.html": JOBS, "new.html": NEW_LEAD, "import.html": IMPORT, "search.html": SEARCH,
+    "job.html": JOB, "settings.html": SETTINGS, "welcome.html": WELCOME, "legal.html": LEGAL, "about.html": ABOUT, "jobs.html": JOBS, "new.html": NEW_LEAD, "import.html": IMPORT, "search.html": SEARCH,
 }

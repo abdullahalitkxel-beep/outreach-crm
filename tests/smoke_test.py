@@ -14,7 +14,7 @@ from pathlib import Path
 import requests
 
 target = sys.argv[1]
-home = Path(tempfile.mkdtemp(prefix="outreach-home-"))
+home = Path(tempfile.mkdtemp(prefix="outreach-home-", dir=os.getenv("SMOKE_TMP") or None))
 env = {**os.environ, "OUTREACH_HOME": str(home), "OUTREACH_NO_WINDOW": "1", "OUTREACH_PORT": "8799"}
 cmd = [target] if target.endswith(".exe") or os.access(target, os.X_OK) and not target.endswith(".py") else [sys.executable, target]
 base = "http://127.0.0.1:8799"
@@ -46,7 +46,18 @@ try:
         time.sleep(1)
     else:
         check(False, "app started and served the Getting Started page")
-    check(True, "app started and served the Getting Started page")
+    check(True, "app started")
+    r = requests.get(base + "/", timeout=10, allow_redirects=False)
+    check(r.status_code == 302 and "/welcome" in r.headers.get("Location", ""), "first launch asks to accept the terms")
+    w = requests.get(base + "/welcome", timeout=10).text
+    check("by BlacSwanken" in w, "welcome screen shows publisher BlacSwanken")
+    for d in ("terms", "privacy", "acceptable-use", "third-party"):
+        r = requests.get(base + f"/legal/{d}", timeout=10)
+        check(r.status_code == 200 and "{{" not in r.text, f"legal document /legal/{d}")
+    tp = requests.get(base + "/legal/third-party", timeout=10).text
+    check("flask" in tp.lower() and "Python Software Foundation" in tp, "third-party notices list bundled components")
+    r = requests.post(base + "/legal/accept", data={"agree": "1"}, timeout=10)
+    check(r.status_code == 200, "terms accepted")
     check((home / "config.yaml").exists(), "default config copied into the data folder")
     sc = subprocess.run(cmd + ["--bot", "selfcheck"], env=env, capture_output=True, text=True, timeout=120)
     sc_out = (sc.stdout or "") + (sc.stderr or "")
@@ -64,7 +75,11 @@ try:
     r = s.post(base + "/settings/inbox", data={"provider1": "gmail", "email1": "tester@example-outreach.com",
                                                 "name1": "Tester", "password1": "pw-1234", "daily_limit1": "10"})
     check(r.status_code == 200 and "Inboxes saved" in r.text, "settings: inbox saved")
-    check("SENDER1_PASSWORD=pw-1234" in (home / ".env").read_text(), "settings: password stored in .env")
+    leaked = [f.name for f in home.rglob("*") if f.is_file() and b"pw-1234" in f.read_bytes()]
+    check(not leaked or os.name != "nt", f"password not stored in plain text anywhere (found in: {leaked})")
+    check("1234" in s.get(base + "/settings?tab=inbox").text, "saved password is recognised (masked) after encryption")
+    a = s.get(base + "/about").text
+    check("BlacSwanken" in a and ("encrypted with Windows Data Protection" in a or os.name != "nt"), "About page: publisher and encryption status")
     r = s.post(base + "/settings/safety", data={"test_mode": "on", "redirect_to": "me@example.com", "review": "on"})
     check("Saved" in r.text, "settings: safety saved")
 
@@ -83,6 +98,10 @@ try:
     check("Drafted 2 new for review" in page, "bot run via --bot: 2 drafts created")
     r = s.get(base + "/review")
     check(r.text.count('id="d') == 2 and "Example Corp" in r.text, "review queue shows the 2 drafts")
+    r = s.post(base + "/sample/load")
+    check("Added 6 sample leads" in r.text, "sample data can be added (for reviewers)")
+    r = s.post(base + "/sample/remove")
+    check("Removed 6 sample leads" in r.text, "sample data can be removed")
     ok = True
 finally:
     try:

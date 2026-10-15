@@ -1,8 +1,10 @@
 """
 Outreach CRM desktop launcher (this is what OutreachCRM.exe runs).
 
-- Double-click: starts the CRM in the background and opens it in its own app window.
-  Opening it again while it's running just brings up another window.
+- Double-click: starts the CRM and opens it in its own app window. Opening it again while it's
+  running just brings up another window.
+- Closing the window quits the app, unless "Run automatically" is on in Settings → Safety; then it
+  keeps running in the background with a tray icon (Open / Quit) next to the clock.
 - `OutreachCRM.exe --bot <command>`: runs a bot command (used internally by the CRM's buttons).
 """
 import os
@@ -10,11 +12,13 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from pathlib import Path
 
 PORT = int(os.getenv("OUTREACH_PORT", "8765"))
 URL = f"http://127.0.0.1:{PORT}"
+APP_NAME = "Outreach CRM"
 
 
 def _ensure_stdio(log_path):
@@ -55,6 +59,52 @@ def open_window(url=URL):
     webbrowser.open(url)
 
 
+def shutdown():
+    print("Outreach CRM: shutting down")
+    os._exit(0)
+
+
+def watchdog(crm, tray_ref):
+    """Quit when the window has been closed, unless automatic runs are switched on.
+    The page pings /heartbeat every 10 seconds while it's open."""
+    started = time.time()
+    while True:
+        time.sleep(5)
+        try:
+            c = crm.cfg()
+            keep = bool((c.get("autorun") or {}).get("enabled"))
+            idle = time.time() - (crm.LAST_SEEN or started)
+            busy = crm.job_running()
+            limit = 45 if crm.LAST_SEEN else 180  # first window gets longer to appear
+            if not keep and not busy and idle > limit and not os.getenv("OUTREACH_NO_WINDOW"):
+                if tray_ref.get("icon"):
+                    tray_ref["icon"].stop()
+                shutdown()
+        except Exception as e:  # never let the watchdog crash the app
+            print("watchdog:", e)
+
+
+def run_tray(tray_ref):
+    """Tray icon with Open / Quit. Returns False if a tray isn't available (then the server runs normally)."""
+    if os.getenv("OUTREACH_NO_WINDOW"):
+        return False
+    try:
+        import pystray
+        from PIL import Image
+        here = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+        image = Image.open(here / "assets" / "icon.png")
+        icon = pystray.Icon("OutreachCRM", image, f"{APP_NAME} is running", menu=pystray.Menu(
+            pystray.MenuItem(f"Open {APP_NAME}", lambda: open_window(), default=True),
+            pystray.MenuItem("Quit", lambda i: (i.stop(), shutdown())),
+        ))
+        tray_ref["icon"] = icon
+        icon.run()
+        return True
+    except Exception as e:
+        print("tray unavailable:", e)
+        return False
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--bot":
         import bot
@@ -71,10 +121,16 @@ def main():
         return
 
     import crm
+    tray_ref = {}
     threading.Thread(target=crm._autorun_loop, daemon=True).start()
+    threading.Thread(target=watchdog, args=(crm, tray_ref), daemon=True).start()
+    server = threading.Thread(target=lambda: crm.app.run(host="127.0.0.1", port=PORT, threaded=True, use_reloader=False),
+                              daemon=True)
+    server.start()
     threading.Timer(1.0, open_window).start()
     print(f"Outreach CRM running at {URL} (data folder: {bot.DATA})")
-    crm.app.run(host="127.0.0.1", port=PORT, threaded=True, use_reloader=False)
+    if not run_tray(tray_ref):
+        server.join()
 
 
 if __name__ == "__main__":

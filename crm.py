@@ -79,6 +79,39 @@ def require_password():
             return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="CRM"'})
 
 
+LAST_SEEN = None  # last time an app window pinged /heartbeat
+
+
+@app.post("/heartbeat")
+def heartbeat():
+    global LAST_SEEN
+    import time as _t
+    LAST_SEEN = _t.time()
+    return ("", 204)
+
+
+def job_running():
+    con = db_connect(cfg().get("database", "outreach.db"))
+    try:
+        return con.execute("SELECT 1 FROM jobs WHERE status='running'").fetchone() is not None
+    finally:
+        con.close()
+
+
+OPEN_ENDPOINTS = {"welcome", "accept_terms", "legal_doc", "about", "heartbeat", "quit_app", "static"}
+
+
+def terms_accepted():
+    acc = (cfg().get("legal_acceptance") or {})
+    return str(acc.get("version")) == str((cfg().get("legal") or {}).get("version", "1.0"))
+
+
+@app.before_request
+def require_terms():
+    if request.endpoint and request.endpoint not in OPEN_ENDPOINTS and not terms_accepted():
+        return redirect(url_for("welcome"))
+
+
 def today():
     return date.today().isoformat()
 
@@ -90,6 +123,11 @@ def money(v):
 def test_redirect():
     tm = cfg().get("test_mode") or {}
     return tm.get("redirect_to") if tm.get("enabled") else None
+
+
+def legal_docs_version():
+    import legal
+    return legal.app_version()
 
 
 def render(name, **ctx):
@@ -105,7 +143,7 @@ def render(name, **ctx):
         request=request, url_for=url_for, money=money, today=today(), status_labels=STATUS_LABELS,
         stages=STAGES, nav_items=nav, active=active, review_count=review_count, job_labels=JOB_LABELS,
         test_redirect=test_redirect(), test_mode_broken=tm.get("enabled") and not tm.get("redirect_to"),
-        currency=cfg().get("currency", "$"),
+        currency=cfg().get("currency", "$"), app_version=legal_docs_version(), publisher=cfg().get("publisher", "BlacSwanken"),
         qs=lambda **kw: url_for(request.endpoint, **{**(request.view_args or {}), **request.args.to_dict(), **kw}),
         **ctx)
 
@@ -264,6 +302,8 @@ def leads_bulk():
             cancel_drafts(con, lid)
             suppress(con, l["email"], "manual")
             set_stage(con, lid, "unqualified", auto=False)
+        elif action == "delete":
+            erase_lead(con, lid, keep_blocked=True)
     con.commit()
     return redirect(url_for("leads", msg=f"Updated {len(ids)} lead(s)."))
 
@@ -841,6 +881,95 @@ def jobs():
     return render("jobs.html", rows=rows("SELECT * FROM jobs ORDER BY id DESC LIMIT 100"))
 
 
+# ---------------------------------------------------------------- legal, about, privacy tools
+
+import legal as legal_docs
+
+
+@app.route("/welcome")
+def welcome():
+    return render("welcome.html", accepted=terms_accepted(), lg=legal_docs.values(cfg()))
+
+
+@app.post("/legal/accept")
+def accept_terms():
+    if not request.form.get("agree"):
+        return redirect(url_for("welcome", msg="Please tick the box to accept the terms.", err=1))
+    write_settings({"legal_acceptance": {"version": str((cfg().get("legal") or {}).get("version", "1.0")),
+                                         "at": iso(now_utc()), "app_version": legal_docs.app_version()}})
+    return redirect(url_for("setup", msg="Welcome! Let's get you set up."))
+
+
+@app.route("/legal/<doc>")
+def legal_doc(doc):
+    if doc == "third-party":
+        return render("legal.html", title="Third-Party Notices", body=None, text=legal_docs.third_party_text())
+    if doc not in legal_docs.DOCS:
+        abort(404)
+    return render("legal.html", title=legal_docs.DOCS[doc][0],
+                  body=legal_docs.to_html(legal_docs.source(doc, cfg())), text=None)
+
+
+@app.route("/about")
+def about():
+    from secretstore import ENCRYPTED
+    acc = cfg().get("legal_acceptance") or {}
+    return render("about.html", version=legal_docs.app_version(),
+                  lg=legal_docs.values(cfg()), data_dir=str(DATA), encrypted=ENCRYPTED, accepted_at=acc.get("at"))
+
+
+@app.post("/about/open-data-folder")
+def open_data_folder():
+    if sys.platform == "win32":
+        os.startfile(str(DATA))  # noqa
+    return redirect(url_for("about"))
+
+
+def erase_lead(con, lead_id, keep_blocked):
+    l = get_lead(lead_id)
+    if keep_blocked:
+        suppress(con, l["email"], "deleted on request")
+    for table, col in (("notes", "lead_id"), ("events", "lead_id"), ("outbox", "lead_id"), ("tasks", "lead_id")):
+        con.execute(f"DELETE FROM {table} WHERE {col}=?", (lead_id,))
+    con.execute("UPDATE opportunities SET lead_id=NULL WHERE lead_id=?", (lead_id,))
+    con.execute("DELETE FROM leads WHERE id=?", (lead_id,))
+
+
+@app.post("/lead/<int:lead_id>/delete")
+def delete_lead(lead_id):
+    erase_lead(db(), lead_id, bool(request.form.get("keep_blocked")))
+    db().commit()
+    return redirect(url_for("leads", msg="Lead and all their history deleted."))
+
+
+# ---------------------------------------------------------------- sample data (try the app without real contacts)
+
+SAMPLE_LEADS = [
+    {"email": "maya.chen@example.com", "first_name": "Maya", "last_name": "Chen", "title": "CTO", "company": "Northwind Health", "website": "example.com", "industry": "Healthcare", "country": "United States"},
+    {"email": "omar.haddad@example.org", "first_name": "Omar", "last_name": "Haddad", "title": "VP Engineering", "company": "Bluefin Payments", "website": "example.org", "industry": "Financial Services", "country": "United Arab Emirates"},
+    {"email": "lena.fischer@example.net", "first_name": "Lena", "last_name": "Fischer", "title": "Head of Product", "company": "Cartwise Retail", "website": "example.net", "industry": "Retail", "country": "United Kingdom"},
+    {"email": "sam.okafor@example.com", "first_name": "Sam", "last_name": "Okafor", "title": "Founder & CEO", "company": "Routely Logistics", "website": "example.com", "industry": "Logistics", "country": "United States"},
+    {"email": "priya.raman@example.org", "first_name": "Priya", "last_name": "Raman", "title": "Director of Engineering", "company": "Keystone Realty", "website": "example.org", "industry": "Real Estate", "country": "United States"},
+    {"email": "tom.berg@example.net", "first_name": "Tom", "last_name": "Berg", "title": "Office Manager", "company": "Example Clubs", "website": "example.net", "industry": "Leisure", "country": "United Kingdom"},
+]
+SAMPLE_SOURCE = "Sample data"
+
+
+@app.post("/sample/load")
+def sample_load():
+    added, _ = import_rows(db(), [dict(r) for r in SAMPLE_LEADS], "active", source=SAMPLE_SOURCE)
+    return redirect(url_for("leads", msg=f"Added {added} sample leads (fictional people at example.com addresses). Remove them any time from Getting Started."))
+
+
+@app.post("/sample/remove")
+def sample_remove():
+    ids = [r["id"] for r in rows("SELECT id FROM leads WHERE json_extract(extra,'$.source')=?", SAMPLE_SOURCE)]
+    for lid in ids:
+        erase_lead(db(), lid, keep_blocked=False)
+    db().commit()
+    return redirect(url_for("setup", msg=f"Removed {len(ids)} sample leads."))
+
+
 # ---------------------------------------------------------------- settings (no file editing needed)
 
 import imaplib
@@ -884,20 +1013,9 @@ def write_settings(update):
 
 
 def set_secret(key, value):
-    """Save a secret to .env and apply it immediately (no restart needed)."""
-    path = DATA / ".env"
-    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-    out, found = [], False
-    for line in lines:
-        if line.split("=", 1)[0].strip() == key:
-            out.append(f"{key}={value}")
-            found = True
-        else:
-            out.append(line)
-    if not found:
-        out.append(f"{key}={value}")
-    path.write_text("\n".join(out) + "\n", encoding="utf-8")
-    os.environ[key] = value
+    """Save a secret encrypted (Windows DPAPI) and apply it immediately (no restart needed)."""
+    from bot import SECRETS
+    SECRETS.set(key, value)
 
 
 def mask(v):
@@ -1044,6 +1162,7 @@ def save_keys():
     for k in ("ANTHROPIC_API_KEY", "APOLLO_API_KEY", "SLACK_WEBHOOK_URL"):
         if f.get(k, "").strip():
             set_secret(k, f[k].strip())
+    write_settings({"ai_reply_sorting": {"enabled": bool(f.get("ai_reply_sorting"))}})
     test = f.get("test")
     if test == "ai":
         ok, msg = test_anthropic(env("ANTHROPIC_API_KEY")) if env("ANTHROPIC_API_KEY") else (False, "Paste your AI key first.")
@@ -1168,8 +1287,10 @@ def setup_steps():
              todo=todo2 + ([] if apollo_key else ["(Optional) Apollo API key to find new leads"]),
              link=url_for("settings", tab="keys"), link_text="Open Settings → Keys"),
         dict(id="leads", ok=n_leads > 0, title="Add leads",
-             text=f"You have <b>{n_leads}</b> lead(s). Import your test spreadsheet, or find new leads in Apollo. "
-                  "Previewing Apollo is free; finding leads uses about 1 Apollo credit per lead.",
+             text=f"You have <b>{n_leads}</b> lead(s). Import your spreadsheet, or find new leads in Apollo "
+                  "(previewing Apollo is free; finding leads uses about 1 Apollo credit per lead). "
+                  "Just exploring? Add <b>sample leads</b>: fictional people at example.com addresses.",
+             sample=True, has_sample=one("SELECT COUNT(*) FROM leads WHERE json_extract(extra,'$.source')=?", SAMPLE_SOURCE) > 0,
              link=url_for("import_page"), link_text="Import a spreadsheet",
              action="apollo-preview" if apollo_key else None, button="Preview Apollo searches (free)"),
         dict(id="draft", ok=s4, title="Let the bot draft your first emails",

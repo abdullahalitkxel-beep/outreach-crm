@@ -6,3 +6,5 @@ beautifulsoup4
 flask
 openpyxl
 tzdata
+pystray
+pillow
