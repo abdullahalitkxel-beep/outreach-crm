@@ -164,11 +164,11 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
 {% if test_redirect %}<div class="testbar">TEST MODE: every email goes to {{ test_redirect }}, never to leads. <a href="{{ url_for('setup') }}#golive">How to go live</a></div>
 {% elif test_mode_broken %}<div class="testbar">TEST MODE is on but has no test address, so the bot won't send anything. <a href="{{ url_for('setup') }}">Fix in Getting Started</a></div>{% endif %}
 <div class="gh">
- <div class="logo">O</div>
- <form class="gsearch" action="{{ url_for('search') }}" id="t-search">
+ <img src="/app-icon.png" alt="Outreach CRM" width="32" height="32" style="flex:none">
+ {% if request.endpoint != 'welcome' %}<form class="gsearch" action="{{ url_for('search') }}" id="t-search">
   <svg width="14" height="14" viewBox="0 0 24 24"><path d="M15.5 14h-.8l-.3-.3A6.5 6.5 0 1 0 9.5 16a6.5 6.5 0 0 0 4.2-1.6l.3.3v.8l5 5 1.5-1.5-5-5zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></svg>
   <input name="q" placeholder="Search leads, accounts, opportunities…" value="{{ request.args.get('q','') if request.endpoint=='search' else '' }}">
- </form>
+ </form>{% else %}<div style="flex:1"></div>{% endif %}
  <div class="tools">
   <div class="iconbtn" id="helpbtn" title="Help" onclick="this.classList.toggle('open')">?
    <div class="menu">
@@ -786,7 +786,7 @@ document.querySelectorAll('select.prov').forEach(function(sel){ sel.onchange=fun
 
 WELCOME = r"""{% extends 'base.html' %}{% block title %}Welcome to Outreach CRM{% endblock %}{% block body %}
 <div class="card" style="max-width:760px;margin:24px auto"><div class="card-b" style="padding:28px 32px">
- <div style="display:flex;gap:14px;align-items:center"><div class="logo" style="width:48px;height:48px;font-size:22px">O</div>
+ <div style="display:flex;gap:14px;align-items:center"><img src="/app-icon.png" alt="" width="52" height="52">
  <div><h1 style="font-size:22px">Welcome to Outreach CRM</h1><div class="muted">by {{ publisher }} · version {{ app_version }}</div></div></div>
  <p style="margin-top:18px">Before you start, please read and accept the terms. Short version:</p>
  <ul style="line-height:1.8">

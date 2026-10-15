@@ -166,9 +166,13 @@ jobs:
           body: |
             **OutreachCRM-Setup.exe**: install on your PC (per-user, no admin rights needed). Shows the licence agreement and registers BlacSwanken as publisher.
             **OutreachCRM-Store.msix**: upload this to Microsoft Partner Center for the Store listing. (It isn't meant to be double-clicked; the Store signs it.)
+            **privacy.html, terms.html, acceptable-use.html**: put these on blacswanken.com; the Store listing needs the privacy page's address.
 
             Until the Store version is live, Windows may show "Windows protected your PC" for the installer: click **More info → Run anyway**.
             Your data stays in %APPDATA%\OutreachCRM, so updating keeps everything.
           files: |
             dist/OutreachCRM-Setup.exe
             dist/OutreachCRM-Store.msix
+            build/legal-site/privacy.html
+            build/legal-site/terms.html
+            build/legal-site/acceptable-use.html

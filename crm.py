@@ -98,7 +98,14 @@ def job_running():
         con.close()
 
 
-OPEN_ENDPOINTS = {"welcome", "accept_terms", "legal_doc", "about", "heartbeat", "quit_app", "static"}
+OPEN_ENDPOINTS = {"welcome", "accept_terms", "legal_doc", "about", "heartbeat", "quit_app", "static", "app_icon"}
+
+
+@app.route("/app-icon.png")
+def app_icon():
+    from flask import send_file
+    here = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return send_file(here / "assets" / "icon.png", mimetype="image/png", max_age=86400)
 
 
 def terms_accepted():
