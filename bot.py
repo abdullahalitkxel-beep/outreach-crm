@@ -895,6 +895,26 @@ def cmd_suppress(cfg, con, args):
     print(f"{args.email} will never be emailed.")
 
 
+def cmd_selfcheck(cfg, con, args):
+    """Verify every library the app loads on demand is present (used by the Windows build test)."""
+    problems = []
+    for mod in ("anthropic", "bs4", "openpyxl", "yaml", "requests", "dotenv", "flask", "apollo"):
+        try:
+            __import__(mod)
+        except Exception as e:
+            problems.append(f"{mod}: {e}")
+    try:
+        ZoneInfo(cfg["schedule"]["timezone"])
+        in_send_window(cfg)
+    except Exception as e:
+        problems.append(f"time zones: {e}")
+    for p in problems:
+        print("PROBLEM:", p)
+    print("SELFCHECK OK" if not problems else "SELFCHECK FAILED")
+    if problems:
+        sys.exit(1)
+
+
 def cmd_apollo_preview(cfg, con, args):
     import apollo
     try:
@@ -967,6 +987,7 @@ def main(argv=None):
     sub.add_parser("stats", help="show campaign stats")
     s = sub.add_parser("suppress", help="never email an address")
     s.add_argument("email")
+    sub.add_parser("selfcheck", help="verify the installation")
     sub.add_parser("apollo-preview", help="free: see what your Apollo searches match")
     s = sub.add_parser("apollo-pull", help="add new verified leads from Apollo (uses credits)")
     s.add_argument("--max", type=int, help="max new leads this run (default: apollo.max_per_pull)")
@@ -980,7 +1001,7 @@ def main(argv=None):
 
     {"import": cmd_import, "run": cmd_run, "check": cmd_check,
      "stats": cmd_stats, "suppress": cmd_suppress,
-     "apollo-preview": cmd_apollo_preview, "apollo-pull": cmd_apollo_pull}[args.cmd](cfg, con, args)
+     "apollo-preview": cmd_apollo_preview, "selfcheck": cmd_selfcheck, "apollo-pull": cmd_apollo_pull}[args.cmd](cfg, con, args)
 
 
 if __name__ == "__main__":

@@ -22,9 +22,17 @@ proc = subprocess.Popen(cmd, env=env)
 ok = False
 
 
+def gh_error(title, text):
+    """Show a message in GitHub's run summary (annotations are readable even when raw logs aren't)."""
+    if os.getenv("GITHUB_ACTIONS"):
+        body = text.replace("%", "%25").replace("\r", "").replace("\n", "%0A")[-6000:]
+        print(f"::error title={title}::{body}", flush=True)
+
+
 def check(cond, what):
     print(("PASS " if cond else "FAIL ") + what, flush=True)
     if not cond:
+        gh_error("Smoke test failed", what)
         raise SystemExit(1)
 
 
@@ -40,6 +48,12 @@ try:
         check(False, "app started and served the Getting Started page")
     check(True, "app started and served the Getting Started page")
     check((home / "config.yaml").exists(), "default config copied into the data folder")
+    sc = subprocess.run(cmd + ["--bot", "selfcheck"], env=env, capture_output=True, text=True, timeout=120)
+    sc_out = (sc.stdout or "") + (sc.stderr or "")
+    if (home / "bot.log").exists():
+        sc_out += (home / "bot.log").read_text(errors="replace")
+    print(sc_out.strip()[-2000:])
+    check(sc.returncode == 0 and "SELFCHECK OK" in sc_out, "all on-demand libraries and time zones are bundled (selfcheck)")
 
     for page in ["/", "/leads", "/review", "/accounts", "/opportunities", "/tasks", "/reports", "/jobs",
                  "/settings?tab=inbox", "/settings?tab=safety", "/settings?tab=keys", "/settings?tab=emails",
@@ -78,12 +92,12 @@ finally:
     time.sleep(2)
     if proc.poll() is None:
         proc.kill()
-    log = home / "app.log"
-    if log.exists() and not ok:
-        print("---- app.log ----\n" + log.read_text(errors="replace")[-4000:])
-    for f in sorted((home / "logs").glob("*.log")) if (home / "logs").exists() else []:
-        if not ok:
-            print(f"---- {f.name} ----\n" + f.read_text(errors="replace")[-4000:])
+    if not ok:
+        for f in [home / "app.log", home / "bot.log"] + (sorted((home / "logs").glob("*.log")) if (home / "logs").exists() else []):
+            if f.exists() and f.read_text(errors="replace").strip():
+                text = f.read_text(errors="replace")[-4000:]
+                print(f"---- {f.name} ----\n" + text)
+                gh_error(f"Log: {f.name}", text)
 
 print("SMOKE TEST PASSED" if ok else "SMOKE TEST FAILED")
 sys.exit(0 if ok else 1)
