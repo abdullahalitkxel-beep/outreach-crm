@@ -581,6 +581,7 @@ REVIEW = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block ti
  {% if d.variant %}<span class="badge" title="Template">{{ d.variant }}</span>{% endif %}<span class="badge b-info">{{ 'First email' if d.step == 0 else 'Follow-up ' ~ d.step }}</span></div>
  <div class="card-b">
  <div class="muted">To {{ d.email }} · from {{ d.sender }}{% if d.website %} · <a href="https://{{ d.website }}" target="_blank" rel="noopener">{{ d.website }} ↗</a>{% endif %}{% if d.x.linkedin %} · <a href="{{ d.x.linkedin }}" target="_blank" rel="noopener">LinkedIn ↗</a>{% endif %}</div>
+ {% if d.avoid %}<div class="help" style="margin:8px 0 0;border-color:#c23934">⚠️ This email contains words on your avoid list: <b>{{ d.avoid|join(', ') }}</b>. Edit them out before approving, or it may be filtered as spam.</div>{% endif %}
  {% if d.x.fit == 'C' %}<div class="help" style="margin:8px 0 0">⚠️ This lead's title is outside your target roles (fit C). Consider rejecting.</div>{% endif %}
  <form method="post" action="{{ url_for('review_action', draft_id=d.id) }}">
   <label>Subject</label><input name="subject" value="{{ d.subject }}" {{ 'readonly title="Follow-ups keep the same subject so they thread"' if d.step > 0 }}>
@@ -670,7 +671,7 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
 
 {% if tab == 'inbox' %}
 <div class="card"><div class="card-h"><h2>Email inboxes</h2></div><div class="card-b">
-<p class="muted" style="margin-top:0">The addresses your emails are sent from. One is enough to start; add up to three to send more per day. Use your <b>outreach domain</b>, not your main company inbox.</p>
+<p class="muted" style="margin-top:0">The addresses your emails are sent from. One is enough to start; add up to ten to send more per day. Use your <b>outreach domain</b>, not your main company inbox.</p>
 <form method="post" action="{{ url_for('save_inbox') }}">
 {% for ib in inboxes %}{% set s = ib.s %}{% set n = ib.n %}
 <fieldset class="ibox" {{ 'data-optional' if n > 1 }}><legend>Inbox {{ n }}{{ ' (optional)' if n > 1 }}</legend>
@@ -720,7 +721,10 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <button class="btn brand" style="margin-top:12px">Save keys</button></form></div></div>
 
 {% elif tab == 'emails' %}
-<div class="card"><div class="card-h"><h2>Your offer &amp; emails</h2></div><div class="card-b"><form method="post" action="{{ url_for('save_emails') }}">
+<div class="card"><div class="card-h"><h2>Your offer &amp; emails</h2></div><div class="card-b">
+ {% if avoid_hits %}<div class="help" style="border-color:#c23934">⚠️ Some templates use words on your avoid list, so the bot will not send them until you edit them out:<ul>{% for i, vs in avoid_hits.items() %}{% for v, hits in vs.items() %}<li>Email {{ i }} · {{ v }}: <b>{{ hits|join(', ') }}</b></li>{% endfor %}{% endfor %}</ul></div>
+ {% elif avoid_n %}<p class="hint">✓ Checked against your avoid list ({{ avoid_n }} words and phrases). None are used.</p>{% endif %}
+ <form method="post" action="{{ url_for('save_emails') }}">
  <label>What you offer (the AI uses this to write each lead's opening line)</label><textarea name="offer" rows="4">{{ c.offer or '' }}</textarea>
  <label>Company name and postal address (legally required in the footer)</label><input name="sender_address" value="{{ c.sender_address or '' }}">
  <h3 style="margin:18px 0 4px;font-size:14px">Company facts used in the templates</h3>

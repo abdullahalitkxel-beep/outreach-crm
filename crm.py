@@ -19,6 +19,7 @@ from pathlib import Path
 from flask import Flask, Response, abort, g, redirect, request, url_for
 from jinja2 import DictLoader
 import brand
+from bot import find_avoid, template_avoid_hits
 
 from bot import (DATA, HUMAN_STAGES, env, LEAD_OPEN_STAGES, OPP_OPEN_STAGES, OPP_STAGES, ROOT, STAGES, settings_path,
                  add_lead, add_task, cancel_drafts, db_connect, import_rows, iso, load_config,
@@ -707,6 +708,7 @@ def review():
                   "JOIN leads l ON l.id=o.lead_id WHERE o.status='pending' ORDER BY o.step DESC, o.id"):
         r["x"] = json.loads(r.pop("extra") or "{}")
         r["name"] = " ".join(p for p in (r["first_name"], r["x"].get("last_name")) if p) or r["email"]
+        r["avoid"] = find_avoid(cfg(), r["subject"], r["body"])
         data.append(r)
     return render("review.html", drafts=data, approved=one("SELECT COUNT(*) FROM outbox WHERE status='approved'"),
                   ai_on=bool(env("ANTHROPIC_API_KEY")), lead_count=one("SELECT COUNT(*) FROM leads"))
@@ -1094,10 +1096,11 @@ def test_apollo(key):
 def settings():
     c = cfg()
     senders = list(c.get("senders") or [])
-    while len(senders) < 3:
+    real_n = sum(1 for x in senders if not any(p in (x.get("email") or "") for p in PLACEHOLDERS))
+    while len(senders) < min(10, max(3, real_n + 1)):
         senders.append({})
     inboxes = []
-    for i, s in enumerate(senders[:3], 1):
+    for i, s in enumerate(senders[:10], 1):
         placeholder = any(p in (s.get("email") or "") for p in PLACEHOLDERS)
         inboxes.append({"n": i, "s": {} if placeholder else s, "provider": guess_provider(s),
                         "pw": mask(env(s.get("password_env") or f"SENDER{i}_PASSWORD"))})
@@ -1112,7 +1115,7 @@ def settings():
                   keys={"ANTHROPIC_API_KEY": mask(env("ANTHROPIC_API_KEY")), "APOLLO_API_KEY": mask(env("APOLLO_API_KEY")),
                         "SLACK_WEBHOOK_URL": mask(env("SLACK_WEBHOOK_URL"))},
                   tab=request.args.get("tab", "inbox"), result=request.args.get("result"),
-                  ok=request.args.get("ok"))
+                  ok=request.args.get("ok"), avoid_hits=template_avoid_hits(c), avoid_n=len(c.get("avoid_phrases") or []))
 
 
 def _inbox_from_form(f, n):
@@ -1132,7 +1135,9 @@ def _inbox_from_form(f, n):
 def save_inbox():
     f = request.form
     senders = []
-    for n in (1, 2, 3):
+    for n in range(1, 11):
+        if f.get(f"provider{n}") is None:
+            continue
         s = _inbox_from_form(f, n)
         if f.get(f"password{n}", "").strip():
             set_secret(s["password_env"], f[f"password{n}"].strip())

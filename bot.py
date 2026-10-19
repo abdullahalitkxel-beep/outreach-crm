@@ -346,6 +346,50 @@ def fetch_site_text(url, limit=4000):
         return ""
 
 
+
+_AVOID_CACHE = {}
+
+
+def _avoid_patterns(cfg):
+    phrases = tuple(cfg.get("avoid_phrases") or ())
+    if phrases not in _AVOID_CACHE:
+        pats = []
+        for ph in phrases:
+            ph = str(ph).strip().replace("\u2019", "'")
+            if not ph:
+                continue
+            if ph.startswith("regex:"):
+                pats.append((ph, re.compile(ph[6:], re.I)))
+            elif re.search(r"[$%]", ph):          # symbols: match literally
+                pats.append((ph, re.compile(re.escape(ph), re.I)))
+            else:                                  # whole words; spaces and hyphens are interchangeable
+                words = [re.escape(w) for w in re.split(r"[\s-]+", ph) if w]
+                pats.append((ph, re.compile(r"(?<![\w])" + r"[\s-]+".join(words) + r"(?![\w])", re.I)))
+        _AVOID_CACHE[phrases] = pats
+    return _AVOID_CACHE[phrases]
+
+
+def find_avoid(cfg, *texts):
+    """Phrases from the avoid list (config: avoid_phrases) that appear in the text, e.g. spam-trigger words."""
+    text = "\n".join(t or "" for t in texts).replace("\u2019", "'")
+    return sorted({ph.replace("regex:", "") for ph, rx in _avoid_patterns(cfg) if rx.search(text)}, key=str.lower)
+
+
+def template_avoid_hits(cfg):
+    """Avoid-list phrases found in the email templates after the facts are filled in. {step: {variant: [phrases]}}"""
+    out = {}
+    facts = SafeDict(**{k: str(v) for k, v in (cfg.get("facts") or {}).items()})
+    for i, st in enumerate(cfg.get("sequence") or [], 1):
+        for v in st.get("variants") or [st]:
+            if v.get("enabled", True) is False:
+                continue
+            filled = ((v.get("subject") or "") + "\n" + (v.get("body") or "")).format_map(facts)
+            hits = find_avoid(cfg, filled, cfg.get("footer", ""))
+            if hits:
+                out.setdefault(i, {})[v.get("name") or f"step {i}"] = hits
+    return out
+
+
 def personalize(cfg, lead):
     """One personalised opening line. Privacy: the AI only sees business information — the company's
     public website text, company name, job title and industry — never the contact's name, email,
@@ -374,7 +418,10 @@ Output only the sentence."""
     line = llm(cfg, "personalize", prompt)
     if not line or line.upper().startswith("NONE") or not (10 < len(line) < 300):
         return fallback
-    return line.strip().strip('"')
+    line = line.strip().strip('"')
+    if find_avoid(cfg, line):  # the AI used a word you asked us to avoid
+        return fallback
+    return line
 
 
 def classify_reply(cfg, msg, body):
@@ -584,6 +631,11 @@ def cmd_run(cfg, con, args):
                     continue
                 sender = pick_sender(lead, senders, {s["email"]: 1 for s in senders})
                 subject, body, variant = compose(cfg, con, lead, sender, idx)
+                hits = find_avoid(cfg, subject, body)
+                if hits:
+                    problems.append(f"Step {idx + 1} email for {lead['email']} uses avoided phrases ({', '.join(hits)}); not drafted. "
+                                    "Edit the template in Settings → Your offer & emails.")
+                    continue
                 con.execute(
                     "INSERT INTO outbox(lead_id, step, sender, subject, body, status, created_at, variant) "
                     "VALUES (?,?,?,?,?,'pending',?,?)",
@@ -605,6 +657,11 @@ def cmd_run(cfg, con, args):
             if not sender:
                 continue
             subject, body, variant = compose(cfg, con, lead, sender, idx)
+            hits = find_avoid(cfg, subject, body)
+            if hits:
+                problems.append(f"Step {idx + 1} email for {lead['email']} uses avoided phrases ({', '.join(hits)}); not sent. "
+                                "Edit the template in Settings → Your offer & emails.")
+                continue
 
         reply_to = lead["first_msg_id"] if idx > 0 else None
         full_body = body + "\n\n" + render(cfg["footer"], lead, sender, cfg)
@@ -700,8 +757,16 @@ def get_text_body(msg):
     return "\n".join(lines).strip()
 
 
-def notify(text):
+def notify(text, cfg=None):
     print(text)
+    to = ((cfg or {}).get("notifications") or {}).get("email", "").strip()
+    if to and cfg:
+        try:  # an email alert, sent from the first working inbox
+            sender = next((x for x in load_senders(cfg) if x["password"]), None)
+            if sender:
+                send_email(sender, to, "BSO: " + text.split(":", 1)[0][:80], text)
+        except Exception as e:
+            log.warning("Email notification failed: %s", e)
     hook = env("SLACK_WEBHOOK_URL")
     if hook:
         try:
@@ -749,7 +814,7 @@ def handle_message(cfg, con, sender, msg):
     add_task(con, f"Respond to {who} ({label.replace('_', ' ')} reply)", lead_id=lead["id"])
     snippet = body[:300].replace("\n", " ")
     notify(f"📬 {label.upper()} reply from {lead['first_name'] or ''} <{frm}> "
-           f"({lead['company'] or ''}) in {sender['email']}:\n{snippet}")
+           f"({lead['company'] or ''}) in {sender['email']}:\n{snippet}", cfg)
 
 
 def process_inbox(cfg, con, sender):
@@ -967,6 +1032,14 @@ def cmd_selfcheck(cfg, con, args):
         print("legal documents: OK, version", legal.app_version())
     except Exception as e:
         problems.append(f"legal documents: {e}")
+    try:
+        bad = template_avoid_hits(cfg)
+        assert not bad, "; ".join(f"step {i} '{v}': {', '.join(h)}" for i, vs in bad.items() for v, h in vs.items())
+        if cfg.get("avoid_phrases"):
+            assert find_avoid(cfg, "Act now, it is FREE!"), "avoid-list matcher found nothing in a test sentence"
+        print("email templates: no avoided phrases (%d phrases checked)" % len(cfg.get("avoid_phrases") or []))
+    except Exception as e:
+        problems.append(f"email templates use avoided phrases: {e}")
     for p in problems:
         print("PROBLEM:", p)
     print("SELFCHECK OK" if not problems else "SELFCHECK FAILED")

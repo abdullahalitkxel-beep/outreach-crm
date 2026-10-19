@@ -47,22 +47,234 @@ schedule:
 delay_between_sends_seconds: [60, 180]
 reply_lookback_days: 14
 
+# Who is told about interested replies (always shown in the app too). Sent from your first inbox.
+notifications:
+  email: "omar@blacswanken.com"
+
+# Words and phrases the emails must never contain (spam triggers). Matching ignores capitals and
+# treats hyphens like spaces. An email that contains one is not drafted or sent, and the Review page
+# and Settings flag it. Lines starting with regex: are regular expressions.
+avoid_phrases:
+  - "Act now"
+  - "Urgent"
+  - "Immediately"
+  - "Important information regarding"
+  - "Last chance"
+  - "Limited time"
+  - "Expires today"
+  - "Final notice"
+  - "Don't delete"
+  - "Don't miss out"
+  - "Hurry"
+  - "regex:only \\d+ left"
+  - "Offer ends soon"
+  - "Now or never"
+  - "Time-sensitive"
+  - "Today only"
+  - "While supplies last"
+  - "Before it's too late"
+  - "Action required"
+  - "Response needed"
+  - "Free"
+  - "$$$"
+  - "Cash"
+  - "Cash bonus"
+  - "Earn money"
+  - "Make money"
+  - "Extra income"
+  - "Double your income"
+  - "Save big"
+  - "Cheap"
+  - "Lowest price"
+  - "Best price"
+  - "Bargain"
+  - "Discount"
+  - "% off"
+  - "Credit"
+  - "Loans"
+  - "Pre-approved"
+  - "Debt"
+  - "Refinance"
+  - "Investment"
+  - "Income"
+  - "Profit"
+  - "Million dollars"
+  - "Billion"
+  - "Fast cash"
+  - "No fees"
+  - "No cost"
+  - "Price"
+  - "Rates"
+  - "Bonus"
+  - "Guaranteed"
+  - "100% free"
+  - "100% satisfied"
+  - "Risk-free"
+  - "No risk"
+  - "Miracle"
+  - "Amazing"
+  - "Incredible deal"
+  - "Unbelievable"
+  - "Once in a lifetime"
+  - "Winner"
+  - "You've been selected"
+  - "Congratulations"
+  - "You're a winner"
+  - "Prize"
+  - "Claim your prize"
+  - "Exclusive deal"
+  - "Special promotion"
+  - "Secret"
+  - "Instant"
+  - "Best deal"
+  - "Best offer"
+  - "Big savings"
+  - "Buy direct"
+  - "Clearance"
+  - "Compare rates"
+  - "Deal"
+  - "Fantastic offer"
+  - "Incredible"
+  - "Lifetime access"
+  - "Lowest rate"
+  - "Massive"
+  - "Mind-blowing"
+  - "No catch"
+  - "No gimmick"
+  - "No hidden costs"
+  - "No obligation"
+  - "No purchase necessary"
+  - "No questions asked"
+  - "No strings attached"
+  - "Not a scam"
+  - "One-time offer"
+  - "Pure profit"
+  - "Special offer"
+  - "Stop overpaying"
+  - "Satisfaction guaranteed"
+  - "Trial"
+  - "Unlimited"
+  - "Value"
+  - "Be your own boss"
+  - "Work from home"
+  - "Earn $"
+  - "Earn per week"
+  - "Financial freedom"
+  - "Full refund"
+  - "Home-based business"
+  - "Increase sales"
+  - "Increase traffic"
+  - "Make $"
+  - "MLM"
+  - "Multi-level marketing"
+  - "Passive income"
+  - "Online biz opportunity"
+  - "Get paid"
+  - "Hidden assets"
+  - "Additional income"
+  - "Billing address"
+  - "Click here"
+  - "Click below"
+  - "Click now"
+  - "Click to remove"
+  - "Buy now"
+  - "Order now"
+  - "Order today"
+  - "Shop now"
+  - "Sign up free"
+  - "Join millions"
+  - "Get it now"
+  - "Get started now"
+  - "Apply now"
+  - "Call now"
+  - "Call free"
+  - "Claim now"
+  - "Claim your discount"
+  - "Download now"
+  - "Get out of debt"
+  - "Start now"
+  - "Subscribe now"
+  - "Visit our website"
+  - "Try it free"
+  - "Access now"
+  - "Don't hesitate"
+  - "What are you waiting for"
+  - "Take action now"
+  - "See for yourself"
+  - "Request now"
+
 # ---- Inboxes (passwords go in .env as SENDER1_PASSWORD, SENDER2_PASSWORD ...)
 senders:
-  - email: you@your-outreach-domain.com      # TODO
-    name: Your Name                          # TODO: the name prospects will see
-    smtp_host: smtp.example.com              # TODO: from your email provider
+  - email: cole.reed@getneosofttech.com
+    name: Cole Reed
+    smtp_host: smtp.example.com              # TODO: from your email provider (same for all ten inboxes)
     smtp_port: 587
     imap_host: imap.example.com              # TODO
     password_env: SENDER1_PASSWORD
-    daily_limit: 10      # inboxes are new: start at 10, raise ~5/week toward 30
-  # - email: second@your-outreach-domain.com
-  #   name: Your Name
-  #   smtp_host: smtp.example.com
-  #   smtp_port: 587
-  #   imap_host: imap.example.com
-  #   password_env: SENDER2_PASSWORD
-  #   daily_limit: 10
+    daily_limit: 10      # new inboxes: start at 10, raise ~5/week toward 30
+  - email: anne.brand@getneosofttech.com
+    name: Anne Brand
+    smtp_host: smtp.example.com              # TODO: from your email provider (same for all ten inboxes)
+    smtp_port: 587
+    imap_host: imap.example.com              # TODO
+    password_env: SENDER2_PASSWORD
+    daily_limit: 10      # new inboxes: start at 10, raise ~5/week toward 30
+  - email: ruth.vance@getneosofttech.com
+    name: Ruth Vance
+    smtp_host: smtp.example.com              # TODO: from your email provider (same for all ten inboxes)
+    smtp_port: 587
+    imap_host: imap.example.com              # TODO
+    password_env: SENDER3_PASSWORD
+    daily_limit: 10      # new inboxes: start at 10, raise ~5/week toward 30
+  - email: kate.moore@getneosofttech.com
+    name: Kate Moore
+    smtp_host: smtp.example.com              # TODO: from your email provider (same for all ten inboxes)
+    smtp_port: 587
+    imap_host: imap.example.com              # TODO
+    password_env: SENDER4_PASSWORD
+    daily_limit: 10      # new inboxes: start at 10, raise ~5/week toward 30
+  - email: beth.cross@getneosofttech.com
+    name: Beth Cross
+    smtp_host: smtp.example.com              # TODO: from your email provider (same for all ten inboxes)
+    smtp_port: 587
+    imap_host: imap.example.com              # TODO
+    password_env: SENDER5_PASSWORD
+    daily_limit: 10      # new inboxes: start at 10, raise ~5/week toward 30
+  - email: neil.frost@getneosofttech.com
+    name: Neil Frost
+    smtp_host: smtp.example.com              # TODO: from your email provider (same for all ten inboxes)
+    smtp_port: 587
+    imap_host: imap.example.com              # TODO
+    password_env: SENDER6_PASSWORD
+    daily_limit: 10      # new inboxes: start at 10, raise ~5/week toward 30
+  - email: drew.hale@getneosofttech.com
+    name: Drew Hale
+    smtp_host: smtp.example.com              # TODO: from your email provider (same for all ten inboxes)
+    smtp_port: 587
+    imap_host: imap.example.com              # TODO
+    password_env: SENDER7_PASSWORD
+    daily_limit: 10      # new inboxes: start at 10, raise ~5/week toward 30
+  - email: seth.ward@getneosofttech.com
+    name: Seth Ward
+    smtp_host: smtp.example.com              # TODO: from your email provider (same for all ten inboxes)
+    smtp_port: 587
+    imap_host: imap.example.com              # TODO
+    password_env: SENDER8_PASSWORD
+    daily_limit: 10      # new inboxes: start at 10, raise ~5/week toward 30
+  - email: jade.hunt@getneosofttech.com
+    name: Jade Hunt
+    smtp_host: smtp.example.com              # TODO: from your email provider (same for all ten inboxes)
+    smtp_port: 587
+    imap_host: imap.example.com              # TODO
+    password_env: SENDER9_PASSWORD
+    daily_limit: 10      # new inboxes: start at 10, raise ~5/week toward 30
+  - email: wade.lane@getneosofttech.com
+    name: Wade Lane
+    smtp_host: smtp.example.com              # TODO: from your email provider (same for all ten inboxes)
+    smtp_port: 587
+    imap_host: imap.example.com              # TODO
+    password_env: SENDER10_PASSWORD
+    daily_limit: 10      # new inboxes: start at 10, raise ~5/week toward 30
 
 # ---- AI
 models:
@@ -121,7 +333,7 @@ apollo:
 facts:
   team_size: "4,000+ engineers"
   proof_point: "CMMI Level 5, with 1,500+ clients in 50+ countries"
-  trial_offer: "a no-cost 40-hour proof of concept"
+  trial_offer: "a complimentary 40-hour proof of concept"
   lead_time: "two weeks"
   stacks: "front-end (React, Angular, Vue.js), back-end (Java, .NET, Python, Node, Go) and mobile (iOS, Android, Flutter)"
 
@@ -144,7 +356,7 @@ sequence:
 
           At NeoSOFT, we can help you scale your development efforts with our regularly upskilled, seasoned developers, with expertise across all modern technology stacks.
 
-          With a pool of {team_size} and the ability to start within {lead_time}, we're happy to go through your evaluation process, including technical interviews and coding tests. Or we can start with {trial_offer}, no strings attached.
+          With a pool of {team_size} and the ability to start within {lead_time}, we're happy to go through your evaluation process, including technical interviews and coding tests. Or we can start with {trial_offer}, with no commitment.
 
           Timing is probably off, but would you be open to seeing how you could access a larger pool of developers?
 
@@ -212,7 +424,7 @@ sequence:
 
           Is your team spreading itself thin finding the right talent? At NeoSOFT, we can help you scale your development efforts up or down at will with our regularly upskilled, seasoned developers.
 
-          With a pool of {team_size} and the ability to start within {lead_time}, we're happy to go through your evaluation process, including technical interviews and coding tests. Or simply start with {trial_offer}, no strings attached.
+          With a pool of {team_size} and the ability to start within {lead_time}, we're happy to go through your evaluation process, including technical interviews and coding tests. Or simply start with {trial_offer}, with no commitment.
 
           Would it be a terrible idea to send you more information about our engagement models and pricing? If not, let me know and I'll remove your company from future emails.
 
@@ -252,7 +464,7 @@ sequence:
 
           {sender_name}
 
-  - delay_days: 3
+  - delay_days: 5
     variants:
       - name: "Being upfront (touchpoints 3, 13)"
         enabled: true
@@ -271,7 +483,7 @@ sequence:
         body: |
           {first_name}, what are you doing to scale your development efforts this year? Your competitors are widening their reach across the globe to find the right talent.
 
-          Our seasoned developers cover {stacks}. Happy to go through your evaluation process of technical interviews and tests, or start with {trial_offer}, no strings attached.
+          Our seasoned developers cover {stacks}. Happy to go through your evaluation process of technical interviews and tests, or start with {trial_offer}, with no commitment.
 
           Open to learning more?
 
@@ -279,7 +491,20 @@ sequence:
 
   - delay_days: 5
     variants:
-      - name: "No-risk trial, last note (touchpoint 2)"
+      - name: "Formal check-in (15-minute call)"
+        enabled: true
+        body: |
+          {first_name}, I am writing again in case my earlier notes were buried.
+
+          In brief, NeoSOFT is {proof_point}, with {team_size} covering {stacks}. We can start with {trial_offer}, and you decide afterwards whether to continue.
+
+          If strengthening your engineering capacity is on your agenda this year, would you be open to a 15-minute call to discuss whether we are a fit?
+
+          {sender_name}
+
+  - delay_days: 5
+    variants:
+      - name: "Proof of concept, last note (touchpoint 2)"
         enabled: true
         body: |
           Hi {first_name},
