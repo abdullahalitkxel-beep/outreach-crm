@@ -48,6 +48,30 @@ r = c2.post("/login", data={"_csrf": re.search(r'name="_csrf" value="([^"]+)"', 
 check(b"Too many failed attempts" in r.data, "login is locked after repeated failures")
 
 c.post("/settings", data={"_csrf": csrf("/settings"), "action": "org", "org": "NeoSOFT", "public_url": "http://127.0.0.1:8791", "grace_hours": "72"})
+# --- forgot password by email
+sent = []
+hub.send_mail = lambda to, subj, body: sent.append((to, body))
+c3 = hub.app.test_client()
+tk = lambda cl, path: re.search(r'name="_csrf" value="([^"]+)"', cl.get(path).get_data(as_text=True)).group(1)
+r = c3.post("/forgot", data={"_csrf": tk(c3, "/forgot"), "email": "nobody@x.com"})
+check(b"on its way" in r.data and not sent, "unknown address gets the same answer and no email")
+r = c3.post("/forgot", data={"_csrf": tk(c3, "/forgot"), "email": "o@x.com"})
+check(b"on its way" in r.data and len(sent) == 1 and sent[0][0] == "o@x.com", "owner gets a reset email")
+link = re.search(r"/reset/([\w-]+)", sent[0][1]).group(1)
+r = c3.post(f"/reset/{link}", data={"_csrf": tk(c3, f"/reset/{link}"), "password": "short", "password2": "short"})
+check(b"at least 10" in r.data, "weak new password refused")
+r = c3.post(f"/reset/{link}", data={"_csrf": tk(c3, f"/reset/{link}"), "password": "fresh-owner-pass-1", "password2": "fresh-owner-pass-1"})
+check(r.status_code == 302 and "reset=1" in r.headers["Location"], "reset link sets the new password")
+check(c3.get(f"/reset/{link}").status_code == 400, "reset link works only once")
+_t = hub.sqlite3.connect(str(hub.DB_PATH)); _t.execute("DELETE FROM throttle"); _t.commit()   # the earlier lockout test used this address
+r = c3.post("/login", data={"_csrf": tk(c3, "/login"), "email": "o@x.com", "password": "fresh-owner-pass-1"})
+check(r.status_code == 302, "owner signs in with the new password")
+check(c3.get("/").status_code == 200, "console opens")
+# expired token
+exp = hub.sqlite3.connect(str(hub.DB_PATH)); exp.execute("INSERT INTO reset_tokens(user_id, token_hash, expires_at) VALUES (1, ?, '2000-01-01T00:00:00Z')", (hub.sha("old"),)); exp.commit()
+check(c3.get("/reset/old").status_code == 400, "expired reset link refused")
+c.post("/login", data={"_csrf": csrf("/login"), "email": "o@x.com", "password": "fresh-owner-pass-1"})
+
 # --- add a member who needs master approval, with a cap of 2
 t = csrf("/users")
 r = c.post("/users/new", data={"_csrf": t, "name": "Ayesha", "email": "a@x.com", "username": "Ayesha", "role": "member", "daily_cap": "2", "weekly_target": "10", "approval": "master", "password": ""}, follow_redirects=True)

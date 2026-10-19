@@ -20,6 +20,11 @@ BSO laptops refuse to join a plain `http://` hub unless it is on a private netwo
 
 Then open **Settings** in the console and enter that address as *Public address of this hub*. Invites carry it.
 
+## Forgotten master password
+
+- **By email:** on the sign-in page click *Forgot password?*, enter your email or ID, and open the link that arrives (works once, valid 30 minutes). This needs outgoing email set up first: console **Settings → Outgoing email** (for Gmail use an app password), then *Send a test email to me*. Also set the hub's public address there so the link opens the right place.
+- **If email isn't set up and you're locked out:** on the hub computer run `BSO.exe --hub --reset-owner-password` and type a new password.
+
 ## 3. Add people and install BSO for them
 
 1. **Users → Add a user**: name, email, sign-in **ID**, role, daily cap, weekly target, and who approves their emails. Leave the password blank to have one generated.

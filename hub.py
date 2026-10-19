@@ -19,6 +19,8 @@ import json
 import os
 import re
 import secrets
+import smtplib
+import ssl
 import sqlite3
 import sys
 import threading
@@ -26,6 +28,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from email.message import EmailMessage
 from flask import Flask, abort, g, jsonify, redirect, render_template, request, session, url_for
 from flask.sessions import SecureCookieSessionInterface
 from jinja2 import DictLoader
@@ -87,6 +90,7 @@ CREATE TABLE IF NOT EXISTS drafts (
     UNIQUE(user_id, local_id)
 );
 CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, at TEXT, actor TEXT, action TEXT, detail TEXT);
+CREATE TABLE IF NOT EXISTS reset_tokens (id INTEGER PRIMARY KEY, user_id INTEGER, token_hash TEXT UNIQUE, expires_at TEXT, used_at TEXT);
 CREATE TABLE IF NOT EXISTS throttle (key TEXT PRIMARY KEY, n INTEGER, first_at REAL);
 """
 
@@ -357,6 +361,101 @@ def login():
     return render("login.html", err=err)
 
 
+# ---------------------------------------------------------------------------------------------- password reset by email
+
+RESET_MINUTES = 30
+
+
+def _secret_store():
+    from secretstore import SecretStore
+    return SecretStore(data_dir())
+
+
+def smtp_conf():
+    c = {k: meta_get("smtp_" + k, "") for k in ("host", "port", "user", "from")}
+    try:
+        c["password"] = _secret_store().load().get("HUB_SMTP_PASSWORD", "")
+    except Exception:
+        c["password"] = ""
+    return c
+
+
+def send_mail(to, subject, body):
+    """Send through the mail account set in Settings. Raises RuntimeError with a plain message."""
+    c = smtp_conf()
+    if not (c["host"] and c["from"]):
+        raise RuntimeError("Outgoing email is not set up in the hub's Settings.")
+    msg = EmailMessage()
+    msg["From"], msg["To"], msg["Subject"] = c["from"], to, subject
+    msg.set_content(body)
+    port = int(c["port"] or 587)
+    try:
+        if port == 465:
+            srv = smtplib.SMTP_SSL(c["host"], port, timeout=20, context=ssl.create_default_context())
+        else:
+            srv = smtplib.SMTP(c["host"], port, timeout=20)
+            srv.starttls(context=ssl.create_default_context())
+        with srv:
+            if c["user"]:
+                srv.login(c["user"], c["password"])
+            srv.send_message(msg)
+    except (smtplib.SMTPException, OSError) as e:
+        raise RuntimeError(f"Could not send: {e}")
+
+
+@app.route("/forgot", methods=["GET", "POST"])
+def forgot():
+    done = False
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        ip = request.remote_addr or "?"
+        done = True                                   # same answer whether or not the address exists
+        k1, k2 = f"forgot:{ip}", f"forgote:{email}"
+        if not throttled(k1, 6, 3600) and not throttled(k2, 3, 3600):
+            throttle_hit(k1, 3600)
+            throttle_hit(k2, 3600)
+            u = db().execute("SELECT * FROM users WHERE (email=? OR username=?) AND status!='disabled' AND role IN ('owner','manager')", (email, email)).fetchone()
+            if u:
+                token = secrets.token_urlsafe(32)
+                db().execute("INSERT INTO reset_tokens(user_id, token_hash, expires_at) VALUES (?,?,?)",
+                             (u["id"], sha(token), iso(now() + timedelta(minutes=RESET_MINUTES))))
+                db().commit()
+                base = (meta_get("public_url") or request.host_url).rstrip("/")
+                try:
+                    send_mail(u["email"], "Reset your BSO master password",
+                              f"Hello {u['name']},\n\nSomeone asked to reset the password for your BSO master console account.\n"
+                              f"Open this link within {RESET_MINUTES} minutes to choose a new password:\n\n{base}/reset/{token}\n\n"
+                              "If it wasn't you, ignore this email. Nothing changes until the link is used.")
+                    g.me = None
+                    audit("reset_requested", u["email"])
+                except RuntimeError as e:
+                    app.logger.warning("reset email failed: %s", e)
+    return render("forgot.html", done=done)
+
+
+@app.route("/reset/<token>", methods=["GET", "POST"])
+def reset(token):
+    t = db().execute("SELECT * FROM reset_tokens WHERE token_hash=? AND used_at IS NULL", (sha(token),)).fetchone()
+    if not t or (parse(t["expires_at"]) or now()) < now():
+        return render("reset.html", bad=True, err=None), 400
+    err = None
+    if request.method == "POST":
+        f = request.form
+        if not strong(f.get("password")) or f.get("password") != f.get("password2"):
+            err = "The password must be at least 10 characters and typed twice the same."
+        else:
+            db().execute("UPDATE users SET pw_hash=? WHERE id=?", (generate_password_hash(f["password"]), t["user_id"]))
+            db().execute("UPDATE reset_tokens SET used_at=? WHERE user_id=? AND used_at IS NULL", (iso(), t["user_id"]))
+            db().commit()
+            session.clear()
+            g.me = None
+            u = db().execute("SELECT email FROM users WHERE id=?", (t["user_id"],)).fetchone()
+            db().execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)", (iso(), u["email"], "password_reset_by_email", ""))
+            db().commit()
+            return redirect(url_for("login", reset=1))
+    return render("reset.html", bad=False, err=err)
+
+
 @app.post("/logout")
 def logout():
     session.clear()
@@ -581,6 +680,20 @@ def hub_settings():
                 meta_set("grace_hours", str(_valid_int(f.get("grace_hours"), 0, 720) if f.get("grace_hours") != "" else GRACE_HOURS))
                 audit("hub_settings", f"org={f.get('org')} url={url}")
                 msg = "Saved."
+        elif f.get("action") in ("smtp", "smtp_test"):
+            if f.get("action") == "smtp":
+                for k in ("host", "port", "user", "from"):
+                    meta_set("smtp_" + k, f.get(k, "").strip())
+                if f.get("password"):
+                    _secret_store().set("HUB_SMTP_PASSWORD", f["password"])
+                audit("smtp_settings", f.get("host", ""))
+                msg = "Email settings saved."
+            else:
+                try:
+                    send_mail(g.me["email"], "BSO hub test email", "Your BSO hub can send email. Password reset links will arrive like this.")
+                    msg = f"Test email sent to {g.me['email']}."
+                except RuntimeError as e:
+                    msg = str(e)
         elif f.get("action") == "password":
             me = db().execute("SELECT * FROM users WHERE id=?", (g.me["id"],)).fetchone()
             if not check_password_hash(me["pw_hash"], f.get("old", "")):
@@ -592,7 +705,7 @@ def hub_settings():
                 db().commit()
                 audit("password_changed")
                 msg = "Password changed."
-    return render("settings.html", msg=msg, public_url=meta_get("public_url", ""), grace=meta_get("grace_hours", str(GRACE_HOURS)), tab="settings")
+    return render("settings.html", msg=msg, smtp=smtp_conf(), public_url=meta_get("public_url", ""), grace=meta_get("grace_hours", str(GRACE_HOURS)), tab="settings")
 
 
 # ---------------------------------------------------------------------------------------------- API used by team laptops
@@ -737,9 +850,18 @@ T["setup.html"] = """{% extends 'base.html' %}{% block title %}Set up{% endblock
 <p><button class="btn brand">Create the owner account</button></p></form></div></div>{% endblock %}"""
 T["login.html"] = """{% extends 'base.html' %}{% block title %}Sign in{% endblock %}{% block body %}<div class="center card"><div class="card-b">
 <div class="logo">{{ logo(56, tile=True, uid='lg', animated=True)|safe }}<div><h2 style="margin:0">BSO Master console</h2><span class="muted">BlacSwanken Outreach</span></div></div>
-{% if err %}<div class="err">{{ err }}</div>{% endif %}
+{% if err %}<div class="err">{{ err }}</div>{% endif %}{% if request.args.get('reset') %}<div class="note">Password changed. Sign in with the new one.</div>{% endif %}
 <form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><label>ID or email</label><input name="email" required autofocus autocomplete="username">
-<label>Password</label><input name="password" type="password" required><p><button class="btn brand">Sign in</button></p></form></div></div>{% endblock %}"""
+<label>Password</label><input name="password" type="password" required><p><button class="btn brand">Sign in</button> <a href="{{ url_for('forgot') }}" style="margin-left:10px">Forgot password?</a></p></form></div></div>{% endblock %}"""
+T["forgot.html"] = """{% extends 'base.html' %}{% block title %}Forgot password{% endblock %}{% block body %}<div class="center card"><div class="card-b">
+<h2 style="margin-top:0">Reset your password</h2>
+{% if done %}<div class="note">If that ID or email belongs to a master or manager account and email is set up, a reset link is on its way. It works once and expires in 30 minutes.</div><a href="{{ url_for('login') }}">Back to sign in</a>
+{% else %}<form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><label>Your email or ID</label><input name="email" required autofocus><p><button class="btn brand">Email me a reset link</button> <a href="{{ url_for('login') }}" style="margin-left:10px">Cancel</a></p></form>{% endif %}</div></div>{% endblock %}"""
+T["reset.html"] = """{% extends 'base.html' %}{% block title %}Choose a new password{% endblock %}{% block body %}<div class="center card"><div class="card-b">
+{% if bad %}<h2 style="margin-top:0">This link has expired</h2><p>Reset links work once and last 30 minutes.</p><a class="btn brand" href="{{ url_for('forgot') }}">Get a new link</a>
+{% else %}<h2 style="margin-top:0">Choose a new password</h2>{% if err %}<div class="err">{{ err }}</div>{% endif %}
+<form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><label>New password (at least 10 characters)</label><input name="password" type="password" autocomplete="new-password" required autofocus>
+<label>Again</label><input name="password2" type="password" autocomplete="new-password" required><p><button class="btn brand">Save password</button></p></form>{% endif %}</div></div>{% endblock %}"""
 T["dashboard.html"] = """{% extends 'base.html' %}{% block body %}
 <div class="stats"><div class="stat"><small>Sent (7 days)</small><div>{{ totals.sent }}</div></div><div class="stat"><small>Replies (7 days)</small><div>{{ totals.replies }}</div></div>
 <div class="stat"><small>Interested replies</small><div>{{ totals.interested }}</div></div><div class="stat"><small>Drafts awaiting approval</small><div><a href="{{ url_for('approvals') }}">{{ totals.pending }}</a></div></div>
@@ -809,6 +931,12 @@ T["settings.html"] = """{% extends 'base.html' %}{% block title %}Settings{% end
 <ul><li>Install with <code>BSO-Setup.exe /HUB={{ public_url or 'https://your-hub-address' }}</code></li>
 <li>or <a href="{{ url_for('team_defaults_file') }}">download team-defaults.json</a> and put it in the BSO program folder (next to <code>BSO.exe</code>).</li></ul>
 <p class="muted" style="margin-bottom:0">Without either, BSO behaves as a normal single-user app and asks for the hub address when someone signs in under Settings → Team.</p></div></div>
+<div class="card"><div class="card-h"><h2>Outgoing email (for password-reset links)</h2></div><div class="card-b"><form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}">
+<div class="grid"><div><label>SMTP server</label><input name="host" value="{{ smtp.host }}" placeholder="smtp.gmail.com"></div><div><label>Port (587 or 465)</label><input name="port" value="{{ smtp.port or 587 }}"></div>
+<div><label>Login</label><input name="user" value="{{ smtp.user }}" autocomplete="off"></div><div><label>Password / app password {{ '(saved, leave blank to keep)' if smtp.password }}</label><input name="password" type="password" autocomplete="new-password"></div>
+<div><label>Send from</label><input name="from" value="{{ smtp['from'] }}" placeholder="BSO hub &lt;hub@your-company.com&gt;"></div></div>
+<p><button class="btn brand" name="action" value="smtp">Save</button> <button class="btn" name="action" value="smtp_test">Send a test email to me</button></p>
+<p class="muted" style="margin:0">Use a mailbox the hub may send from (for Gmail, an app password). Set the public address above too, so links in the email open the right place.</p></form></div></div>
 <div class="card"><div class="card-h"><h2>Change your password</h2></div><div class="card-b"><form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="password">
 <div class="grid"><div><label>Current password</label><input name="old" type="password" required></div><div><label>New password (10+ characters)</label><input name="new" type="password" required autocomplete="new-password"></div><div><label>New password again</label><input name="new2" type="password" required autocomplete="new-password"></div></div><p><button class="btn brand">Change password</button></p></form></div></div>{% endblock %}"""
 app.jinja_loader = DictLoader(T)
@@ -848,8 +976,23 @@ def main(argv=None):
     ap.add_argument("--host", default="127.0.0.1", help="use 0.0.0.0 to let other computers connect")
     ap.add_argument("--port", type=int, default=8780)
     ap.add_argument("--data", help="folder for the hub database (default: the BSO data folder)")
+    ap.add_argument("--reset-owner-password", action="store_true", help="locked out and email isn't set up? Set a new owner password from this computer")
     a = ap.parse_args(argv)
     d, key = prepare(a.data)
+    if a.reset_owner_password:
+        import getpass
+        con = sqlite3.connect(str(DB_PATH))
+        row = con.execute("SELECT id, email FROM users WHERE role='owner'").fetchone()
+        if not row:
+            sys.exit("No owner account yet: just start the hub and open the setup page.")
+        pw = getpass.getpass(f"New password for {row[1]} (10+ characters): ")
+        if not strong(pw) or pw != getpass.getpass("Again: "):
+            sys.exit("Not changed: passwords must match and be at least 10 characters.")
+        con.execute("UPDATE users SET pw_hash=? WHERE id=?", (generate_password_hash(pw), row[0]))
+        con.execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)", (iso(), "local", "owner_password_reset_cli", ""))
+        con.commit()
+        print("Owner password changed.")
+        return
     print(f"\n  BSO master hub, data folder: {d}")
     print(f"  Open http://{'127.0.0.1' if a.host == '0.0.0.0' else a.host}:{a.port}")
     if key:
