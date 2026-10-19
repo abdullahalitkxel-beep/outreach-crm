@@ -1,0 +1,2 @@
+# The master hub address built into BSO. Team members never type it.
+# Put the full https:// address on the line below (one line, no spaces), then rebuild.

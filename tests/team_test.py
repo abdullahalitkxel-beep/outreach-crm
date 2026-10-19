@@ -124,7 +124,7 @@ check(team.signed_in(), "second sign-in needs no consent box")
 
 # --- offline sign-in works from the cached check, not with a wrong password
 real = team.hub_url
-st = team.state(); st["hub"] = "http://127.0.0.1:1"; team.save_state(st)
+_dfl = team.defaults; team.defaults = lambda: {"hub": "http://127.0.0.1:1", "required": True}   # hub unreachable
 team.sign_out()
 try:
     team.sign_in(con, uname, "wrongpassword")
@@ -133,7 +133,7 @@ except ValueError:
     check(True, "offline: wrong password refused")
 team.sign_in(con, uname, pw)
 check(team.signed_in() and team.SIGNED_IN.get("offline"), "offline: right password lets the same person in (within grace)")
-st = team.state(); st["hub"] = "http://127.0.0.1:8791"; team.save_state(st)
+team.defaults = _dfl
 team.sign_in(con, uname, pw)
 
 # --- activity and drafts sync up
@@ -198,7 +198,7 @@ except ValueError:
 
 # --- the CRM itself opens on the sign-in screen, even with no admin file
 import crm  # noqa: E402
-(tmp / "laptop" / "team-defaults.json").unlink()
+(tmp / "laptop" / "team-defaults.json").unlink(missing_ok=True)
 team.leave()
 check(team.required(), "every install requires sign-in by default")
 w0 = crm.app.test_client()
@@ -212,6 +212,16 @@ r = w0.get("/")
 check(r.status_code == 302 and "/welcome" in r.headers["Location"], "after sign-in, terms come next")
 w0.post("/signout")
 _sp = w0.get("/signin").data; check(b"Hub address: http://127.0.0.1:8791" in _sp, "hub address is remembered")
+(tmp / "laptop" / "team-defaults.json").unlink(missing_ok=True)
+_orig_bi = team.built_in_hub
+team.built_in_hub = lambda: "http://127.0.0.1:8791"
+team.leave()
+_sp = w0.get("/signin").data
+check(b'name="hub"' not in _sp and b'name="username"' in _sp, "built-in hub address: sign-in asks only for ID and password")
+r = w0.post("/signin", data={"username": "ayesha", "password": "brand-new-pass-1", "consent": "1"})
+check(r.status_code == 302 and team.hub_url() == "http://127.0.0.1:8791", "sign-in uses the built-in hub")
+w0.post("/signout")
+team.built_in_hub = _orig_bi
 (tmp / "laptop" / "team-defaults.json").write_text(json.dumps({"hub": "http://127.0.0.1:8791", "required": True}))
 crm.write_settings({"legal_acceptance": {"version": str(crm.cfg().get("legal", {}).get("version", "1.0"))}})
 team.leave()

@@ -73,18 +73,32 @@ def app_dir():
     return Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 
 
+def built_in_hub():
+    """The hub address built into this copy of BSO (hub_address.txt, bundled at build time)."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    try:
+        for line in (base / "hub_address.txt").read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return line.rstrip("/")
+    except OSError:
+        pass
+    return ""
+
+
 def defaults():
-    """Set by the admin when installing: {"hub": "https://...", "required": true}."""
+    """Hub settings: a team-defaults.json next to BSO.exe (or in the data folder) wins; otherwise the built-in hub address."""
     for d in (app_dir(), Path(DATA)):
         try:
             return json.loads((d / "team-defaults.json").read_text(encoding="utf-8-sig"))
         except Exception:
             continue
-    return {}
+    hub = built_in_hub()
+    return {"hub": hub} if hub else {}
 
 
 def hub_url():
-    return (state().get("hub") or defaults().get("hub") or "").rstrip("/")
+    return (defaults().get("hub") or state().get("hub") or "").rstrip("/")
 
 
 def required():
