@@ -20,11 +20,14 @@ BSO laptops refuse to join a plain `http://` hub unless it is on a private netwo
 
 Then open **Settings** in the console and enter that address as *Public address of this hub*. Invites carry it.
 
-## 3. Add people
+## 3. Add people and install BSO for them
 
-1. **Users → Add a user**: name, email, role, daily cap, weekly target, and who approves their emails.
-2. Copy the invite line shown (it appears once, works once, expires in 7 days) and send it to the person privately.
-3. They paste it in BSO under **Settings → Team**, read the disclosure and tick the box. Their status turns to Online.
+1. **Users → Add a user**: name, email, sign-in **ID**, role, daily cap, weekly target, and who approves their emails. Leave the password blank to have one generated.
+2. The ID and password are shown **once**. Give them to the person privately.
+3. Install BSO on their computer so it asks for sign-in and knows your hub, either with `BSO-Setup.exe /HUB=https://hub.your-company.com`, or by downloading `team-defaults.json` from the hub's **Settings** page into the BSO program folder (next to `BSO.exe`).
+4. The person opens BSO, signs in with the ID and password, and ticks the box on first sign-in after reading what you can see. That is all they need.
+
+Until someone signs in, BSO opens nothing and sends nothing, including automatic runs. If the hub can't be reached, the same person can still sign in on that laptop for the grace period (default 72 hours).
 
 Roles: **owner** (everything, including users and settings), **manager** (sees everyone, approves drafts, signs in to the console), **member** (uses BSO on their laptop).
 
@@ -33,11 +36,13 @@ Roles: **owner** (everything, including users and settings), **manager** (sees e
 - **Pause / resume** an account: their BSO stops sending at its next check-in.
 - **Daily cap** and **weekly target**: the cap is enforced on the laptop; the target shows as progress.
 - **Approval**: "The master approves every email" holds their drafts; you edit, approve or reject on the Approvals page and the email goes out from their own inbox on their next run.
-- **Disconnect laptops** revokes access; the person needs a new invite.
+- **Reset password** signs that person's laptops out until they sign in with the new one. **Disconnect laptops** signs them out without changing the password.
 - **Audit log** (owner) records every change made in the console.
 
 If a laptop can't reach the hub for the grace period (default 72 hours, adjustable in Settings), it pauses sending.
 
 ## 5. Security notes
 
-Passwords and device tokens are stored hashed; sign-in and invite attempts are rate-limited; forms are CSRF-protected; sessions expire after 12 hours. The hub never receives anyone's inbox passwords, API keys, lead lists or reply text. Tell your team before you switch this on: the Privacy Policy section 7 covers it, but your own employment rules may add duties.
+Passwords and device tokens are stored hashed (the hub never keeps a readable password); sign-in and invite attempts are rate-limited; forms are CSRF-protected; sessions expire after 12 hours. The hub never receives anyone's inbox passwords, API keys, lead lists or reply text. Tell your team before you switch this on: the Privacy Policy section 7 covers it, but your own employment rules may add duties.
+
+A person with full control of their own Windows account could tamper with their local copy of BSO. The hub will then simply stop hearing from that laptop (the Overview shows it as Offline), which is how you would notice.

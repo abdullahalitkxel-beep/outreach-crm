@@ -102,7 +102,7 @@ def job_running():
         con.close()
 
 
-OPEN_ENDPOINTS = {"welcome", "accept_terms", "legal_doc", "about", "heartbeat", "quit_app", "static", "app_icon", "favicon", "web_manifest"}
+OPEN_ENDPOINTS = {"signin", "welcome", "accept_terms", "legal_doc", "about", "heartbeat", "quit_app", "static", "app_icon", "favicon", "web_manifest"}
 
 
 @app.route("/favicon.ico")
@@ -139,6 +139,39 @@ def require_terms():
         return redirect(url_for("welcome"))
 
 
+@app.before_request
+def require_signin():
+    """When the admin has made sign-in mandatory, nothing opens until the person signs in with their ID and password."""
+    if request.endpoint and request.endpoint not in OPEN_ENDPOINTS and team.required() and not team.signed_in():
+        return redirect(url_for("signin", next=request.full_path.rstrip("?")))
+
+
+@app.route("/signin", methods=["GET", "POST"])
+def signin():
+    err = None
+    nxt = request.values.get("next", "")
+    nxt = nxt if nxt.startswith("/") and not nxt.startswith("//") else url_for("home")
+    if team.signed_in():
+        return redirect(nxt)
+    if request.method == "POST":
+        try:
+            team.sign_in(db(), request.form.get("username"), request.form.get("password"),
+                         consent=request.form.get("consent") == "1", hub=request.form.get("hub") or None)
+            return redirect(nxt)
+        except ValueError as e:
+            err = str(e)
+    st = team.state()
+    return render("signin.html", err=err, nxt=nxt, hub=team.hub_url(), hub_fixed=bool(team.defaults().get("hub")),
+                  first=not st.get("username"), disclosure=team.DISCLOSURE, last_user=st.get("username", ""),
+                  optional=not team.required())
+
+
+@app.post("/signout")
+def signout():
+    team.sign_out()
+    return redirect(url_for("signin") if team.required() else url_for("home"))
+
+
 def today():
     return date.today().isoformat()
 
@@ -170,7 +203,7 @@ def render(name, **ctx):
         request=request, url_for=url_for, money=money, today=today(), status_labels=STATUS_LABELS,
         stages=STAGES, nav_items=nav, active=active, review_count=review_count, job_labels=JOB_LABELS,
         test_redirect=test_redirect(), test_mode_broken=tm.get("enabled") and not tm.get("redirect_to"),
-        currency=cfg().get("currency", "$"), app_version=legal_docs_version(), publisher=cfg().get("publisher", "BlacSwanken"),
+        team_user=team.signed_in(), team_name=team.SIGNED_IN.get("name"), currency=cfg().get("currency", "$"), app_version=legal_docs_version(), publisher=cfg().get("publisher", "BlacSwanken"),
         qs=lambda **kw: url_for(request.endpoint, **{**(request.view_args or {}), **request.args.to_dict(), **kw}),
         **ctx)
 
@@ -880,6 +913,8 @@ def _autorun_loop():
     while True:
         _t.sleep(30)
         try:
+            if team.required() and not team.signed_in():
+                continue          # nothing runs until someone has signed in
             c = load_config(CONFIG_PATH)
             minutes = int((c.get("autorun") or {}).get("every_minutes") or 0)
             if (c.get("autorun") or {}).get("enabled") and minutes and _t.time() - last >= minutes * 60:
@@ -1137,21 +1172,13 @@ def settings():
                         "SLACK_WEBHOOK_URL": mask(env("SLACK_WEBHOOK_URL"))},
                   tab=request.args.get("tab", "inbox"), result=request.args.get("result"),
                   ok=request.args.get("ok"), avoid_hits=template_avoid_hits(c), avoid_n=len(c.get("avoid_phrases") or []),
-                  team=dict(team.state(), joined=team.joined(), policy=team.policy(), disclosure=team.DISCLOSURE))
-
-
-@app.post("/settings/team/join")
-def team_join():
-    try:
-        pol, url = team.join(request.form.get("invite", ""), request.form.get("consent") == "1")
-    except ValueError as e:
-        return redirect(url_for("settings", tab="team", result=str(e)))
-    team.finish_join(db(), url, pol)
-    return redirect(url_for("settings", tab="team", result="You're on the team.", ok=1))
+                  team=dict(team.state(), joined=team.joined(), policy=team.policy(), disclosure=team.DISCLOSURE, locked=team.locked_in(), signed=team.signed_in()))
 
 
 @app.post("/settings/team/leave")
 def team_leave():
+    if team.locked_in():
+        return redirect(url_for("settings", tab="team", result="This install is managed by your admin and can't leave the team."))
     team.leave()
     return redirect(url_for("settings", tab="team", result="You left the team.", ok=1))
 

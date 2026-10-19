@@ -1,16 +1,19 @@
 """Team mode, the laptop side: connect this BSO to a team hub run by your manager.
 
-Nothing here runs unless the person has joined a team (Settings -> Team) and agreed to the disclosure.
+Nothing here runs unless the person signs in to a team (the admin gives them an ID and password) and agrees to the disclosure.
 What is shared with the hub: send / reply-label / bounce / draft events (lead email, company, step, which of
 your inboxes sent it), and, only when your manager requires approval, the text of drafts waiting for approval.
 Never shared: passwords, API keys, inbox credentials, the text of replies, your lead list, notes.
 The hub's policy (paused, daily cap, approval mode) is enforced here before BSO sends.
 """
-import base64
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
+import secrets
 import socket
+import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -29,7 +32,7 @@ DISCLOSURE = [
     "If your manager requires approval, they can read, edit and approve or reject your drafts before they send.",
     "Your manager can pause your account, set a daily send cap and a weekly target, and see when this laptop last connected.",
     "Never shared: your passwords, API keys, inbox logins, your lead list, your notes, or the text of replies.",
-    "You can leave the team any time in Settings → Team. Your data stays on this laptop; your manager keeps the activity log already sent.",
+    "Your data stays on this laptop; your manager keeps the activity log already sent. If you stop working with the team, your admin removes your account.",
 ]
 
 
@@ -61,7 +64,59 @@ def holds_approval():
     return joined() and policy().get("approval") == "master"
 
 
-# ---------------------------------------------------------------- joining
+# ---------------------------------------------------------------- signing in
+
+SIGNED_IN = {}          # lives only in this running app: who is signed in right now
+
+
+def app_dir():
+    return Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+
+
+def defaults():
+    """Set by the admin when installing: {"hub": "https://...", "required": true}."""
+    for d in (app_dir(), Path(DATA)):
+        try:
+            return json.loads((d / "team-defaults.json").read_text(encoding="utf-8-sig"))
+        except Exception:
+            continue
+    return {}
+
+
+def hub_url():
+    return (state().get("hub") or defaults().get("hub") or "").rstrip("/")
+
+
+def required():
+    """True when this install must be signed in with an ID and password before it can be used."""
+    return bool(defaults().get("required") or state().get("required"))
+
+
+def locked_in():
+    return bool(defaults().get("required"))
+
+
+def signed_in():
+    return SIGNED_IN.get("user")
+
+
+def sign_out():
+    SIGNED_IN.clear()
+
+
+def check_hub_url(url):
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        raise ValueError("Enter the hub address your admin gave you.")
+    if "://" not in url:
+        url = "https://" + url
+    u = urlparse(url)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise ValueError("That hub address isn't valid.")
+    if u.scheme == "http" and not _private_host(u.hostname):
+        raise ValueError("This hub is not using HTTPS. BSO only connects to a hub over the internet when it is encrypted (https://). Ask your admin to set up HTTPS.")
+    return url
+
 
 def _private_host(host):
     if host in ("localhost",) or host.endswith(".local") or host.endswith(".lan"):
@@ -74,25 +129,6 @@ def _private_host(host):
             return ipaddress.ip_address(socket.gethostbyname(host)).is_private
         except Exception:
             return False
-
-
-def parse_invite(text):
-    """'BSO1.<base64 json>' -> (hub_url, code). Raises ValueError with a friendly message."""
-    text = (text or "").strip()
-    if not text.startswith("BSO1."):
-        raise ValueError("That doesn't look like an invite. It starts with BSO1. Paste the whole line your manager sent.")
-    raw = text[5:]
-    try:
-        j = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
-        url, code = str(j["u"]).rstrip("/"), str(j["c"])
-    except Exception:
-        raise ValueError("The invite is damaged. Copy it again, the whole line.")
-    u = urlparse(url)
-    if u.scheme not in ("http", "https") or not u.hostname:
-        raise ValueError("The invite has no valid hub address.")
-    if u.scheme == "http" and not _private_host(u.hostname):
-        raise ValueError("This hub is not using HTTPS. BSO only connects to a hub over the internet when it is encrypted (https://). Ask your manager to set up HTTPS.")
-    return url, code
 
 
 def _post(url, path, payload, token=None, timeout=20):
@@ -110,28 +146,62 @@ def _post(url, path, payload, token=None, timeout=20):
             return e.code, {}
 
 
-def join(invite, consent, device=None):
-    if not consent:
+def _verifier(username, password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", f"{username}\0{password}".encode(), bytes.fromhex(salt), 200_000).hex()
+    return {"salt": salt, "hash": h}
+
+
+def _verify_offline(s, username, password):
+    v = s.get("verifier") or {}
+    if not v or s.get("username") != username:
+        return False
+    return hmac.compare_digest(_verifier(username, password, v["salt"])["hash"], v["hash"])
+
+
+def sign_in(con, username, password, consent=False, hub=None):
+    """Sign in with the ID and password the admin created. Returns the policy. Raises ValueError with a friendly message."""
+    username = (username or "").strip().lower()
+    if not username or not password:
+        raise ValueError("Enter your ID and password.")
+    s = state()
+    first_time = s.get("username") != username
+    if first_time and not consent:
         raise ValueError("Tick the box to confirm you've read what your manager will be able to see.")
-    url, code = parse_invite(invite)
-    device = device or os.getenv("COMPUTERNAME") or socket.gethostname()
+    url = check_hub_url(hub or hub_url())
+    device = os.getenv("COMPUTERNAME") or socket.gethostname()
     try:
-        status, j = _post(url, "/api/v1/join", {"code": code, "device": device})
+        status, j = _post(url, "/api/v1/login", {"username": username, "password": password, "device": device})
     except (urllib.error.URLError, OSError, TimeoutError) as e:
-        raise ValueError(f"Can't reach the hub at {url}. Check your internet connection and the invite. ({getattr(e, 'reason', e)})")
+        # hub unreachable: allow the same person back in on this laptop for a limited time
+        grace = int(((s.get("policy") or {}).get("grace_hours", 72)) or 0)
+        try:
+            recent = grace == 0 or now_utc() - datetime.fromisoformat(s.get("last_ok")).astimezone(timezone.utc) <= timedelta(hours=grace)
+        except Exception:
+            recent = False
+        if _verify_offline(s, username, password) and recent and not s.get("revoked"):
+            SIGNED_IN.update(user=username, name=(s.get("policy") or {}).get("name", username), offline=True)
+            return s.get("policy") or {}
+        raise ValueError(f"Can't reach the hub at {url}. Check your internet connection. ({getattr(e, 'reason', e)})")
     if status != 200 or "token" not in j:
-        raise ValueError(j.get("error") or f"The hub refused the invite (code {status}).")
+        raise ValueError(j.get("error") or f"Sign-in failed (code {status}).")
     SECRETS.set(TOKEN_KEY, j["token"])
-    return j.get("policy") or {}, url
-
-
-def finish_join(con, url, pol):
-    last = con.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
-    save_state({"hub": url, "policy": pol, "joined_at": iso(now_utc()), "consent": CONSENT_VERSION,
-                "last_event_id": last, "last_ok": iso(now_utc()), "drafts_sent": [], "ack": []})
+    pol = j.get("policy") or {}
+    if first_time:
+        last = con.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
+        s = {"joined_at": iso(now_utc()), "last_event_id": last, "drafts_sent": [], "ack": []}
+    s.update(hub=url, username=username, policy=pol, consent=CONSENT_VERSION, last_ok=iso(now_utc()),
+             verifier=_verifier(username, password), required=True)
+    s.pop("revoked", None)
+    save_state(s)
+    SIGNED_IN.clear()
+    SIGNED_IN.update(user=username, name=pol.get("name", username))
+    return pol
 
 
 def leave():
+    """Only for installs the admin has not locked to a team."""
+    sign_out()
     SECRETS.set(TOKEN_KEY, "")
     try:
         STATE.unlink()
@@ -239,6 +309,8 @@ def sync(con, version=""):
 def gate(con, version=""):
     """Called before BSO sends. Returns (allowed, reason, daily_cap or 0)."""
     if not joined():
+        if required():
+            return False, "Sign in to BSO with your ID and password first.", 0
         return True, "", 0
     sync(con, version)
     s, p = state(), policy()

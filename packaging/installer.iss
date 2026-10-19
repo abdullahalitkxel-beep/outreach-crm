@@ -70,4 +70,8 @@ var
 begin
   if CurStep = ssInstall then
     Exec(ExpandConstant('{cmd}'), '/C taskkill /IM OutreachCRM.exe /F', '', SW_HIDE, ewWaitUntilTerminated, rc);
+  { managed install: BSO-Setup.exe /HUB=https://hub.example.com  makes sign-in with an admin-issued ID mandatory }
+  if (CurStep = ssPostInstall) and (ExpandConstant('{param:HUB|}') <> '') then
+    SaveStringToFile(ExpandConstant('{app}\team-defaults.json'),
+      '{"hub": "' + ExpandConstant('{param:HUB|}') + '", "required": true}', False);
 end;

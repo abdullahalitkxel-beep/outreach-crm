@@ -1,6 +1,6 @@
 """BSO master hub: the console where a team owner sets up users, sets their limits and targets,
 approves their drafts and watches their activity. Team members keep BSO on their own laptops; each laptop
-connects to this hub with an invite code (see team.py).
+signs in to this hub with the ID and password the admin created for them (see team.py).
 
 Run it on a computer or server the team can reach:
     BSO.exe --hub                 (Windows app)      or      python hub.py --host 0.0.0.0 --port 8780
@@ -37,7 +37,6 @@ import brand
 ROLES = ("owner", "manager", "member")
 EVENT_TYPES = ("sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "settings", "app_start", "paused")
 ONLINE_MINUTES = 10
-INVITE_DAYS = 7
 GRACE_HOURS = 72
 _lock = threading.Lock()
 
@@ -61,7 +60,7 @@ def data_dir():
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, role TEXT NOT NULL DEFAULT 'member',
+    id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, username TEXT, role TEXT NOT NULL DEFAULT 'member',
     status TEXT NOT NULL DEFAULT 'invited',          -- invited | active | disabled
     pw_hash TEXT, daily_cap INTEGER DEFAULT 0, weekly_target INTEGER DEFAULT 0,
     approval TEXT DEFAULT 'member',                  -- member | master (the master approves every draft)
@@ -120,6 +119,11 @@ def db():
 def init_db():
     con = sqlite3.connect(str(DB_PATH), timeout=30)
     con.executescript(SCHEMA)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(users)")}
+    if "username" not in cols:
+        con.execute("ALTER TABLE users ADD COLUMN username TEXT")
+        con.execute("UPDATE users SET username=lower(email) WHERE username IS NULL")
+    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username)")
     con.commit()
     con.close()
 
@@ -201,7 +205,7 @@ def _load():
     g.me = None
     uid = session.get("uid")
     if uid:
-        u = db().execute("SELECT * FROM users WHERE id=? AND status='active' AND role IN ('owner','manager')", (uid,)).fetchone()
+        u = db().execute("SELECT * FROM users WHERE id=? AND status!='disabled' AND role IN ('owner','manager')", (uid,)).fetchone()
         g.me = dict(u) if u else None
         if not g.me:
             session.clear()
@@ -308,8 +312,8 @@ def setup():
         elif "@" not in f.get("email", "") or not f.get("name", "").strip():
             err = "Enter your name and email."
         else:
-            db().execute("INSERT INTO users(name,email,role,status,pw_hash,created_at) VALUES(?,?,?,?,?,?)",
-                         (f["name"].strip(), f["email"].strip().lower(), "owner", "active", generate_password_hash(f["password"]), iso()))
+            db().execute("INSERT INTO users(name,email,username,role,status,pw_hash,created_at) VALUES(?,?,?,?,?,?,?)",
+                         (f["name"].strip(), f["email"].strip().lower(), f["email"].strip().lower(), "owner", "active", generate_password_hash(f["password"]), iso()))
             meta_set("org_name", f.get("org", "").strip() or "Your team")
             db().commit()
             try:
@@ -337,7 +341,7 @@ def login():
         if throttled(k1, 5, 900) or throttled(k2, 30, 900):
             err = "Too many failed attempts. Wait 15 minutes and try again."
         else:
-            u = db().execute("SELECT * FROM users WHERE email=? AND status='active' AND role IN ('owner','manager')", (email,)).fetchone()
+            u = db().execute("SELECT * FROM users WHERE (username=? OR email=?) AND status!='disabled' AND role IN ('owner','manager')", (email, email)).fetchone()
             if u and u["pw_hash"] and check_password_hash(u["pw_hash"], request.form.get("password", "")):
                 throttle_clear(k1)
                 session.clear()
@@ -406,7 +410,7 @@ def dashboard():
 @app.route("/users")
 @need()
 def users():
-    return render("users.html", stats=user_stats(30), tab="users", new_invite=session.pop("new_invite", None))
+    return render("users.html", stats=user_stats(30), tab="users", new_creds=session.pop("new_creds", None))
 
 
 def _valid_int(v, lo=0, hi=100000):
@@ -416,14 +420,17 @@ def _valid_int(v, lo=0, hi=100000):
         return 0
 
 
-def make_invite(uid, days=INVITE_DAYS):
-    code = "BSO-" + "-".join("".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(5)) for _ in range(4))
-    db().execute("UPDATE invites SET expires_at=? WHERE user_id=? AND used_at IS NULL", (iso(), uid))
-    db().execute("INSERT INTO invites(user_id, code_hash, expires_at) VALUES(?,?,?)", (uid, sha(code), iso(now() + timedelta(days=days))))
-    db().commit()
-    base = (meta_get("public_url") or request.host_url).rstrip("/")
-    blob = base64.urlsafe_b64encode(json.dumps({"u": base, "c": code}).encode()).decode().rstrip("=")
-    return {"code": code, "string": "BSO1." + blob, "url": base, "expires": iso(now() + timedelta(days=days))}
+def gen_password():
+    return "".join(secrets.choice("abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(12))
+
+
+def clean_username(v):
+    return re.sub(r"[^a-z0-9._@-]", "", (v or "").strip().lower())[:60]
+
+
+def creds_note(name, username, password):
+    return {"name": name, "username": username, "password": password,
+            "url": (meta_get("public_url") or request.host_url).rstrip("/")}
 
 
 @app.post("/users/new")
@@ -431,21 +438,21 @@ def make_invite(uid, days=INVITE_DAYS):
 def user_new():
     f = request.form
     name, email, role = f.get("name", "").strip(), f.get("email", "").strip().lower(), f.get("role", "member")
-    if not name or "@" not in email or role not in ROLES or role == "owner":
-        return redirect(url_for("users", err="Enter a name, a valid email and a role."))
-    if db().execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
-        return redirect(url_for("users", err="That email is already a user."))
-    pw = f.get("password", "")
-    if role == "manager" and not strong(pw):
-        return redirect(url_for("users", err="Managers sign in to this console: give them a password of at least 10 characters."))
-    db().execute("INSERT INTO users(name,email,role,status,pw_hash,daily_cap,weekly_target,approval,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                 (name, email, role, "invited", generate_password_hash(pw) if role == "manager" else None,
+    username = clean_username(f.get("username")) or clean_username(email.split("@")[0])
+    if not name or "@" not in email or role not in ROLES or role == "owner" or len(username) < 3:
+        return redirect(url_for("users", err="Enter a name, an ID of at least 3 characters, a valid email and a role."))
+    if db().execute("SELECT 1 FROM users WHERE email=? OR username=?", (email, username)).fetchone():
+        return redirect(url_for("users", err="That ID or email is already used."))
+    pw = f.get("password", "") or gen_password()
+    if not strong(pw):
+        return redirect(url_for("users", err="The password must be at least 10 characters (or leave it blank to generate one)."))
+    db().execute("INSERT INTO users(name,email,username,role,status,pw_hash,daily_cap,weekly_target,approval,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                 (name, email, username, role, "invited", generate_password_hash(pw),
                   _valid_int(f.get("daily_cap")), _valid_int(f.get("weekly_target")),
                   "master" if f.get("approval") == "master" else "member", iso()))
     db().commit()
-    uid = db().execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()["id"]
-    audit("user_created", f"{email} ({role})")
-    session["new_invite"] = dict(make_invite(uid), name=name)
+    audit("user_created", f"{username} ({role})")
+    session["new_creds"] = creds_note(name, username, pw)
     return redirect(url_for("users"))
 
 
@@ -456,7 +463,7 @@ def user_detail(uid):
     st = next(s for s in user_stats(30) if s["u"]["id"] == uid)
     events = db().execute("SELECT * FROM events WHERE user_id=? ORDER BY at DESC, id DESC LIMIT 60", (uid,)).fetchall()
     devices = db().execute("SELECT * FROM devices WHERE user_id=? ORDER BY created_at DESC", (uid,)).fetchall()
-    return render("user.html", u=dict(u), st=st, events=events, devices=devices, tab="users", new_invite=session.pop("new_invite", None))
+    return render("user.html", u=dict(u), st=st, events=events, devices=devices, tab="users", new_creds=session.pop("new_creds", None))
 
 
 @app.post("/users/<int:uid>")
@@ -472,20 +479,21 @@ def user_save(uid):
         db().execute("UPDATE users SET name=?, role=?, daily_cap=?, weekly_target=?, approval=?, note=? WHERE id=?",
                      (f.get("name", u["name"]).strip() or u["name"], role, _valid_int(f.get("daily_cap")), _valid_int(f.get("weekly_target")),
                       "master" if f.get("approval") == "master" else "member", f.get("note", "")[:300], uid))
-        if f.get("password"):
-            if not strong(f["password"]):
-                return redirect(url_for("user_detail", uid=uid, err="Password must be at least 10 characters."))
-            db().execute("UPDATE users SET pw_hash=? WHERE id=?", (generate_password_hash(f["password"]), uid))
         audit("user_changed", f"{u['email']}: role={role} cap={f.get('daily_cap')} target={f.get('weekly_target')} approval={f.get('approval')}")
     elif action in ("disable", "enable"):
         if u["role"] == "owner":
             abort(400, "The owner can't be disabled.")
-        new = "disabled" if action == "disable" else ("active" if db().execute("SELECT 1 FROM devices WHERE user_id=?", (uid,)).fetchone() or u["pw_hash"] else "invited")
+        new = "disabled" if action == "disable" else ("active" if db().execute("SELECT 1 FROM devices WHERE user_id=?", (uid,)).fetchone() or u["role"] != "member" else "invited")
         db().execute("UPDATE users SET status=? WHERE id=?", (new, uid))
         audit("user_" + action + "d", u["email"])
-    elif action == "invite":
-        session["new_invite"] = dict(make_invite(uid), name=u["name"])
-        audit("invite_created", u["email"])
+    elif action == "resetpw":
+        pw = f.get("password", "") or gen_password()
+        if not strong(pw):
+            return redirect(url_for("user_detail", uid=uid, err="Password must be at least 10 characters (or leave blank to generate one)."))
+        db().execute("UPDATE users SET pw_hash=? WHERE id=?", (generate_password_hash(pw), uid))
+        db().execute("UPDATE devices SET revoked=1 WHERE user_id=?", (uid,))   # a new password signs the old laptops out
+        session["new_creds"] = creds_note(u["name"], u["username"] or u["email"], pw)
+        audit("password_reset", u["email"])
     elif action == "revoke":
         db().execute("UPDATE devices SET revoked=1 WHERE user_id=?", (uid,))
         audit("devices_revoked", u["email"])
@@ -539,6 +547,16 @@ def activity():
     rows = db().execute(q + " ORDER BY e.at DESC, e.id DESC LIMIT 200", a).fetchall()
     ulist = db().execute("SELECT id, name FROM users ORDER BY name").fetchall()
     return render("activity.html", rows=rows, ulist=ulist, uid=uid, typ=typ, types=EVENT_TYPES, tab="activity")
+
+
+@app.route("/team-defaults.json")
+@need("owner")
+def team_defaults_file():
+    """Drop this file next to BSO.exe to make that install sign-in-only and point it at this hub."""
+    url = (meta_get("public_url") or request.host_url).rstrip("/")
+    resp = app.response_class(json.dumps({"hub": url, "required": True}, indent=1), mimetype="application/json")
+    resp.headers["Content-Disposition"] = "attachment; filename=team-defaults.json"
+    return resp
 
 
 @app.route("/audit")
@@ -597,29 +615,34 @@ def policy_for(u):
             "message": "Your account is paused by your manager." if u["status"] != "active" else ""}
 
 
-@app.post("/api/v1/join")
-def api_join():
-    ip = request.remote_addr or "?"
-    if throttled("join:" + ip, 10, 3600):
-        return jsonify(error="Too many attempts. Try again later."), 429
+@app.post("/api/v1/login")
+def api_login():
     j = request.get_json(silent=True) or {}
-    code = str(j.get("code", "")).strip().upper()
-    inv = db().execute("SELECT * FROM invites WHERE code_hash=? AND used_at IS NULL", (sha(code),)).fetchone()
-    if not inv or (parse(inv["expires_at"]) or now()) < now():
-        throttle_hit("join:" + ip, 3600)
-        return jsonify(error="That invite code is wrong, already used, or expired. Ask your manager for a new one."), 400
-    u = db().execute("SELECT * FROM users WHERE id=?", (inv["user_id"],)).fetchone()
+    username = clean_username(j.get("username"))
+    ip = request.remote_addr or "?"
+    k1, k2 = f"alogin:{ip}:{username}", f"aloginip:{ip}"
+    if throttled(k1, 5, 900) or throttled(k2, 40, 900):
+        return jsonify(error="Too many failed attempts. Wait 15 minutes and try again."), 429
+    u = db().execute("SELECT * FROM users WHERE username=? OR email=?", (username, username)).fetchone()
+    if not u or not u["pw_hash"] or not check_password_hash(u["pw_hash"], str(j.get("password", ""))):
+        throttle_hit(k1, 900)
+        throttle_hit(k2, 900)
+        return jsonify(error="ID or password is wrong."), 401
+    if u["status"] == "disabled":
+        return jsonify(error="This account is paused. Contact your manager."), 403
+    throttle_clear(k1)
     token = secrets.token_urlsafe(32)
-    db().execute("UPDATE invites SET used_at=? WHERE id=?", (iso(), inv["id"]))
+    device = str(j.get("device", "laptop"))[:80]
+    db().execute("UPDATE devices SET revoked=1 WHERE user_id=? AND name=? AND revoked=0", (u["id"], device))
     db().execute("INSERT INTO devices(user_id, token_hash, name, created_at, last_seen) VALUES(?,?,?,?,?)",
-                 (u["id"], sha(token), str(j.get("device", "laptop"))[:80], iso(), iso()))
+                 (u["id"], sha(token), device, iso(), iso()))
     if u["status"] == "invited":
         db().execute("UPDATE users SET status='active' WHERE id=?", (u["id"],))
     db().commit()
     u = db().execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
     g.me = None
-    audit("device_joined", f"{u['email']} / {str(j.get('device', ''))[:60]}")
-    return jsonify(token=token, policy=policy_for(dict(u)))
+    audit("device_signed_in", f"{u['username']} / {device}")
+    return jsonify(token=token, policy=policy_for(dict(u)), username=u["username"])
 
 
 @app.post("/api/v1/sync")
@@ -715,7 +738,7 @@ T["setup.html"] = """{% extends 'base.html' %}{% block title %}Set up{% endblock
 T["login.html"] = """{% extends 'base.html' %}{% block title %}Sign in{% endblock %}{% block body %}<div class="center card"><div class="card-b">
 <div class="logo">{{ logo(56, tile=True, uid='lg', animated=True)|safe }}<div><h2 style="margin:0">BSO Master console</h2><span class="muted">BlacSwanken Outreach</span></div></div>
 {% if err %}<div class="err">{{ err }}</div>{% endif %}
-<form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><label>Email</label><input name="email" type="email" required autofocus>
+<form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><label>ID or email</label><input name="email" required autofocus autocomplete="username">
 <label>Password</label><input name="password" type="password" required><p><button class="btn brand">Sign in</button></p></form></div></div>{% endblock %}"""
 T["dashboard.html"] = """{% extends 'base.html' %}{% block body %}
 <div class="stats"><div class="stat"><small>Sent (7 days)</small><div>{{ totals.sent }}</div></div><div class="stat"><small>Replies (7 days)</small><div>{{ totals.replies }}</div></div>
@@ -727,39 +750,41 @@ T["dashboard.html"] = """{% extends 'base.html' %}{% block body %}
 <div class="card"><div class="card-h"><h2>Team, last 7 days</h2><span class="muted">A laptop reports each time it syncs, about every 2 minutes while BSO is open.</span></div>
 <table><tr><th>User</th><th>Status</th><th class="r">Today</th><th class="r">Sent</th><th class="r">Replies</th><th class="r">Reply rate</th><th class="r">Interested</th><th class="r">Bounces</th><th>Weekly target</th><th class="r">Awaiting approval</th><th>Last seen</th></tr>
 {% for s in stats %}<tr><td><a href="{{ url_for('user_detail', uid=s.u.id) }}"><b>{{ s.u.name }}</b></a><br><span class="muted">{{ s.u.role }}</span></td>
-<td>{% if s.u.status == 'disabled' %}<span class="badge b-bad">Paused</span>{% elif s.u.status == 'invited' %}<span class="badge b-warn">Invited</span>{% else %}<span class="dot {{ 'on' if s.online }}"></span>{{ 'Online' if s.online else 'Offline' }}{% endif %}</td>
+<td>{% if s.u.status == 'disabled' %}<span class="badge b-bad">Paused</span>{% elif s.u.status == 'invited' %}<span class="badge b-warn">Not signed in yet</span>{% else %}<span class="dot {{ 'on' if s.online }}"></span>{{ 'Online' if s.online else 'Offline' }}{% endif %}</td>
 <td class="r">{{ s.today }}{% if s.u.daily_cap %} / {{ s.u.daily_cap }}{% endif %}</td><td class="r">{{ s.sent }}</td><td class="r">{{ s.replies }}</td><td class="r">{{ s.rate }}</td><td class="r">{{ s.interested }}</td><td class="r">{{ s.bounces }}</td>
 <td>{% if s.pct is not none %}<div class="bar" title="{{ s.week_sent }} of {{ s.u.weekly_target }}"><i style="width:{{ s.pct }}%"></i></div><small class="muted">{{ s.week_sent }} / {{ s.u.weekly_target }}</small>{% else %}<span class="muted">none set</span>{% endif %}</td>
 <td class="r">{% if s.pending %}<a href="{{ url_for('approvals') }}">{{ s.pending }}</a>{% else %}0{% endif %}</td><td class="muted">{{ s.u.last_seen|ago }}</td></tr>
 {% else %}<tr><td colspan="11" class="muted">No users yet. Add one on the Users page.</td></tr>{% endfor %}</table></div>{% endblock %}"""
-T["_invite.html"] = """{% if new_invite %}<div class="note"><b>Invite for {{ new_invite.name }}</b> (valid until {{ new_invite.expires|dt }}, works once).<br>Send them this single line. They paste it in BSO under <i>Settings → Team → Join a team</i>:
-<div class="code" style="margin:8px 0">{{ new_invite.string }}</div><span class="muted">Or code <b>{{ new_invite.code }}</b> with hub address <b>{{ new_invite.url }}</b>. This is shown only once.</span></div>{% endif %}"""
+T["_invite.html"] = """{% if new_creds %}<div class="note"><b>Sign-in details for {{ new_creds.name }}</b> (shown only once. Give them to the person privately.)<br>
+<div class="code" style="margin:8px 0">ID: {{ new_creds.username }}<br>Password: {{ new_creds.password }}</div>
+<span class="muted">They install BSO, open it and sign in with these. {% if new_creds.url %}Hub address (if BSO asks): <b>{{ new_creds.url }}</b>.{% endif %}</span></div>{% endif %}"""
 T["users.html"] = """{% extends 'base.html' %}{% block title %}Users{% endblock %}{% block body %}{% include '_invite.html' %}
 <div class="card"><div class="card-h"><h2>Users</h2></div><table><tr><th>Name</th><th>Role</th><th>Status</th><th>Daily cap</th><th>Weekly target</th><th>Approval</th><th class="r">Sent (30 d)</th><th class="r">Replies</th><th>Last seen</th></tr>
-{% for s in stats %}{% set u = s.u %}<tr><td><a href="{{ url_for('user_detail', uid=u.id) }}"><b>{{ u.name }}</b></a><br><span class="muted">{{ u.email }}</span></td><td>{{ u.role }}</td>
+{% for s in stats %}{% set u = s.u %}<tr><td><a href="{{ url_for('user_detail', uid=u.id) }}"><b>{{ u.name }}</b></a><br><span class="muted">ID: {{ u.username or u.email }}</span></td><td>{{ u.role }}</td>
 <td><span class="badge {{ 'b-ok' if u.status == 'active' else 'b-bad' if u.status == 'disabled' else 'b-warn' }}">{{ u.status }}</span></td><td>{{ u.daily_cap or 'no cap' }}</td><td>{{ u.weekly_target or '–' }}</td>
 <td>{{ 'Master approves' if u.approval == 'master' else 'Self' }}</td><td class="r">{{ s.sent }}</td><td class="r">{{ s.replies }}</td><td class="muted">{{ u.last_seen|ago }}</td></tr>{% endfor %}</table></div>
 {% if me.role == 'owner' %}<div class="card"><div class="card-h"><h2>Add a user</h2></div><div class="card-b"><form method="post" action="{{ url_for('user_new') }}"><input type="hidden" name="_csrf" value="{{ csrf }}">
 <div class="grid"><div><label>Name</label><input name="name" required></div><div><label>Email</label><input name="email" type="email" required></div>
-<div><label>Role</label><select name="role"><option value="member">Member (uses BSO on their laptop)</option><option value="manager">Manager (member + can view all and approve)</option></select></div>
-<div><label>Console password (managers only, 10+ characters)</label><input name="password" type="password" autocomplete="new-password"></div>
+<div><label>Sign-in ID (blank = part of email before @)</label><input name="username" autocomplete="off"></div>
+<div><label>Role</label><select name="role"><option value="member">Member (uses BSO on their laptop)</option><option value="manager">Manager (member + can use this console)</option></select></div>
+<div><label>Password (10+ characters; blank = generate one)</label><input name="password" autocomplete="off"></div>
 <div><label>Daily send cap (0 = no cap)</label><input name="daily_cap" type="number" min="0" value="0"></div><div><label>Weekly target (emails, 0 = none)</label><input name="weekly_target" type="number" min="0" value="0"></div>
 <div><label>Who approves their emails</label><select name="approval"><option value="member">They approve their own</option><option value="master">The master approves every email</option></select></div></div>
-<p><button class="btn brand">Create user and get invite</button></p></form></div></div>{% endif %}{% endblock %}"""
+<p><button class="btn brand">Create user</button></p></form></div></div>{% endif %}{% endblock %}"""
 T["user.html"] = """{% extends 'base.html' %}{% block title %}{{ u.name }}{% endblock %}{% block body %}{% include '_invite.html' %}
 <p><a href="{{ url_for('users') }}">← All users</a></p>
 <div class="stats"><div class="stat"><small>Sent (30 days)</small><div>{{ st.sent }}</div></div><div class="stat"><small>Replies</small><div>{{ st.replies }}</div></div><div class="stat"><small>Reply rate</small><div>{{ st.rate }}</div></div>
 <div class="stat"><small>Interested</small><div>{{ st.interested }}</div></div><div class="stat"><small>App version</small><div style="font-size:18px">{{ u.app_version or '–' }}</div></div></div>
 {% if me.role == 'owner' %}<div class="card"><div class="card-h"><h2>{{ u.name }} <span class="badge {{ 'b-ok' if u.status == 'active' else 'b-bad' if u.status == 'disabled' else 'b-warn' }}">{{ u.status }}</span></h2></div><div class="card-b">
 <form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="save"><div class="grid">
-<div><label>Name</label><input name="name" value="{{ u.name }}"></div><div><label>Email</label><input value="{{ u.email }}" disabled></div>
+<div><label>Name</label><input name="name" value="{{ u.name }}"></div><div><label>Email</label><input value="{{ u.email }}" disabled></div><div><label>Sign-in ID</label><input value="{{ u.username or u.email }}" disabled></div>
 <div><label>Role</label><select name="role" {{ 'disabled' if u.role == 'owner' }}>{% for r in ['member','manager'] %}<option {{ 'selected' if u.role == r }}>{{ r }}</option>{% endfor %}{% if u.role == 'owner' %}<option selected>owner</option>{% endif %}</select></div>
 <div><label>Daily send cap (0 = no cap)</label><input name="daily_cap" type="number" min="0" value="{{ u.daily_cap or 0 }}"></div><div><label>Weekly target</label><input name="weekly_target" type="number" min="0" value="{{ u.weekly_target or 0 }}"></div>
 <div><label>Who approves their emails</label><select name="approval"><option value="member" {{ 'selected' if u.approval != 'master' }}>They approve their own</option><option value="master" {{ 'selected' if u.approval == 'master' }}>The master approves every email</option></select></div>
-{% if u.role in ('manager','owner') %}<div><label>New console password (leave blank to keep)</label><input name="password" type="password" autocomplete="new-password"></div>{% endif %}</div>
+</div>
 <label>Private note</label><input name="note" value="{{ u.note or '' }}"><p><button class="btn brand">Save</button></p></form>
-<form method="post" style="display:inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" name="action" value="invite">New invite code</button></form>
-<form method="post" style="display:inline" onsubmit="return confirm('Disconnect all of this user\\'s laptops? They must join again with a new invite.')"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn danger" name="action" value="revoke">Disconnect laptops</button></form>
+<form method="post" style="display:inline-flex;gap:6px;align-items:center" onsubmit="return confirm('Set a new password? Their laptops are signed out and must sign in again.')"><input type="hidden" name="_csrf" value="{{ csrf }}"><input name="password" placeholder="new password (blank = generate)" autocomplete="off" style="width:240px"><button class="btn" name="action" value="resetpw">Reset password</button></form>
+<form method="post" style="display:inline" onsubmit="return confirm('Disconnect all of this user\\'s laptops? They must sign in again.')"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn danger" name="action" value="revoke">Disconnect laptops</button></form>
 {% if u.role != 'owner' %}<form method="post" style="display:inline"><input type="hidden" name="_csrf" value="{{ csrf }}">{% if u.status == 'disabled' %}<button class="btn" name="action" value="enable">Resume account</button>{% else %}<button class="btn danger" name="action" value="disable" onclick="return confirm('Pause this account? Their BSO stops sending at the next check-in.')">Pause account</button>{% endif %}</form>{% endif %}</div></div>{% endif %}
 <div class="card"><div class="card-h"><h2>Laptops</h2></div><table><tr><th>Name</th><th>Joined</th><th>Last seen</th><th></th></tr>{% for d in devices %}<tr><td>{{ d.name }}</td><td>{{ d.created_at|dt }}</td><td>{{ d.last_seen|ago }}</td><td>{{ 'disconnected' if d.revoked }}</td></tr>{% else %}<tr><td colspan="4" class="muted">No laptop has joined yet.</td></tr>{% endfor %}</table></div>
 <div class="card"><div class="card-h"><h2>Recent activity</h2></div><table><tr><th>When</th><th>Event</th><th>Lead</th><th>Detail</th></tr>{% for e in events %}<tr><td class="muted">{{ e.at|dt }}</td><td>{{ e.type }}</td><td>{{ e.lead_email }}{% if e.company %}<br><span class="muted">{{ e.company }}</span>{% endif %}</td><td>{{ e.detail }}</td></tr>{% else %}<tr><td colspan="4" class="muted">Nothing reported yet.</td></tr>{% endfor %}</table></div>{% endblock %}"""
@@ -777,8 +802,13 @@ T["activity.html"] = """{% extends 'base.html' %}{% block title %}Activity{% end
 T["audit.html"] = """{% extends 'base.html' %}{% block title %}Audit log{% endblock %}{% block body %}<div class="card"><div class="card-h"><h2>Who changed what in this console</h2></div><table><tr><th>When</th><th>Who</th><th>Action</th><th>Detail</th></tr>{% for r in rows %}<tr><td class="muted">{{ r.at|dt }}</td><td>{{ r.actor }}</td><td>{{ r.action }}</td><td>{{ r.detail }}</td></tr>{% endfor %}</table></div>{% endblock %}"""
 T["settings.html"] = """{% extends 'base.html' %}{% block title %}Settings{% endblock %}{% block body %}{% if msg %}<div class="note">{{ msg }}</div>{% endif %}
 <div class="card"><div class="card-h"><h2>Hub settings</h2></div><div class="card-b"><form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="org">
-<label>Team or company name</label><input name="org" value="{{ org }}"><label>Public address of this hub (what laptops connect to, e.g. https://hub.example.com). It is put into invites.</label><input name="public_url" value="{{ public_url }}" placeholder="https://hub.your-company.com">
+<label>Team or company name</label><input name="org" value="{{ org }}"><label>Public address of this hub (what laptops connect to, e.g. https://hub.example.com). Shown with new users' sign-in details.</label><input name="public_url" value="{{ public_url }}" placeholder="https://hub.your-company.com">
 <label>If a laptop cannot reach the hub for this many hours, it pauses sending (0 = never)</label><input name="grace_hours" type="number" min="0" max="720" value="{{ grace }}"><p><button class="btn brand">Save</button></p></form></div></div>
+<div class="card"><div class="card-h"><h2>Installing BSO for your team</h2></div><div class="card-b">
+<p style="margin-top:0">Make each install ask for an ID and password and point at this hub, in either of two ways:</p>
+<ul><li>Install with <code>BSO-Setup.exe /HUB={{ public_url or 'https://your-hub-address' }}</code></li>
+<li>or <a href="{{ url_for('team_defaults_file') }}">download team-defaults.json</a> and put it in the BSO program folder (next to <code>BSO.exe</code>).</li></ul>
+<p class="muted" style="margin-bottom:0">Without either, BSO behaves as a normal single-user app and asks for the hub address when someone signs in under Settings → Team.</p></div></div>
 <div class="card"><div class="card-h"><h2>Change your password</h2></div><div class="card-b"><form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="password">
 <div class="grid"><div><label>Current password</label><input name="old" type="password" required></div><div><label>New password (10+ characters)</label><input name="new" type="password" required autocomplete="new-password"></div><div><label>New password again</label><input name="new2" type="password" required autocomplete="new-password"></div></div><p><button class="btn brand">Change password</button></p></form></div></div>{% endblock %}"""
 app.jinja_loader = DictLoader(T)

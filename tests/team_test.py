@@ -50,31 +50,58 @@ check(b"Too many failed attempts" in r.data, "login is locked after repeated fai
 c.post("/settings", data={"_csrf": csrf("/settings"), "action": "org", "org": "NeoSOFT", "public_url": "http://127.0.0.1:8791", "grace_hours": "72"})
 # --- add a member who needs master approval, with a cap of 2
 t = csrf("/users")
-r = c.post("/users/new", data={"_csrf": t, "name": "Ayesha", "email": "a@x.com", "role": "member", "daily_cap": "2", "weekly_target": "10", "approval": "master"}, follow_redirects=True)
-m = re.search(r"BSO1\.[A-Za-z0-9_-]+", r.get_data(as_text=True))
-check(bool(m), "invite string is shown")
-invite = m.group(0)
-check(team.parse_invite(invite)[0] == "http://127.0.0.1:8791", "invite carries the hub address")
-url, code = team.parse_invite(invite)
+r = c.post("/users/new", data={"_csrf": t, "name": "Ayesha", "email": "a@x.com", "username": "Ayesha", "role": "member", "daily_cap": "2", "weekly_target": "10", "approval": "master", "password": ""}, follow_redirects=True)
+html = r.get_data(as_text=True)
+m = re.search(r"ID: (\w+)<br>Password: (\S+)</div>", html)
+check(bool(m), "sign-in details are shown once, with a generated password")
+uname, pw = m.group(1), m.group(2)
+check(uname == "ayesha" and len(pw) == 12, "ID is lower-cased; password is 12 characters")
+check("Password: " not in c.get("/users").get_data(as_text=True), "password is not shown again")
+r = c.post("/users/new", data={"_csrf": csrf("/users"), "name": "Dup", "email": "d@x.com", "username": "ayesha", "role": "member"}, follow_redirects=True)
+check(b"already used" in r.data, "duplicate ID refused")
+r = c.post("/users/new", data={"_csrf": csrf("/users"), "name": "Weak", "email": "w@x.com", "username": "weak1", "role": "member", "password": "short"}, follow_redirects=True)
+check(b"at least 10" in r.data, "weak password refused")
 
-# --- member joins
+# --- the laptop: locked until signed in
 con = bot.db_connect("outreach.db")
 for i in range(1, 5):
     con.execute("INSERT INTO leads(email, first_name, company, status, step, created_at) VALUES (?,?,?,?,0,'2026-01-01')", (f"l{i}@acme.com", f"L{i}", "Acme", "active"))
 con.commit()
+(tmp / "laptop" / "team-defaults.json").write_text(json.dumps({"hub": "http://127.0.0.1:8791", "required": True}))
+check(team.required() and not team.signed_in() and not team.joined(), "managed install requires sign-in")
+allowed, why, _ = team.gate(con)
+check(not allowed and "Sign in" in why, "bot refuses to send before sign-in")
+for bad_user, bad_pw, expect in (("ayesha", "wrongpassword", "wrong"), ("nobody", "whatever12345", "wrong")):
+    try:
+        team.sign_in(con, bad_user, bad_pw, consent=True)
+        check(False, "bad credentials refused")
+    except ValueError as e:
+        check(expect in str(e), f"bad credentials refused ({bad_user})")
 try:
-    team.join(invite, consent=False)
-    check(False, "joining needs consent")
+    team.sign_in(con, uname, pw, consent=False)
+    check(False, "first sign-in needs consent")
 except ValueError:
-    check(True, "joining needs consent")
-pol, hubu = team.join(invite, consent=True, device="test-laptop")
-team.finish_join(con, hubu, pol)
-check(team.joined() and team.holds_approval(), "member joined; manager approval is in force")
+    check(True, "first sign-in needs consent")
+pol = team.sign_in(con, uname, pw, consent=True)
+check(team.joined() and team.signed_in() == "ayesha" and team.holds_approval(), "signed in; manager approval is in force")
+team.sign_out()
+check(not team.signed_in(), "sign-out locks the app")
+pol = team.sign_in(con, uname, pw)
+check(team.signed_in(), "second sign-in needs no consent box")
+
+# --- offline sign-in works from the cached check, not with a wrong password
+real = team.hub_url
+st = team.state(); st["hub"] = "http://127.0.0.1:1"; team.save_state(st)
+team.sign_out()
 try:
-    team.join(invite, consent=True)
-    check(False, "invite works only once")
+    team.sign_in(con, uname, "wrongpassword")
+    check(False, "offline: wrong password refused")
 except ValueError:
-    check(True, "invite works only once")
+    check(True, "offline: wrong password refused")
+team.sign_in(con, uname, pw)
+check(team.signed_in() and team.SIGNED_IN.get("offline"), "offline: right password lets the same person in (within grace)")
+st = team.state(); st["hub"] = "http://127.0.0.1:8791"; team.save_state(st)
+team.sign_in(con, uname, pw)
 
 # --- activity and drafts sync up
 bot.log_event(con, 1, "sent", "step 1", "me@x.com", "A")
@@ -114,15 +141,44 @@ check(hub.app.test_client().post("/api/v1/sync", json={}).status_code == 401, "s
 c.post(f"/users/{uid}", data={"_csrf": csrf(f"/users/{uid}"), "action": "revoke"})
 ok, msg = team.sync(con)
 check(not ok and "disconnected" in msg, "revoked laptop is cut off")
+pol = team.sign_in(con, uname, pw)
+check(team.sync(con)[0], "signing in again restores a revoked laptop")
+c.post(f"/users/{uid}", data={"_csrf": csrf(f"/users/{uid}"), "action": "resetpw", "password": "brand-new-pass-1"})
+ok, msg = team.sync(con)
+check(not ok, "password reset signs old laptops out")
+try:
+    team.sign_in(con, uname, pw)
+    check(False, "old password no longer works")
+except ValueError:
+    check(True, "old password no longer works")
+team.sign_in(con, uname, "brand-new-pass-1")
+check(team.signed_in() == "ayesha", "new password works")
 team.leave()
-check(not team.joined(), "member can leave the team")
+check(not team.joined(), "an unlocked install can leave the team")
 
 # --- http to a public host is refused
 try:
-    team.parse_invite("BSO1." + __import__("base64").urlsafe_b64encode(json.dumps({"u": "http://example.com", "c": "X"}).encode()).decode())
+    team.check_hub_url("http://example.com")
     check(False, "plain http to a public host is refused")
 except ValueError:
     check(True, "plain http to a public host is refused")
+
+# --- the CRM itself is locked behind the sign-in page
+import crm  # noqa: E402
+(tmp / "laptop" / "team-defaults.json").write_text(json.dumps({"hub": "http://127.0.0.1:8791", "required": True}))
+crm.write_settings({"legal_acceptance": {"version": str(crm.cfg().get("legal", {}).get("version", "1.0"))}})
+team.leave()
+w = crm.app.test_client()
+r = w.get("/leads")
+check(r.status_code == 302 and "/signin" in r.headers["Location"], "CRM pages redirect to the sign-in page")
+check(w.get("/signin").status_code == 200 and b"What your manager can see" in w.get("/signin").data, "sign-in page shows the disclosure")
+r = w.post("/signin", data={"username": "ayesha", "password": "nope", "consent": "1"})
+check(b"wrong" in r.data, "wrong password shows an error")
+r = w.post("/signin", data={"username": "ayesha", "password": "brand-new-pass-1", "consent": "1", "next": "/leads"})
+check(r.status_code == 302 and w.get("/leads").status_code == 200, "signing in opens the CRM")
+check(b"Signed in as" in w.get("/").data, "app shows who is signed in")
+w.post("/signout")
+check(w.get("/leads").status_code == 302, "sign-out locks the CRM again")
 
 srv.shutdown()
 print(f"\nAll {n} team checks passed.")
