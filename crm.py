@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Outreach CRM: a Salesforce-inspired CRM on the same database as bot.py.
+BSO: a Salesforce-inspired CRM on the same database as bot.py.
 
   python crm.py                                       # open http://127.0.0.1:5000
   CRM_PASSWORD=secret python crm.py --host 0.0.0.0    # on a server (password required)
@@ -18,6 +18,7 @@ from pathlib import Path
 
 from flask import Flask, Response, abort, g, redirect, request, url_for
 from jinja2 import DictLoader
+import brand
 
 from bot import (DATA, HUMAN_STAGES, env, LEAD_OPEN_STAGES, OPP_OPEN_STAGES, OPP_STAGES, ROOT, STAGES, settings_path,
                  add_lead, add_task, cancel_drafts, db_connect, import_rows, iso, load_config,
@@ -28,6 +29,7 @@ CONFIG_PATH = os.getenv("BOT_CONFIG", str(DATA / "config.yaml"))
 app = Flask(__name__)
 app.secret_key = os.getenv("CRM_SECRET", "change-me")
 app.jinja_loader = DictLoader(TEMPLATES)
+app.jinja_env.globals.update(logo=brand.logo_svg, logo_css=brand.MARK_CSS)
 
 STATUS_LABELS = {
     "active": "In sequence", "paused": "Paused", "done": "Sequence finished", "replied": "Replied",
@@ -1246,7 +1248,7 @@ def save_schedule():
 @app.post("/quit")
 def quit_app():
     threading.Timer(0.5, lambda: os._exit(0)).start()
-    return "<p style='font:16px system-ui;padding:40px'>Outreach CRM has stopped. You can close this window.</p>"
+    return "<p style='font:16px system-ui;padding:40px'>BSO has stopped. You can close this window.</p>"
 
 
 # ---------------------------------------------------------------- getting started
@@ -1343,6 +1345,6 @@ if __name__ == "__main__":
     a = p.parse_args()
     if a.host != "127.0.0.1" and not os.getenv("CRM_PASSWORD"):
         sys.exit("Set CRM_PASSWORD in .env before exposing the CRM beyond this machine.")
-    print(f"\n  Outreach CRM is running → open http://{'127.0.0.1' if a.host == '0.0.0.0' else a.host}:{a.port}\n")
+    print(f"\n  BSO is running → open http://{'127.0.0.1' if a.host == '0.0.0.0' else a.host}:{a.port}\n")
     threading.Thread(target=_autorun_loop, daemon=True).start()
     app.run(host=a.host, port=a.port)

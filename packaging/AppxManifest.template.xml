@@ -10,7 +10,7 @@
   <Identity Name="{{IDENTITY}}" Publisher="{{PUBLISHER}}" Version="{{VERSION}}" ProcessorArchitecture="x64" />
 
   <Properties>
-    <DisplayName>Outreach CRM</DisplayName>
+    <DisplayName>BSO – BlacSwanken Outreach</DisplayName>
     <PublisherDisplayName>{{PUBLISHER_DISPLAY}}</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
     <Description>Personalised B2B email outreach with a built-in CRM. Your data stays on your computer.</Description>
@@ -25,8 +25,8 @@
   </Resources>
 
   <Applications>
-    <Application Id="OutreachCRM" Executable="OutreachCRM.exe" EntryPoint="Windows.FullTrustApplication">
-      <uap:VisualElements DisplayName="Outreach CRM"
+    <Application Id="BSO" Executable="BSO.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements DisplayName="BSO"
                           Description="Personalised B2B email outreach with a built-in CRM."
                           BackgroundColor="transparent"
                           Square150x150Logo="Assets\Square150x150Logo.png"
@@ -35,9 +35,9 @@
         <uap:SplashScreen Image="Assets\SplashScreen.png" />
       </uap:VisualElements>
       <Extensions>
-        <uap3:Extension Category="windows.appExecutionAlias" Executable="OutreachCRM.exe" EntryPoint="Windows.FullTrustApplication">
+        <uap3:Extension Category="windows.appExecutionAlias" Executable="BSO.exe" EntryPoint="Windows.FullTrustApplication">
           <uap3:AppExecutionAlias>
-            <desktop:ExecutionAlias Alias="OutreachCRM.exe" />
+            <desktop:ExecutionAlias Alias="BSO.exe" />
           </uap3:AppExecutionAlias>
         </uap3:Extension>
       </Extensions>

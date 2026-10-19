@@ -532,7 +532,7 @@ def regenerate_draft(cfg, con, draft_id):
 def cmd_run(cfg, con, args):
     lg_ver = str((cfg.get("legal") or {}).get("version", "1.0"))
     if str((cfg.get("legal_acceptance") or {}).get("version")) != lg_ver and not args.dry_run:
-        print("PROBLEM: Open Outreach CRM and accept the Terms of Use first.")
+        print("PROBLEM: Open BSO and accept the Terms of Use first.")
         sys.exit(1)
     if not args.force and not in_send_window(cfg):
         print("Outside the sending window; nothing sent (use --force to override).")

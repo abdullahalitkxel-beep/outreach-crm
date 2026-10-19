@@ -38,12 +38,12 @@ v4 = (1, 0, build_no, 0)
   kids=[
     StringFileInfo([StringTable('040904B0', [
       StringStruct('CompanyName', {json.dumps(company)}),
-      StringStruct('FileDescription', 'Outreach CRM'),
+      StringStruct('FileDescription', 'BSO – BlacSwanken Outreach'),
       StringStruct('FileVersion', '{version}.0'),
-      StringStruct('InternalName', 'OutreachCRM'),
+      StringStruct('InternalName', 'BSO'),
       StringStruct('LegalCopyright', {json.dumps(copyright_)}),
-      StringStruct('OriginalFilename', 'OutreachCRM.exe'),
-      StringStruct('ProductName', 'Outreach CRM'),
+      StringStruct('OriginalFilename', 'BSO.exe'),
+      StringStruct('ProductName', 'BSO – BlacSwanken Outreach'),
       StringStruct('ProductVersion', '{version}.0')])]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
   ]
@@ -61,7 +61,7 @@ eula = "\n\n".join(legal.to_text(legal.source(d, cfg)) for d in ("terms", "accep
 site = BUILD / "legal-site"
 site.mkdir(exist_ok=True)
 page = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title} | Outreach CRM by {company}</title><style>
+<title>{title} | BSO – BlacSwanken Outreach by {company}</title><style>
 body{{margin:0;font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;color:#181818;background:#f6f7f9}}
 main{{max-width:820px;margin:0 auto;padding:32px 20px 64px;background:#fff;min-height:100vh;box-sizing:border-box}}
 h1{{font-size:28px;line-height:1.25}}h2{{font-size:19px;margin-top:28px}}a{{color:#0176d3}}
@@ -91,8 +91,8 @@ BUILD_ONLY = {"pyinstaller-hooks-contrib", "altgraph", "pefile", "pywin32-ctypes
 out = subprocess.run([sys.executable, "-m", "piplicenses", "--from=mixed", "--with-urls", "--with-license-file",
                       "--no-license-path", "--format=json"], capture_output=True, text=True, check=True).stdout
 pkgs = [p for p in json.loads(out) if p["Name"].lower() not in BUILD_ONLY]
-parts = ["Outreach CRM includes the following open-source software. Each component is provided under its own",
-         "licence, reproduced below. Nothing in the Outreach CRM Terms of Use limits your rights under these licences.", ""]
+parts = ["BSO – BlacSwanken Outreach includes the following open-source software. Each component is provided under its own",
+         "licence, reproduced below. Nothing in the BSO – BlacSwanken Outreach Terms of Use limits your rights under these licences.", ""]
 py_license = Path(sys.base_prefix) / "LICENSE.txt"
 parts += ["=" * 78, f"Python {sys.version.split()[0]} — Python Software Foundation License", "https://www.python.org/", "=" * 78,
           py_license.read_text(encoding="utf-8", errors="replace") if py_license.exists() else "PSF License Agreement", ""]

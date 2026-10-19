@@ -1,8 +1,8 @@
-# Outreach CRM — Privacy Policy
+# BSO — Privacy Policy
 
 Version {{version}} · Effective {{effective_date}}
 
-This Privacy Policy explains how the Outreach CRM software (the "Software"), published by **{{company_name}}** ("BlacSwanken", "we"), handles personal information. In short: **the Software runs on your computer, your data stays on your computer, and BlacSwanken never receives it.** Data leaves your computer only to reach services you choose to connect, as described below.
+This Privacy Policy explains how the BSO software (the "Software"), published by **{{company_name}}** ("BlacSwanken", "we"), handles personal information. In short: **the Software runs on your computer, your data stays on your computer, and BlacSwanken never receives it.** Data leaves your computer only to reach services you choose to connect, as described below.
 
 ## 1. BlacSwanken does not collect your data
 

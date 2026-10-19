@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Double-click this file on Mac (or run ./start.command on Linux) to start the Outreach CRM.
+# Double-click this file on Mac (or run ./start.command on Linux) to start the BSO.
 cd "$(dirname "$0")"
 if [ ! -d .venv ]; then
   echo "First run: setting things up. This takes a minute..."

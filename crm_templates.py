@@ -2,7 +2,7 @@
 
 BASE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{% block title %}Outreach CRM{% endblock %}</title>
+<title>{% block title %}BSO{% endblock %}</title>
 <style>
 :root{--brand:#0176d3;--brand-d:#014486;--brand-l:#eef4ff;--bg:#f3f3f3;--card:#fff;--line:#dddbda;--line2:#e5e5e5;
 --ink:#181818;--muted:#706e6b;--ok:#2e844a;--ok-l:#cdefc4;--err:#ba0517;--err-l:#feded8;--warn:#dd7a01;--warn-l:#fef1ee;
@@ -160,11 +160,12 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
 #tour-pop h3{font-size:15px;margin-bottom:6px}#tour-pop p{margin:0 0 12px;color:#3e3e3c}
 #tour-pop .ft{display:flex;align-items:center;gap:6px}#tour-pop .ft span{flex:1;color:var(--muted);font-size:12px}
 @media(max-width:700px){.hl{gap:14px}.gsearch input{font-size:16px}}
+{{ logo_css|safe }}
 </style></head><body>
 {% if test_redirect %}<div class="testbar">TEST MODE: every email goes to {{ test_redirect }}, never to leads. <a href="{{ url_for('setup') }}#golive">How to go live</a></div>
 {% elif test_mode_broken %}<div class="testbar">TEST MODE is on but has no test address, so the bot won't send anything. <a href="{{ url_for('setup') }}">Fix in Getting Started</a></div>{% endif %}
 <div class="gh">
- <img src="/app-icon.png" alt="Outreach CRM" width="32" height="32" style="flex:none">
+ <span style="flex:none;display:flex">{{ logo(32, tile=True, uid="hd", weight="b", label="BSO")|safe }}</span>
  {% if request.endpoint != 'welcome' %}<form class="gsearch" action="{{ url_for('search') }}" id="t-search">
   <svg width="14" height="14" viewBox="0 0 24 24"><path d="M15.5 14h-.8l-.3-.3A6.5 6.5 0 1 0 9.5 16a6.5 6.5 0 0 0 4.2-1.6l.3.3v.8l5 5 1.5-1.5-5-5zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></svg>
   <input name="q" placeholder="Search leads, accounts, opportunities…" value="{{ request.args.get('q','') if request.endpoint=='search' else '' }}">
@@ -177,7 +178,7 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
     <button onclick="resetHelp()">Show all help tips again</button>
     <a href="{{ url_for('settings') }}">Settings</a>
     <a href="{{ url_for('about') }}">About &amp; legal</a>
-    <form method="post" action="{{ url_for('quit_app') }}" onsubmit="return confirm('Stop Outreach CRM? Automatic runs stop until you open it again.')"><button>Quit the app</button></form>
+    <form method="post" action="{{ url_for('quit_app') }}" onsubmit="return confirm('Stop BSO? Automatic runs stop until you open it again.')"><button>Quit the app</button></form>
    </div>
   </div>
  </div>
@@ -216,7 +217,7 @@ document.querySelectorAll('[data-tabs]').forEach(function(box){
 var all=document.getElementById('selall'); if(all) all.onchange=function(){document.querySelectorAll('input[name=ids]').forEach(function(c){c.checked=all.checked})};
 // ---- guided tour
 var TOUR=[
- {sel:null,t:'Welcome to your Outreach CRM',p:'This 60-second tour shows where everything lives. You can replay it any time from the ? menu at the top right.'},
+ {sel:null,t:'Welcome to BSO',p:'This 60-second tour shows where everything lives. You can replay it any time from the ? menu at the top right.'},
  {sel:'#nav-setup',t:'Start here: Getting Started',p:'A checklist that walks you through setup, with a button for every step. It ticks itself off as you go.'},
  {sel:'#nav-settings',t:'Settings',p:'Connect your inbox, paste your keys, edit your emails and targeting. Simple forms with a Test button. No files to edit.'},
  {sel:'#nav-home',t:'Home',p:'Your daily dashboard: tasks due, hot replies, emails waiting for review, and recent activity.'},
@@ -784,10 +785,10 @@ document.querySelectorAll('select.prov').forEach(function(sel){ sel.onchange=fun
 }});
 </script>{% endblock %}"""
 
-WELCOME = r"""{% extends 'base.html' %}{% block title %}Welcome to Outreach CRM{% endblock %}{% block body %}
+WELCOME = r"""{% extends 'base.html' %}{% block title %}Welcome to BSO{% endblock %}{% block body %}
 <div class="card" style="max-width:760px;margin:24px auto"><div class="card-b" style="padding:28px 32px">
- <div style="display:flex;gap:14px;align-items:center"><img src="/app-icon.png" alt="" width="52" height="52">
- <div><h1 style="font-size:22px">Welcome to Outreach CRM</h1><div class="muted">by {{ publisher }} · version {{ app_version }}</div></div></div>
+ <div style="display:flex;gap:14px;align-items:center"><span style="flex:none;display:flex">{{ logo(64, tile=True, uid="wl", animated=True, label="BSO")|safe }}</span>
+ <div><h1 style="font-size:22px">Welcome to BSO</h1><div class="muted">by {{ publisher }} · version {{ app_version }}</div></div></div>
  <p style="margin-top:18px">Before you start, please read and accept the terms. Short version:</p>
  <ul style="line-height:1.8">
   <li><b>Your data stays on this computer.</b> {{ publisher }} never receives it. No accounts, no tracking.</li>
@@ -809,15 +810,15 @@ WELCOME = r"""{% extends 'base.html' %}{% block title %}Welcome to Outreach CRM{
 LEGAL = r"""{% extends 'base.html' %}{% block title %}{{ title }}{% endblock %}{% block body %}
 <div class="card legal" style="max-width:900px;margin:0 auto"><div class="card-b" style="padding:24px 32px">
 <p class="muted" style="margin-top:0"><a href="{{ url_for('about') }}">← About &amp; legal</a></p>
-{% if body %}{{ body|safe }}{% else %}<h1>{{ title }}</h1><p class="muted">Outreach CRM includes the open-source software listed below. Each component is licensed under its own terms, reproduced here.</p><pre class="log" style="background:#f8f8f8;color:var(--ink);max-height:none">{{ text }}</pre>{% endif %}
+{% if body %}{{ body|safe }}{% else %}<h1>{{ title }}</h1><p class="muted">BSO includes the open-source software listed below. Each component is licensed under its own terms, reproduced here.</p><pre class="log" style="background:#f8f8f8;color:var(--ink);max-height:none">{{ text }}</pre>{% endif %}
 </div></div>
 {% endblock %}"""
 
 ABOUT = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}About{% endblock %}{% block body %}
-{% call m.header('t-setup', 'i', 'About', 'Outreach CRM') %}{% endcall %}
+{% call m.header('t-setup', 'i', 'About', 'BSO') %}{% endcall %}
 <div class="cols"><div>
  <div class="card"><div class="card-h"><h2>About this app</h2></div><div class="card-b"><table class="tbl">
-  <tr><td class="muted" style="width:180px">Product</td><td>Outreach CRM</td></tr>
+  <tr><td class="muted" style="width:180px">Product</td><td>BSO – BlacSwanken Outreach</td></tr>
   <tr><td class="muted">Version</td><td>{{ version }}</td></tr>
   <tr><td class="muted">Publisher</td><td>{{ lg.company_name }}</td></tr>
   <tr><td class="muted">Contact</td><td>{{ lg.contact_email }}</td></tr>
@@ -834,7 +835,7 @@ ABOUT = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block tit
   <a href="{{ url_for('legal_doc', doc='privacy') }}">Privacy Policy</a><br>
   <a href="{{ url_for('legal_doc', doc='acceptable-use') }}">Acceptable Use Policy</a><br>
   <a href="{{ url_for('legal_doc', doc='third-party') }}">Third-Party Notices</a></div></div>
- <div class="card"><div class="card-b muted" style="font-size:12px">© 2026 {{ lg.company_name }}. All rights reserved. Outreach CRM is not affiliated with Salesforce, Microsoft, Google, Anthropic or Apollo.io.</div></div>
+ <div class="card"><div class="card-b muted" style="font-size:12px">© 2026 {{ lg.company_name }}. All rights reserved. BSO is not affiliated with Salesforce, Microsoft, Google, Anthropic or Apollo.io.</div></div>
 </div></div>
 {% endblock %}"""
 

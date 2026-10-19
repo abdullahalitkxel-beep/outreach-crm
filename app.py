@@ -18,7 +18,7 @@ from pathlib import Path
 
 PORT = int(os.getenv("OUTREACH_PORT", "8765"))
 URL = f"http://127.0.0.1:{PORT}"
-APP_NAME = "Outreach CRM"
+APP_NAME = "BSO"
 
 
 def _ensure_stdio(log_path):
@@ -93,7 +93,7 @@ def run_tray(tray_ref):
         from PIL import Image
         here = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
         image = Image.open(here / "assets" / "icon.png")
-        icon = pystray.Icon("OutreachCRM", image, f"{APP_NAME} is running", menu=pystray.Menu(
+        icon = pystray.Icon("BSO", image, f"{APP_NAME} is running", menu=pystray.Menu(
             pystray.MenuItem(f"Open {APP_NAME}", lambda: open_window(), default=True),
             pystray.MenuItem("Quit", lambda i: (i.stop(), shutdown())),
         ))

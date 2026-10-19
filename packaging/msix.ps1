@@ -1,6 +1,6 @@
 # Builds the Microsoft Store package and installs a test-signed copy so the app can be tested
 # exactly as Store users will run it.
-#   packaging\msix.ps1 -Mode pack       -> dist\OutreachCRM-Store.msix (unsigned; the Store signs it)
+#   packaging\msix.ps1 -Mode pack       -> dist\BSO-Store.msix (unsigned; the Store signs it)
 #   packaging\msix.ps1 -Mode installtest -> signs a copy with a throwaway test certificate and installs it
 #   packaging\msix.ps1 -Mode uninstall
 param([ValidateSet("pack", "installtest", "uninstall")][string]$Mode = "pack")
@@ -16,29 +16,29 @@ $signtool = Join-Path $sdk.FullName "x64\signtool.exe"
 if ($Mode -eq "pack") {
     $layout = "build\msix-layout"
     Remove-Item $layout -Recurse -Force -ErrorAction SilentlyContinue
-    Copy-Item "dist\OutreachCRM" $layout -Recurse
+    Copy-Item "dist\BSO" $layout -Recurse
     New-Item "$layout\Assets" -ItemType Directory -Force | Out-Null
     Copy-Item "packaging\msix-assets\*" "$layout\Assets\"
     Copy-Item "build\AppxManifest.xml" "$layout\AppxManifest.xml"
-    & $makeappx pack /d $layout /p "dist\OutreachCRM-Store.msix" /o
+    & $makeappx pack /d $layout /p "dist\BSO-Store.msix" /o
     if ($LASTEXITCODE) { throw "makeappx failed ($LASTEXITCODE)" }
-    Write-Host "Built dist\OutreachCRM-Store.msix"
+    Write-Host "Built dist\BSO-Store.msix"
 }
 
 if ($Mode -eq "installtest") {
     [xml]$m = Get-Content "build\AppxManifest.xml"
     $publisher = $m.Package.Identity.Publisher
     $cert = New-SelfSignedCertificate -Type Custom -Subject $publisher -KeyUsage DigitalSignature `
-        -FriendlyName "Outreach CRM CI test only" -CertStoreLocation "Cert:\CurrentUser\My" `
+        -FriendlyName "BSO – BlacSwanken Outreach CI test only" -CertStoreLocation "Cert:\CurrentUser\My" `
         -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
     $pw = ConvertTo-SecureString -String "ci-test-only" -Force -AsPlainText
     Export-PfxCertificate -Cert $cert -FilePath "build\ci-test.pfx" -Password $pw | Out-Null
     Export-Certificate -Cert $cert -FilePath "build\ci-test.cer" | Out-Null
     Import-Certificate -FilePath "build\ci-test.cer" -CertStoreLocation "Cert:\LocalMachine\TrustedPeople" | Out-Null
-    Copy-Item "dist\OutreachCRM-Store.msix" "build\OutreachCRM-citest.msix" -Force
-    & $signtool sign /fd SHA256 /f "build\ci-test.pfx" /p "ci-test-only" "build\OutreachCRM-citest.msix"
+    Copy-Item "dist\BSO-Store.msix" "build\BSO-citest.msix" -Force
+    & $signtool sign /fd SHA256 /f "build\ci-test.pfx" /p "ci-test-only" "build\BSO-citest.msix"
     if ($LASTEXITCODE) { throw "signtool failed ($LASTEXITCODE)" }
-    Add-AppxPackage "build\OutreachCRM-citest.msix"
+    Add-AppxPackage "build\BSO-citest.msix"
     $pkg = Get-AppxPackage | Where-Object { $_.Name -eq $m.Package.Identity.Name }
     if (-not $pkg) { throw "package did not install" }
     Write-Host "Installed $($pkg.PackageFullName) (publisher display: $($m.Package.Properties.PublisherDisplayName))"

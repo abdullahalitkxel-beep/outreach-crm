@@ -1,8 +1,8 @@
-# Outreach CRM — Terms of Use (End User License Agreement)
+# BSO — Terms of Use (End User License Agreement)
 
 Version {{version}} · Effective {{effective_date}}
 
-These Terms of Use ("Terms") are an agreement between you and **{{company_name}}** ("BlacSwanken", "we", "us"), {{address}}, for the Outreach CRM software, including its updates and documentation (the "Software"). By installing or using the Software you agree to these Terms, the [Privacy Policy](privacy) and the [Acceptable Use Policy](acceptable-use). If you use the Software for an organisation, you confirm you are authorised to accept these Terms for it, and "you" includes that organisation. If you do not agree, do not install or use the Software.
+These Terms of Use ("Terms") are an agreement between you and **{{company_name}}** ("BlacSwanken", "we", "us"), {{address}}, for the BSO software, including its updates and documentation (the "Software"). By installing or using the Software you agree to these Terms, the [Privacy Policy](privacy) and the [Acceptable Use Policy](acceptable-use). If you use the Software for an organisation, you confirm you are authorised to accept these Terms for it, and "you" includes that organisation. If you do not agree, do not install or use the Software.
 
 ## 1. Licence
 
@@ -50,7 +50,7 @@ The Software includes open-source components licensed under their own terms, lis
 
 ## 9. Ownership
 
-The Software is licensed, not sold. We and our licensors keep all rights, title and interest in the Software, including all intellectual property rights. "Outreach CRM" and "BlacSwanken" are our names; these Terms give you no right to use them.
+The Software is licensed, not sold. We and our licensors keep all rights, title and interest in the Software, including all intellectual property rights. "BSO" and "BlacSwanken" are our names; these Terms give you no right to use them.
 
 ## 10. Disclaimer of warranties
 

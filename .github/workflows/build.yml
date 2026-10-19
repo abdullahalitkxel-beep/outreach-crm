@@ -51,7 +51,7 @@ jobs:
 
       - name: Build app (folder build)
         run: >
-          pyinstaller --noconfirm --onedir --windowed --noupx --name OutreachCRM
+          pyinstaller --noconfirm --onedir --windowed --noupx --name BSO
           --icon assets/icon.ico
           --version-file build/version_info.txt
           --add-data "config.yaml;."
@@ -61,6 +61,7 @@ jobs:
           --add-data "assets/icon.png;assets"
           --hidden-import apollo
           --hidden-import legal
+          --hidden-import brand
           --hidden-import secretstore
           --hidden-import bs4
           --hidden-import openpyxl
@@ -72,16 +73,16 @@ jobs:
       - name: Check publisher details in the program file
         shell: pwsh
         run: |
-          $v = (Get-Item dist\OutreachCRM\OutreachCRM.exe).VersionInfo
+          $v = (Get-Item dist\BSO\BSO.exe).VersionInfo
           $summary = "Company: $($v.CompanyName) | Product: $($v.ProductName) | Version: $($v.FileVersion) | $($v.LegalCopyright)"
           Write-Host $summary
           Write-Host "::notice title=File properties::$summary"
           if ($v.CompanyName -notmatch 'BlacSwanken') { throw "Publisher missing from file properties" }
 
       - name: Test the built app
-        run: python tests/smoke_test.py dist/OutreachCRM/OutreachCRM.exe
+        run: python tests/smoke_test.py dist/BSO/BSO.exe
 
-      - name: Build installer (OutreachCRM-Setup.exe)
+      - name: Build installer (BSO-Setup.exe)
         shell: pwsh
         run: |
           $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
@@ -98,18 +99,18 @@ jobs:
       - name: Test the installer (install, run, check Windows "Installed apps" entry, uninstall)
         shell: pwsh
         run: |
-          Start-Process dist\OutreachCRM-Setup.exe -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER" -Wait
-          $exe = "$env:LOCALAPPDATA\Programs\Outreach CRM\OutreachCRM.exe"
+          Start-Process dist\BSO-Setup.exe -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER" -Wait
+          $exe = "$env:LOCALAPPDATA\Programs\BSO\BSO.exe"
           if (-not (Test-Path $exe)) { throw "installer did not install the app" }
-          $entry = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" | Where-Object { $_.DisplayName -eq "Outreach CRM" }
+          $entry = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" | Where-Object { $_.DisplayName -eq "BSO – BlacSwanken Outreach" }
           Write-Host "::notice title=Installed apps entry::$($entry.DisplayName) $($entry.DisplayVersion) by $($entry.Publisher)"
           if ($entry.Publisher -notmatch 'BlacSwanken') { throw "Publisher missing from Installed apps" }
           python tests/smoke_test.py "$exe"
           if ($LASTEXITCODE) { throw "smoke test failed on installed app" }
-          Start-Process "$env:LOCALAPPDATA\Programs\Outreach CRM\unins000.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES" -Wait
+          Start-Process "$env:LOCALAPPDATA\Programs\BSO\unins000.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES" -Wait
           if (Test-Path $exe) { throw "uninstall left the app behind" }
 
-      - name: Build Microsoft Store package (OutreachCRM-Store.msix)
+      - name: Build Microsoft Store package (BSO-Store.msix)
         shell: pwsh
         run: packaging\msix.ps1 -Mode pack
 
@@ -120,7 +121,7 @@ jobs:
         run: |
           New-Item $env:SMOKE_TMP -ItemType Directory -Force | Out-Null
           packaging\msix.ps1 -Mode installtest
-          python tests/smoke_test.py "$env:LOCALAPPDATA\Microsoft\WindowsApps\OutreachCRM.exe"
+          python tests/smoke_test.py "$env:LOCALAPPDATA\Microsoft\WindowsApps\BSO.exe"
           $rc = $LASTEXITCODE
           packaging\msix.ps1 -Mode uninstall
           if ($rc) { throw "smoke test failed on the Store package" }
@@ -132,7 +133,7 @@ jobs:
           $appcert = "${env:ProgramFiles(x86)}\Windows Kits\10\App Certification Kit\appcert.exe"
           if (-not (Test-Path $appcert)) { Write-Host "::warning title=App Certification Kit::Not installed on this runner"; exit 0 }
           & $appcert reset | Out-Null
-          & $appcert test -appxpackagepath "$pwd\build\OutreachCRM-citest.msix" -reportoutputpath "$pwd\build\wack.xml"
+          & $appcert test -appxpackagepath "$pwd\build\BSO-citest.msix" -reportoutputpath "$pwd\build\wack.xml"
           python packaging/wack_summary.py build/wack.xml
 
       - name: Microsoft Defender scan
@@ -150,29 +151,29 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: OutreachCRM-windows
+          name: BSO-windows
           path: |
-            dist/OutreachCRM-Setup.exe
-            dist/OutreachCRM-Store.msix
+            dist/BSO-Setup.exe
+            dist/BSO-Store.msix
 
       - name: Publish release (only after every test passed)
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.${{ github.run_number }}
-          name: Outreach CRM 1.0.${{ github.run_number }} (Windows)
+          name: BSO – BlacSwanken Outreach 1.0.${{ github.run_number }} (Windows)
           target_commitish: ${{ github.sha }}
           make_latest: true
           body: |
-            **OutreachCRM-Setup.exe**: install on your PC (per-user, no admin rights needed). Shows the licence agreement and registers BlacSwanken as publisher.
-            **OutreachCRM-Store.msix**: upload this to Microsoft Partner Center for the Store listing. (It isn't meant to be double-clicked; the Store signs it.)
+            **BSO-Setup.exe**: install on your PC (per-user, no admin rights needed). Shows the licence agreement and registers BlacSwanken as publisher.
+            **BSO-Store.msix**: upload this to Microsoft Partner Center for the Store listing. (It isn't meant to be double-clicked; the Store signs it.)
             **privacy.html, terms.html, acceptable-use.html**: put these on blacswanken.com; the Store listing needs the privacy page's address.
 
             Until the Store version is live, Windows may show "Windows protected your PC" for the installer: click **More info → Run anyway**.
             Your data stays in %APPDATA%\OutreachCRM, so updating keeps everything.
           files: |
-            dist/OutreachCRM-Setup.exe
-            dist/OutreachCRM-Store.msix
+            dist/BSO-Setup.exe
+            dist/BSO-Store.msix
             build/legal-site/privacy.html
             build/legal-site/terms.html
             build/legal-site/acceptable-use.html

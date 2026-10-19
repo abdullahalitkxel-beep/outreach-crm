@@ -1,5 +1,5 @@
 @echo off
-REM Double-click this file on Windows to start the Outreach CRM.
+REM Double-click this file on Windows to start the BSO.
 cd /d "%~dp0"
 if not exist .venv (
   echo First run: setting things up. This takes a minute...

@@ -1,8 +1,8 @@
 """
-Smoke test for the packaged app: launches OutreachCRM.exe (or `python app.py`), clicks through it
+Smoke test for the packaged app: launches BSO.exe (or `python app.py`), clicks through it
 over HTTP, runs a bot job through the --bot path, and shuts it down. Used by the GitHub build.
 
-  python tests/smoke_test.py dist/OutreachCRM.exe
+  python tests/smoke_test.py dist/BSO.exe
 """
 import os
 import subprocess
@@ -87,7 +87,7 @@ try:
     r = s.post(base + "/import", files={"file": ("sample.csv", sample.read_bytes())}, data={"sequence": "1"})
     check("<b>2</b> lead(s) added" in r.text, "import: 2 leads added, shared inbox skipped")
 
-    # runs the bot as a separate process (OutreachCRM.exe --bot ...) — drafts only, nothing is sent
+    # runs the bot as a separate process (BSO.exe --bot ...) — drafts only, nothing is sent
     s.post(base + "/jobs/start", data={"cmd": "run"})
     for _ in range(120):
         jobs = s.get(base + "/jobs").text

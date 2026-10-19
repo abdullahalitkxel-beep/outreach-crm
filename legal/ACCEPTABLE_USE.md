@@ -1,8 +1,8 @@
-# Outreach CRM — Acceptable Use Policy
+# BSO — Acceptable Use Policy
 
 Version {{version}} · Effective {{effective_date}}
 
-Outreach CRM is built for **legitimate, relevant business-to-business outreach**. This policy forms part of the [Terms of Use](terms). Breaking it ends your licence to use the Software.
+BSO is built for **legitimate, relevant business-to-business outreach**. This policy forms part of the [Terms of Use](terms). Breaking it ends your licence to use the Software.
 
 ## You must
 
@@ -32,7 +32,7 @@ You are responsible for complying with the laws of your country and of your reci
 - **United States**: the CAN-SPAM Act — accurate headers and subject lines, a valid postal address, and a working opt-out honoured within 10 business days.
 - **European Union and United Kingdom**: the GDPR and UK GDPR, and the ePrivacy rules (in the UK, PECR), which set when business emails need consent and require a lawful basis for processing personal data.
 - **Canada**: Canada's Anti-Spam Legislation (CASL), which generally requires consent before sending commercial email.
-- **Australia**: the Spam Act 2003, which generally requires consent before sending commercial email. Outreach CRM excludes Australia from lead searches by default for this reason.
+- **Australia**: the Spam Act 2003, which generally requires consent before sending commercial email. BSO excludes Australia from lead searches by default for this reason.
 
 This list is not complete and is not legal advice. If you are unsure whether a campaign is lawful, get advice from a qualified lawyer before sending.
 
