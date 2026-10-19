@@ -112,7 +112,7 @@ def job_running():
         con.close()
 
 
-OPEN_ENDPOINTS = {"signin", "welcome", "accept_terms", "legal_doc", "about", "heartbeat", "bye", "quit_app", "static", "app_icon", "favicon", "web_manifest"}
+OPEN_ENDPOINTS = {"signin", "signout", "welcome", "accept_terms", "legal_doc", "about", "heartbeat", "bye", "quit_app", "static", "app_icon", "favicon", "web_manifest"}
 
 
 @app.route("/favicon.ico")
@@ -145,6 +145,8 @@ def terms_accepted():
 
 @app.before_request
 def require_terms():
+    if team.required() and not team.signed_in():
+        return None                    # sign-in comes first (require_signin below)
     if request.endpoint and request.endpoint not in OPEN_ENDPOINTS and not terms_accepted():
         return redirect(url_for("welcome"))
 
@@ -172,6 +174,7 @@ def signin():
             err = str(e)
     st = team.state()
     return render("signin.html", err=err, nxt=nxt, hub=team.hub_url(), hub_fixed=bool(team.defaults().get("hub")),
+                  hub_known=bool(team.hub_url()),
                   first=not st.get("username"), disclosure=team.DISCLOSURE, last_user=st.get("username", ""),
                   optional=not team.required())
 

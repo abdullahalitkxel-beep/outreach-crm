@@ -29,8 +29,8 @@ Then open **Settings** in the console and enter that address as *Public address 
 
 1. **Users → Add a user**: name, email, sign-in **ID**, role, daily cap, weekly target, and who approves their emails. Leave the password blank to have one generated.
 2. The ID and password are shown **once**. Give them to the person privately.
-3. Install BSO on their computer so it asks for sign-in and knows your hub, either with `BSO-Setup.exe /HUB=https://hub.your-company.com`, or by downloading `team-defaults.json` from the hub's **Settings** page into the BSO program folder (next to `BSO.exe`).
-4. The person opens BSO, signs in with the ID and password, and ticks the box on first sign-in after reading what you can see. That is all they need.
+3. Install BSO on their computer as normal. Every time BSO opens it shows the sign-in screen. The first time, they also type the hub address you give them. To fill the address in for them, install with `BSO-Setup.exe /HUB=https://hub.your-company.com` or put `team-defaults.json` (from the hub's **Settings** page) next to `BSO.exe`.
+4. The person opens BSO, signs in with the ID and password, and on first sign-in ticks the box after reading what you can see.
 
 Until someone signs in, BSO opens nothing and sends nothing, including automatic runs. If the hub can't be reached, the same person can still sign in on that laptop for the grace period (default 72 hours).
 

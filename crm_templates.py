@@ -875,20 +875,43 @@ ABOUT = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block tit
 </div></div>
 {% endblock %}"""
 
-SIGNIN = r"""{% extends 'base.html' %}{% block title %}Sign in{% endblock %}{% block body %}
-<div class="card" style="max-width:460px;margin:48px auto"><div class="card-b" style="padding:28px 30px">
- <div style="display:flex;gap:14px;align-items:center;margin-bottom:12px"><span style="flex:none;display:flex">{{ logo(56, tile=True, uid="si", animated=True, label="BSO")|safe }}</span>
- <div><h2 style="margin:0">Sign in</h2><span class="muted">BlacSwanken Outreach</span></div></div>
- {% if err %}<div class="help" style="border-color:#c23934;margin-bottom:10px">{{ err }}</div>{% endif %}
+SIGNIN = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in · BlacSwanken Outreach</title><link rel="icon" href="{{ url_for('favicon') }}"><link rel="manifest" href="{{ url_for('web_manifest') }}"><meta name="theme-color" content="#1B1F24">
+<style>
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;font:15px/1.45 system-ui,'Segoe UI',sans-serif;color:#181818;background:#1B1F24;display:flex;align-items:center;justify-content:center;padding:16px}
+.box{background:#fff;border-radius:12px;width:100%;max-width:420px;padding:32px 32px 24px;box-shadow:0 20px 60px rgba(0,0,0,.35)}
+.hd{display:flex;flex-direction:column;align-items:center;text-align:center;margin-bottom:20px}.hd h1{font-size:22px;margin:14px 0 2px}.hd span{color:#5c5c5c;font-size:13px}
+label{display:block;font-size:12px;color:#5c5c5c;margin:12px 0 4px}input[type=text],input[type=password],input[name=hub]{width:100%;padding:10px 12px;border:1px solid #c9c7c5;border-radius:6px;font:inherit}
+input:focus{outline:2px solid #0176d3;outline-offset:-1px;border-color:#0176d3}
+.btn{display:block;width:100%;margin-top:18px;padding:11px;border:0;border-radius:6px;background:#0176d3;color:#fff;font:600 15px system-ui,'Segoe UI',sans-serif;cursor:pointer}.btn:hover{background:#015ba7}
+.err{background:#fde1e1;border:1px solid #e9a0a0;color:#7b1018;border-radius:6px;padding:10px 12px;margin-bottom:6px;font-size:14px}
+details{margin-top:14px;font-size:13px;color:#3e3e3c}summary{cursor:pointer;color:#0176d3}details ul{padding-left:18px;margin:8px 0}
+.chk{display:flex;gap:8px;align-items:flex-start;margin-top:12px;font-size:13px;color:#181818}.chk input{margin-top:3px}
+.ft{text-align:center;color:#706e6b;font-size:12px;margin-top:18px}.ft form{display:inline}.ft button{background:none;border:0;color:#706e6b;text-decoration:underline;cursor:pointer;font:inherit;padding:0}
+{{ logo_css|safe }}
+</style></head><body>
+<div class="box">
+ <div class="hd">{{ logo(72, tile=True, uid="si", animated=True, label="BSO")|safe }}<h1>BlacSwanken Outreach</h1><span>Sign in with the ID and password from your admin</span></div>
+ {% if err %}<div class="err">{{ err }}</div>{% endif %}
  <form method="post" action="{{ url_for('signin') }}"><input type="hidden" name="next" value="{{ nxt }}">
-  <label>ID</label><input name="username" value="{{ last_user }}" autocomplete="username" required {{ '' if last_user else 'autofocus' }}>
-  <label>Password</label><input name="password" type="password" autocomplete="current-password" required {{ 'autofocus' if last_user else '' }}>
-  {% if not hub_fixed %}<label>Hub address <span class="muted">(from your admin)</span></label><input name="hub" value="{{ hub }}" placeholder="https://hub.your-company.com">{% endif %}
-  <details style="margin-top:12px" {{ 'open' if first }}><summary><b>What your manager can see</b></summary><ul>{% for line in disclosure %}<li>{{ line }}</li>{% endfor %}</ul></details>
-  {% if first %}<label class="check"><input type="checkbox" name="consent" value="1"> I've read this and I agree.</label>{% endif %}
-  <button class="btn brand" style="margin-top:14px;width:100%">Sign in</button></form>
- <p class="muted" style="margin-bottom:0">Your ID and password come from your admin. Forgotten them? Ask your admin to reset your password.</p>
-</div></div>{% endblock %}"""
+  <label for="u">ID</label><input id="u" type="text" name="username" value="{{ last_user }}" autocomplete="username" autocapitalize="none" spellcheck="false" required {{ '' if last_user else 'autofocus' }}>
+  <label for="p">Password</label><input id="p" type="password" name="password" autocomplete="current-password" required {{ 'autofocus' if last_user else '' }}>
+  {% if not hub_fixed %}{% if hub_known %}<details><summary>Hub address: {{ hub }}</summary><label>Change it only if your admin tells you to</label><input name="hub" value="{{ hub }}"></details>
+  {% else %}<label>Hub address <span style="color:#706e6b">(from your admin)</span></label><input name="hub" value="" placeholder="https://hub.your-company.com" required>{% endif %}{% endif %}
+  {% if first %}<details open><summary>What your manager can see</summary><ul>{% for line in disclosure %}<li>{{ line }}</li>{% endfor %}</ul></details>
+  <label class="chk"><input type="checkbox" name="consent" value="1"> I've read this and I agree.</label>
+  {% else %}<details><summary>What your manager can see</summary><ul>{% for line in disclosure %}<li>{{ line }}</li>{% endfor %}</ul></details>{% endif %}
+  <button class="btn">Sign in</button></form>
+ <div class="ft">Forgotten your password? Ask your admin to reset it.<br><br>
+  <form method="post" action="{{ url_for('quit_app') }}"><button>Quit BSO</button></form> · <a href="{{ url_for('about') }}" style="color:#706e6b">About &amp; legal</a></div>
+</div>
+<script>
+function beat(){ try{ fetch('/heartbeat',{method:'POST',keepalive:true}); }catch(e){} }
+beat(); setInterval(beat, 10000);
+document.addEventListener('visibilitychange', function(){ if(!document.hidden) beat(); });
+window.addEventListener('focus', beat);
+window.addEventListener('pagehide', function(){ try{ navigator.sendBeacon('/bye'); }catch(e){} });
+</script></body></html>"""
 
 
 TEMPLATES = {

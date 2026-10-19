@@ -15,7 +15,7 @@ import requests
 
 target = sys.argv[1]
 home = Path(tempfile.mkdtemp(prefix="outreach-home-", dir=os.getenv("SMOKE_TMP") or None))
-env = {**os.environ, "OUTREACH_HOME": str(home), "OUTREACH_NO_WINDOW": "1", "OUTREACH_PORT": "8799"}
+env = {**os.environ, "OUTREACH_HOME": str(home), "OUTREACH_NO_WINDOW": "1", "OUTREACH_PORT": "8799", "BSO_NO_SIGNIN": "1"}  # no hub in the build machine; sign-in is tested in team_test.py
 cmd = [target] if target.endswith(".exe") or os.access(target, os.X_OK) and not target.endswith(".py") else [sys.executable, target]
 base = "http://127.0.0.1:8799"
 proc = subprocess.Popen(cmd, env=env)

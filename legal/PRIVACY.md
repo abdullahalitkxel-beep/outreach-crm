@@ -8,7 +8,7 @@ This Privacy Policy explains how the BSO software (the "Software"), published by
 
 The Software has no accounts, no analytics, no telemetry and no advertising. We do not receive, host, sell or share the data you store in it. If you obtained the Software from the Microsoft Store, Microsoft may collect installation, usage and crash information under the [Microsoft Privacy Statement](https://privacy.microsoft.com/privacystatement); that collection is controlled by Microsoft, not by us.
 
-**Team mode is the one exception, and it is optional.** If your employer or manager gives you an ID and password and you sign in to their team, the Software reports your outreach activity to *their* hub, as described in section 7. That hub is run by your organisation, not by BlacSwanken, and BlacSwanken receives nothing from it.
+**Team mode is the one exception.** The Software opens on a sign-in screen and is used with an ID and password issued by your organisation. Once you sign in, it reports your outreach activity to your organisation's hub, as described in section 7. That hub is run by your organisation, not by BlacSwanken, and BlacSwanken receives nothing from it.
 
 ## 2. Information the Software processes on your device
 
@@ -57,15 +57,15 @@ If a contact asks BlacSwanken about their data, we will tell them that we do not
 
 Data stays on your device until you delete it. Uninstalling the Microsoft Store version removes the Software's data folder. If you used the separate installer, you can delete the folder `%APPDATA%\OutreachCRM` after uninstalling to remove all data, including encrypted keys.
 
-## 7. Team mode (only if you join a team)
+## 7. Team mode and sign-in
 
-Team mode lets a manager oversee a group of people using the Software. It does nothing unless you sign in with an ID and password issued by your organisation and tick a box confirming you have read the disclosure shown on the sign-in screen. If your organisation installs the Software for you in managed form, you must sign in to use it, and the Software stores a salted, hashed check of your password on your computer so you can sign in when the hub is briefly unreachable. After you join, the Software sends your organisation's hub:
+Team mode lets a manager oversee a group of people using the Software. Each time the Software opens, it asks for the ID and password your organisation issued; the first time, it also shows what your manager can see and asks you to confirm you have read it. The Software stores a salted, hashed check of your password on your computer so you can sign in when the hub is briefly unreachable. After you join, the Software sends your organisation's hub:
 
 - each email sent, drafted, approved or rejected, each bounce, and the label of each reply (for example "interested"), with the lead's email address and company, the sequence step and which of your inboxes was used;
 - when this computer last connected and which version of the Software it runs;
 - if your manager requires approval, the subject and text of drafts waiting for approval.
 
-It never sends your passwords, API keys, inbox logins, your lead list, your notes or the text of replies. The hub can tell the Software to pause sending, apply a daily limit, or approve, edit or reject a draft. The hub's owner (your organisation) is the controller of the data it holds and is responsible for telling you how long it keeps it and for handling your requests about it; BlacSwanken does not host, see or process it. If the Software was not installed in managed form, you can leave the team at any time in Settings → Team. Either way, the hub's owner keeps what it already received. Your organisation may have its own policies, and we recommend that it tells you about team monitoring before you join, as the law in many places requires.
+It never sends your passwords, API keys, inbox logins, your lead list, your notes or the text of replies. The hub can tell the Software to pause sending, apply a daily limit, or approve, edit or reject a draft. The hub's owner (your organisation) is the controller of the data it holds and is responsible for telling you how long it keeps it and for handling your requests about it; BlacSwanken does not host, see or process it. If you stop working with the team, your organisation removes your account; the hub's owner keeps what it already received. Your organisation may have its own policies, and we recommend that it tells you about team monitoring before you join, as the law in many places requires.
 
 ## 8. Children
 

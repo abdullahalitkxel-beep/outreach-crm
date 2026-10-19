@@ -88,12 +88,16 @@ def hub_url():
 
 
 def required():
-    """True when this install must be signed in with an ID and password before it can be used."""
-    return bool(defaults().get("required") or state().get("required"))
+    """Every install opens on the sign-in screen and needs an ID and password from the admin.
+    (BSO_NO_SIGNIN=1 is only for the automated build tests, which have no hub to sign in to.)"""
+    if os.getenv("BSO_NO_SIGNIN") == "1":
+        return False
+    d = defaults()
+    return d.get("required", True) is not False
 
 
 def locked_in():
-    return bool(defaults().get("required"))
+    return required()
 
 
 def signed_in():

@@ -196,8 +196,22 @@ try:
 except ValueError:
     check(True, "plain http to a public host is refused")
 
-# --- the CRM itself is locked behind the sign-in page
+# --- the CRM itself opens on the sign-in screen, even with no admin file
 import crm  # noqa: E402
+(tmp / "laptop" / "team-defaults.json").unlink()
+team.leave()
+check(team.required(), "every install requires sign-in by default")
+w0 = crm.app.test_client()
+r = w0.get("/")
+check(r.status_code == 302 and "/signin" in r.headers["Location"], "opening the app shows sign-in first (before terms)")
+sp = w0.get("/signin").data
+check(b'name="hub"' in sp and b"What your manager can see" in sp and b'class="gsearch"' not in sp, "first-time sign-in asks for hub address, shows disclosure, no app menus")
+r = w0.post("/signin", data={"username": "ayesha", "password": "brand-new-pass-1", "consent": "1", "hub": "http://127.0.0.1:8791"})
+check(r.status_code == 302, "first sign-in with hub address works")
+r = w0.get("/")
+check(r.status_code == 302 and "/welcome" in r.headers["Location"], "after sign-in, terms come next")
+w0.post("/signout")
+_sp = w0.get("/signin").data; check(b"Hub address: http://127.0.0.1:8791" in _sp, "hub address is remembered")
 (tmp / "laptop" / "team-defaults.json").write_text(json.dumps({"hub": "http://127.0.0.1:8791", "required": True}))
 crm.write_settings({"legal_acceptance": {"version": str(crm.cfg().get("legal", {}).get("version", "1.0"))}})
 team.leave()
