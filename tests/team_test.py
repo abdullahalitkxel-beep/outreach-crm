@@ -34,10 +34,18 @@ def csrf(path="/login"):
 check(b"omar@blacswanken.com" in c.get("/setup").data, "setup page pre-fills the master email")
 # --- owner setup and login
 check(c.get("/").status_code == 302, "console needs sign-in")
-r = c.post("/setup", data={"_csrf": csrf("/setup"), "setup_key": "wrong", "name": "Omar", "email": "o@x.com", "password": "correct-horse-9", "password2": "correct-horse-9"})
-check(b"setup key is wrong" in r.data, "wrong setup key refused")
-r = c.post("/setup", data={"_csrf": csrf("/setup"), "setup_key": key, "org": "NeoSOFT", "name": "Omar", "email": "o@x.com", "password": "correct-horse-9", "password2": "correct-horse-9"})
-check(r.status_code == 302, "owner created with the setup key")
+rc = hub.app.test_client()
+REMOTE = {"REMOTE_ADDR": "203.0.113.9"}
+rtok = re.search(r'name="_csrf" value="([^"]+)"', rc.get("/setup", environ_base=REMOTE).get_data(as_text=True)).group(1)
+check(b'name="setup_key"' in rc.get("/setup", environ_base=REMOTE).data and b'name="setup_key"' not in c.get("/setup").data,
+      "setup key asked only from another computer")
+form = {"_csrf": rtok, "setup_key": "wrong", "name": "Omar", "email": "o@x.com", "password": "correct-horse-9", "password2": "correct-horse-9"}
+r = rc.post("/setup", data=form, environ_base=REMOTE)
+check(b"setup key is wrong" in r.data, "wrong setup key refused from another computer")
+r = rc.post("/setup", data=form, environ_base=REMOTE, headers={"X-Forwarded-For": "127.0.0.1"})
+check(b"setup key is wrong" in r.data, "faked local address doesn't skip the key")
+r = c.post("/setup", data={"_csrf": csrf("/setup"), "org": "NeoSOFT", "name": "Omar", "email": "o@x.com", "password": "correct-horse-9", "password2": "correct-horse-9"})
+check(r.status_code == 302, "owner created on the hub computer without a key")
 check(c.get("/").status_code == 200, "owner sees the dashboard")
 check(c.post("/users/new", data={"name": "x"}).status_code == 400, "POST without CSRF token is rejected")
 

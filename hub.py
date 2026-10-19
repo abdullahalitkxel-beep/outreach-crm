@@ -292,6 +292,12 @@ def has_owner():
     return db().execute("SELECT 1 FROM users WHERE role='owner' LIMIT 1").fetchone() is not None
 
 
+def local_request():
+    """True only for a browser on this very computer (not through a proxy or tunnel)."""
+    orig = request.environ.get("werkzeug.proxy_fix.orig", {}).get("REMOTE_ADDR") or request.environ.get("REMOTE_ADDR", "")
+    return orig in ("127.0.0.1", "::1") and not request.headers.get("X-Forwarded-For") and not request.headers.get("Forwarded")
+
+
 def strong(pw):
     return len(pw or "") >= 10
 
@@ -304,7 +310,7 @@ def setup():
     if request.method == "POST":
         f = request.form
         key = f.get("setup_key", "").strip()
-        ok = hmac.compare_digest(sha(key), meta_get("setup_key_hash", ""))
+        ok = local_request() or hmac.compare_digest(sha(key), meta_get("setup_key_hash", ""))
         ip = request.remote_addr or "?"
         if throttled("setup:" + ip, 8, 900):
             err = "Too many attempts. Wait 15 minutes."
@@ -330,7 +336,7 @@ def setup():
             g.me = dict(db().execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone())
             audit("owner_created", f["email"])
             return redirect(url_for("dashboard"))
-    return render("setup.html", err=err, owner_email=meta_get("owner_email", "omar@blacswanken.com"))
+    return render("setup.html", err=err, local=local_request(), owner_email=meta_get("owner_email", "omar@blacswanken.com"))
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -658,6 +664,14 @@ def team_defaults_file():
     return resp
 
 
+@app.post("/shutdown")
+@need("owner")
+def hub_shutdown():
+    audit("hub_stopped")
+    threading.Timer(1.0, lambda: os._exit(0)).start()
+    return "<p style='font:16px system-ui;margin:40px'>The master console has stopped. Start it again from the Start menu: <b>BSO Master Console</b>.</p>"
+
+
 @app.route("/audit")
 @need("owner")
 def audit_page():
@@ -842,7 +856,7 @@ T["setup.html"] = """{% extends 'base.html' %}{% block title %}Set up{% endblock
 <div class="logo">{{ logo(56, tile=True, uid='su', animated=True)|safe }}<div><h2 style="margin:0">Set up your master console</h2><span class="muted">One time only</span></div></div>
 {% if err %}<div class="err">{{ err }}</div>{% endif %}
 <form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}">
-<label>Setup key (shown in the window where the hub was started, and saved in <code>setup-key.txt</code> in the hub's data folder)</label><input name="setup_key" autocomplete="off" required>
+{% if not local %}<label>Setup key (saved in <code>setup-key.txt</code> in the hub's data folder on the hub computer; not needed when you open this page on that computer)</label><input name="setup_key" autocomplete="off" required>{% endif %}
 <label>Team or company name</label><input name="org" placeholder="e.g. NeoSOFT outreach team">
 <label>Your name</label><input name="name" required><label>Your email (your sign-in, and where password-reset links go)</label><input name="email" type="email" required value="{{ owner_email }}">
 <label>Password (at least 10 characters)</label><input name="password" type="password" autocomplete="new-password" required>
@@ -937,6 +951,8 @@ T["settings.html"] = """{% extends 'base.html' %}{% block title %}Settings{% end
 <div><label>Send from</label><input name="from" value="{{ smtp['from'] }}" placeholder="BSO hub &lt;hub@your-company.com&gt;"></div></div>
 <p><button class="btn brand" name="action" value="smtp">Save</button> <button class="btn" name="action" value="smtp_test">Send a test email to me</button></p>
 <p class="muted" style="margin:0">Use a mailbox the hub may send from (for Gmail, an app password). Set the public address above too, so links in the email open the right place.</p></form></div></div>
+<div class="card"><div class="card-h"><h2>Stop the master console</h2></div><div class="card-b"><p style="margin-top:0" class="muted">It runs in the background. While it's stopped, team laptops can't check in (they keep working for the grace period).</p>
+<form method="post" action="{{ url_for('hub_shutdown') }}" onsubmit="return confirm('Stop the master console?')"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn danger">Stop it</button></form></div></div>
 <div class="card"><div class="card-h"><h2>Change your password</h2></div><div class="card-b"><form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="password">
 <div class="grid"><div><label>Current password</label><input name="old" type="password" required></div><div><label>New password (10+ characters)</label><input name="new" type="password" required autocomplete="new-password"></div><div><label>New password again</label><input name="new2" type="password" required autocomplete="new-password"></div></div><p><button class="btn brand">Change password</button></p></form></div></div>{% endblock %}"""
 app.jinja_loader = DictLoader(T)

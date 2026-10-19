@@ -114,6 +114,17 @@ jobs:
           if ($entry.Publisher -notmatch 'BlacSwanken') { throw "Publisher missing from Installed apps" }
           python tests/smoke_test.py "$exe"
           if ($LASTEXITCODE) { throw "smoke test failed on installed app" }
+          # the Start-menu "BSO Master Console" shortcut must start the hub and serve the setup page
+          $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\BSO Master Console.lnk")
+          if ($lnk.Arguments -ne "--hub") { throw "Master Console shortcut missing or wrong: '$($lnk.Arguments)'" }
+          $env:OUTREACH_HOME = "$env:RUNNER_TEMP\hubtest"
+          $hubp = Start-Process $exe -ArgumentList "--hub --no-window" -PassThru
+          $ok = $false
+          for ($i = 0; $i -lt 60; $i++) { try { $r = Invoke-WebRequest http://127.0.0.1:8780/setup -UseBasicParsing -TimeoutSec 2; if ($r.Content -match "omar@blacswanken.com") { $ok = $true; break } } catch {}; Start-Sleep 1 }
+          Stop-Process -Id $hubp.Id -Force -ErrorAction SilentlyContinue
+          Remove-Item Env:OUTREACH_HOME
+          if (-not $ok) { Get-Content "$env:RUNNER_TEMP\hubtest\hub.log" -ErrorAction SilentlyContinue; throw "installed BSO.exe --hub did not serve the setup page" }
+          Write-Host "::notice title=Master console::installed BSO.exe --hub serves the setup page"
           Start-Process "$env:LOCALAPPDATA\Programs\BSO\unins000.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES" -Wait
           if (Test-Path $exe) { throw "uninstall left the app behind" }
 

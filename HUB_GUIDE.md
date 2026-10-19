@@ -4,10 +4,10 @@ The hub is the manager's console. Team members keep BSO on their own laptops; ea
 
 ## 1. Run the hub (on one always-on computer)
 
-- Windows app: `BSO.exe --hub` (add `--host 0.0.0.0 --port 8780` to let other computers connect).
+- Windows app: Start menu → **BSO Master Console** (it runs `BSO.exe --hub` and opens the console). To let other computers connect, run `BSO.exe --hub --host 0.0.0.0` instead.
 - From source: `pip install -r requirements.txt` then `python hub.py --host 0.0.0.0 --port 8780`.
 
-On first start it prints a **setup key** (also saved as `setup-key.txt` in the hub data folder). Open the address it shows, enter the key, and create the owner account (password of 10+ characters). The key file is deleted afterwards.
+On first start the console opens on the setup page: enter your team name, name, email (pre-filled as omar@blacswanken.com) and a password of 10+ characters. On the hub computer itself no setup key is needed. From any other computer the page asks for the **setup key** saved as `setup-key.txt` in the hub data folder (`%APPDATA%\OutreachCRM\hub`); it is deleted once the owner exists. To stop the console: Settings → Stop the master console.
 
 The hub's data (users, activity, drafts awaiting approval) is in `hub.db` inside the hub data folder (`<BSO data folder>\hub` by default). Back it up.
 

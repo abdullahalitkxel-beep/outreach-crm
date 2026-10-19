@@ -42,6 +42,7 @@ Source: "..\dist\BSO\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 
 [Icons]
 Name: "{autoprograms}\BSO"; Filename: "{app}\BSO.exe"
+Name: "{autoprograms}\BSO Master Console"; Filename: "{app}\BSO.exe"; Parameters: "--hub"; Comment: "Team master console (for the admin)"
 Name: "{autodesktop}\BSO"; Filename: "{app}\BSO.exe"; Tasks: desktopicon
 
 [InstallDelete]

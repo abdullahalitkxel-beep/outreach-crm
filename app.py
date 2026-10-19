@@ -5,7 +5,8 @@ Outreach CRM desktop launcher (this is what OutreachCRM.exe runs).
   running just brings up another window.
 - Closing the window quits the app, unless "Run automatically" is on in Settings → Safety; then it
   keeps running in the background with a tray icon (Open / Quit) next to the clock.
-- `OutreachCRM.exe --bot <command>`: runs a bot command (used internally by the CRM's buttons).
+- `BSO.exe --bot <command>`: runs a bot command (used internally by the CRM's buttons).
+- `BSO.exe --hub`: runs the master console (team hub) and opens it; the Start-menu shortcut "BSO Master Console" does this.
 """
 import os
 import socket
@@ -116,8 +117,25 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--hub":
         import bot
         _ensure_stdio(bot.DATA / "hub.log")
+        args = sys.argv[2:]
+        port = 8780
+        if "--port" in args:
+            try:
+                port = int(args[args.index("--port") + 1])
+            except (IndexError, ValueError):
+                pass
+        hub_url = f"http://127.0.0.1:{port}"
+        with socket.socket() as s:
+            s.settimeout(0.5)
+            running = s.connect_ex(("127.0.0.1", port)) == 0
+        if running or "--reset-owner-password" in args:
+            if running:
+                open_window(hub_url)     # already running: just open the console again
+                return
         import hub
-        hub.main(sys.argv[2:])
+        if "--no-window" not in args and "--reset-owner-password" not in args:
+            threading.Timer(2.0, open_window, args=(hub_url,)).start()
+        hub.main([a for a in args if a != "--no-window"])
         return
 
     import bot  # sets up the data folder (%APPDATA%\OutreachCRM) on first run
