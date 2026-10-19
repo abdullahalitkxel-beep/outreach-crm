@@ -2,7 +2,7 @@
 
 BASE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{% block title %}BSO{% endblock %}</title>
+<title>{% block title %}BSO{% endblock %} · BlacSwanken Outreach</title>
 <link rel="icon" href="/favicon.ico" sizes="any">
 <link rel="icon" type="image/png" href="/app-icon.png">
 <link rel="apple-touch-icon" href="/app-icon.png">
@@ -189,7 +189,7 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
  </div>
 </div>
 {% if request.endpoint != 'welcome' %}<nav class="nav">
- <span class="app"><svg width="18" height="18" viewBox="0 0 24 24"><path d="M4 4h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4zM4 10h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4zM4 16h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4z"/></svg>BSO</span>
+ <span class="app"><svg width="18" height="18" viewBox="0 0 24 24"><path d="M4 4h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4zM4 10h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4zM4 16h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4z"/></svg>BlacSwanken Outreach</span>
  {% for ep, label, extra in nav_items %}
  <a class="tab {{ 'on' if active == ep }}" id="nav-{{ ep }}" href="{{ url_for(ep) }}">{{ label }}{% if extra %} <span class="pill">{{ extra }}</span>{% endif %}</a>
  {% endfor %}

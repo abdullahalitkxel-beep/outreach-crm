@@ -60,7 +60,7 @@ def open_window(url=URL):
 
 
 def shutdown():
-    print("Outreach CRM: shutting down")
+    print("BSO: shutting down")
     os._exit(0)
 
 
@@ -128,7 +128,7 @@ def main():
                               daemon=True)
     server.start()
     threading.Timer(1.0, open_window).start()
-    print(f"Outreach CRM running at {URL} (data folder: {bot.DATA})")
+    print(f"BSO running at {URL} (data folder: {bot.DATA})")
     if not run_tray(tray_ref):
         server.join()
 
