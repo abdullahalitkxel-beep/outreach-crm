@@ -16,7 +16,7 @@ import threading
 from datetime import date, timedelta
 from pathlib import Path
 
-from flask import Flask, Response, abort, g, redirect, request, url_for
+from flask import Flask, Response, abort, g, jsonify, redirect, request, url_for
 from jinja2 import DictLoader
 import brand
 from bot import find_avoid, template_avoid_hits
@@ -101,7 +101,23 @@ def job_running():
         con.close()
 
 
-OPEN_ENDPOINTS = {"welcome", "accept_terms", "legal_doc", "about", "heartbeat", "quit_app", "static", "app_icon"}
+OPEN_ENDPOINTS = {"welcome", "accept_terms", "legal_doc", "about", "heartbeat", "quit_app", "static", "app_icon", "favicon", "web_manifest"}
+
+
+@app.route("/favicon.ico")
+def favicon():
+    """The window and taskbar icon: Edge/Chrome app windows take their icon from the page's favicon."""
+    from flask import send_file
+    here = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return send_file(here / "assets" / "icon.ico", mimetype="image/x-icon", max_age=3600)
+
+
+@app.route("/manifest.webmanifest")
+def web_manifest():
+    return jsonify(name="BSO – BlacSwanken Outreach", short_name="BSO", start_url="/", display="standalone",
+                   background_color="#1B1F24", theme_color="#1B1F24",
+                   icons=[{"src": "/app-icon.png", "sizes": "1024x1024", "type": "image/png", "purpose": "any"},
+                          {"src": "/favicon.ico", "sizes": "16x16 32x32 48x48 256x256", "type": "image/x-icon"}])
 
 
 @app.route("/app-icon.png")

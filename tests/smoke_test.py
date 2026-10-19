@@ -54,6 +54,10 @@ try:
     for d in ("terms", "privacy", "acceptable-use", "third-party"):
         r = requests.get(base + f"/legal/{d}", timeout=10)
         check(r.status_code == 200 and "{{" not in r.text, f"legal document /legal/{d}")
+    ic = requests.get(base + "/favicon.ico", timeout=10)
+    check(ic.status_code == 200 and ic.content[:4] == b"\x00\x00\x01\x00" and 'rel="icon"' in requests.get(base + "/welcome", timeout=10).text,
+          "window/taskbar icon is served (favicon.ico + link tag)")
+    check(requests.get(base + "/manifest.webmanifest", timeout=10).json().get("short_name") == "BSO", "web manifest names the app BSO")
     tp = requests.get(base + "/legal/third-party", timeout=10).text
     check("flask" in tp.lower() and "Python Software Foundation" in tp, "third-party notices list bundled components")
     r = requests.post(base + "/legal/accept", data={"agree": "1"}, timeout=10)

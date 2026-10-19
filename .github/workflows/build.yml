@@ -59,6 +59,7 @@ jobs:
           --add-data "version.txt;."
           --add-data "legal;legal"
           --add-data "assets/icon.png;assets"
+          --add-data "assets/icon.ico;assets"
           --hidden-import apollo
           --hidden-import legal
           --hidden-import brand

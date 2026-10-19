@@ -3,6 +3,11 @@
 BASE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{% block title %}BSO{% endblock %}</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" href="/app-icon.png">
+<link rel="apple-touch-icon" href="/app-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#1B1F24">
 <style>
 :root{--brand:#0176d3;--brand-d:#014486;--brand-l:#eef4ff;--bg:#f3f3f3;--card:#fff;--line:#dddbda;--line2:#e5e5e5;
 --ink:#181818;--muted:#706e6b;--ok:#2e844a;--ok-l:#cdefc4;--err:#ba0517;--err-l:#feded8;--warn:#dd7a01;--warn-l:#fef1ee;
