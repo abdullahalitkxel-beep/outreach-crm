@@ -49,6 +49,9 @@ jobs:
       - name: Test team mode (hub and laptop)
         run: python tests/team_test.py
 
+      - name: Test team mode through the Google Drive relay
+        run: python tests/relay_test.py
+
       - name: Test the app doesn't quit while its window is hidden or asleep
         run: python tests/watchdog_test.py
 
@@ -67,11 +70,13 @@ jobs:
           --add-data "assets/icon.png;assets"
           --add-data "assets/icon.ico;assets"
           --add-data "hub_address.txt;."
+          --add-data "relay/Code.gs;relay"
           --hidden-import apollo
           --hidden-import legal
           --hidden-import brand
           --hidden-import hub
           --hidden-import team
+          --hidden-import relay
           --hidden-import waitress
           --hidden-import secretstore
           --hidden-import bs4

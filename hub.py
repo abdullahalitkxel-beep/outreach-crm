@@ -36,6 +36,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import brand
+import relay
 
 ROLES = ("owner", "manager", "member")
 EVENT_TYPES = ("sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "settings", "app_start", "paused")
@@ -129,6 +130,9 @@ def init_db():
         con.execute("ALTER TABLE users ADD COLUMN username TEXT")
         con.execute("UPDATE users SET username=lower(email) WHERE username IS NULL")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username)")
+    for col, decl in (("relay_pw", "TEXT"), ("tv", "INTEGER DEFAULT 1")):
+        if col not in {r[1] for r in con.execute("PRAGMA table_info(users)")}:
+            con.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
     con.commit()
     con.close()
 
@@ -289,6 +293,15 @@ app.jinja_env.globals.update(online=is_online, logo=brand.logo_svg, logo_css=bra
 
 # ---------------------------------------------------------------------------------------------- first-run setup and login
 
+def set_password(con, uid, pw, sign_out=False):
+    """Console password + the team-relay check (so this person can sign in to BSO on any laptop)."""
+    con.execute("UPDATE users SET pw_hash=?, relay_pw=? WHERE id=?",
+                (generate_password_hash(pw), json.dumps(relay.new_password_record(pw)), uid))
+    if sign_out:
+        con.execute("UPDATE users SET tv=COALESCE(tv,1)+1 WHERE id=?", (uid,))
+        con.execute("UPDATE devices SET revoked=1 WHERE user_id=?", (uid,))
+
+
 def has_owner():
     return db().execute("SELECT 1 FROM users WHERE role='owner' LIMIT 1").fetchone() is not None
 
@@ -326,6 +339,7 @@ def setup():
             db().execute("INSERT INTO users(name,email,username,role,status,pw_hash,created_at) VALUES(?,?,?,?,?,?,?)",
                          (f["name"].strip(), f["email"].strip().lower(), f["email"].strip().lower(), "owner", "active", generate_password_hash(f["password"]), iso()))
             meta_set("org_name", f.get("org", "").strip() or "Your team")
+            set_password(db(), db().execute("SELECT id FROM users WHERE role='owner'").fetchone()["id"], f["password"])
             db().commit()
             try:
                 (data_dir() / "setup-key.txt").unlink()
@@ -451,7 +465,7 @@ def reset(token):
         if not strong(f.get("password")) or f.get("password") != f.get("password2"):
             err = "The password must be at least 10 characters and typed twice the same."
         else:
-            db().execute("UPDATE users SET pw_hash=? WHERE id=?", (generate_password_hash(f["password"]), t["user_id"]))
+            set_password(db(), t["user_id"], f["password"])
             db().execute("UPDATE reset_tokens SET used_at=? WHERE user_id=? AND used_at IS NULL", (iso(), t["user_id"]))
             db().commit()
             session.clear()
@@ -556,6 +570,7 @@ def user_new():
                  (name, email, username, role, "invited", generate_password_hash(pw),
                   _valid_int(f.get("daily_cap")), _valid_int(f.get("weekly_target")),
                   "master" if f.get("approval") == "master" else "member", iso()))
+    set_password(db(), db().execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()["id"], pw)
     db().commit()
     audit("user_created", f"{username} ({role})")
     session["new_creds"] = creds_note(name, username, pw)
@@ -596,12 +611,12 @@ def user_save(uid):
         pw = f.get("password", "") or gen_password()
         if not strong(pw):
             return redirect(url_for("user_detail", uid=uid, err="Password must be at least 10 characters (or leave blank to generate one)."))
-        db().execute("UPDATE users SET pw_hash=? WHERE id=?", (generate_password_hash(pw), uid))
-        db().execute("UPDATE devices SET revoked=1 WHERE user_id=?", (uid,))   # a new password signs the old laptops out
+        set_password(db(), uid, pw, sign_out=True)   # a new password signs the old laptops out
         session["new_creds"] = creds_note(u["name"], u["username"] or u["email"], pw)
         audit("password_reset", u["email"])
     elif action == "revoke":
         db().execute("UPDATE devices SET revoked=1 WHERE user_id=?", (uid,))
+        db().execute("UPDATE users SET tv=COALESCE(tv,1)+1 WHERE id=?", (uid,))
         audit("devices_revoked", u["email"])
     db().commit()
     return redirect(url_for("user_detail", uid=uid))
@@ -659,7 +674,7 @@ def activity():
 @need("owner")
 def team_defaults_file():
     """Drop this file next to BSO.exe to make that install sign-in-only and point it at this hub."""
-    url = (meta_get("public_url", DEFAULT_PUBLIC_URL) or request.host_url).rstrip("/")
+    url = (meta_get("relay_url") or meta_get("public_url", DEFAULT_PUBLIC_URL) or request.host_url).rstrip("/")
     resp = app.response_class(json.dumps({"hub": url, "required": True}, indent=1), mimetype="application/json")
     resp.headers["Content-Disposition"] = "attachment; filename=team-defaults.json"
     return resp
@@ -695,6 +710,18 @@ def hub_settings():
                 meta_set("grace_hours", str(_valid_int(f.get("grace_hours"), 0, 720) if f.get("grace_hours") != "" else GRACE_HOURS))
                 audit("hub_settings", f"org={f.get('org')} url={url}")
                 msg = "Saved."
+        elif f.get("action") == "relay_url":
+            url = f.get("relay_url", "").strip()
+            if not relay.is_relay(url) or not (url.startswith("https://") or url.startswith("http://127.0.0.1:")):
+                msg = "Paste the Web app URL from Apps Script. It starts with https://script.google.com/macros/s/ and ends with /exec."
+            else:
+                meta_set("relay_url", url)
+                meta_set("relay_pub_hash", "")
+                ok, msg = relay_cycle(db())
+                msg = ("Connected. " + msg) if ok else msg
+                audit("relay_connected" if ok else "relay_connect_failed", url[:120])
+        elif f.get("action") == "relay_sync":
+            ok, msg = relay_cycle(db())
         elif f.get("action") in ("smtp", "smtp_test"):
             if f.get("action") == "smtp":
                 for k in ("host", "port", "user", "from"):
@@ -716,11 +743,12 @@ def hub_settings():
             elif not strong(f.get("new")) or f.get("new") != f.get("new2"):
                 msg = "The new password must be at least 10 characters and typed twice the same."
             else:
-                db().execute("UPDATE users SET pw_hash=? WHERE id=?", (generate_password_hash(f["new"]), g.me["id"]))
+                set_password(db(), g.me["id"], f["new"])
                 db().commit()
                 audit("password_changed")
                 msg = "Password changed."
-    return render("settings.html", msg=msg, smtp=smtp_conf(), public_url=meta_get("public_url", DEFAULT_PUBLIC_URL), grace=meta_get("grace_hours", str(GRACE_HOURS)), tab="settings")
+    return render("settings.html", msg=msg, smtp=smtp_conf(), relay_url=meta_get("relay_url", ""), relay_ok=meta_get("relay_last_ok", ""),
+                  relay_err=meta_get("relay_last_error", ""), relay_script=relay.script_text(relay_key(create=True)), public_url=meta_get("public_url", DEFAULT_PUBLIC_URL), grace=meta_get("grace_hours", str(GRACE_HOURS)), tab="settings")
 
 
 # ---------------------------------------------------------------------------------------------- API used by team laptops
@@ -773,18 +801,13 @@ def api_login():
     return jsonify(token=token, policy=policy_for(dict(u)), username=u["username"])
 
 
-@app.post("/api/v1/sync")
-def api_sync():
-    u, dev = api_user()
-    if not u:
-        return jsonify(error="unauthorized"), 401
-    j = request.get_json(silent=True) or {}
-    con = db()
+def ingest(con, uid, j):
+    """Store one report from a team laptop (events, drafts awaiting approval, delivered decisions). Returns events accepted."""
     n_ev = 0
     for e in (j.get("events") or [])[:500]:
         try:
             con.execute("INSERT OR IGNORE INTO events(user_id, local_id, at, type, detail, sender, lead_email, company, step, variant) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        (u["id"], int(e["id"]), str(e.get("at", iso()))[:25], str(e.get("type", ""))[:30], str(e.get("detail", ""))[:300],
+                        (uid, int(e["id"]), str(e.get("at", iso()))[:25], str(e.get("type", ""))[:30], str(e.get("detail", ""))[:300],
                          str(e.get("sender") or "")[:120], str(e.get("lead_email") or "")[:200], str(e.get("company") or "")[:200],
                          e.get("step"), str(e.get("variant") or "")[:80]))
             n_ev += 1
@@ -795,26 +818,160 @@ def api_sync():
             lid = int(dr["id"])
         except (KeyError, ValueError, TypeError):
             continue
-        cur = con.execute("SELECT * FROM drafts WHERE user_id=? AND local_id=?", (u["id"], lid)).fetchone()
+        cur = con.execute("SELECT * FROM drafts WHERE user_id=? AND local_id=?", (uid, lid)).fetchone()
         vals = (str(dr.get("lead_email", ""))[:200], str(dr.get("company", ""))[:200], dr.get("step", 0), str(dr.get("sender", ""))[:120],
                 str(dr.get("subject", ""))[:300], str(dr.get("body", ""))[:20000])
         if not cur:
             con.execute("INSERT INTO drafts(user_id, local_id, lead_email, company, step, sender, subject, body, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                        (u["id"], lid, *vals, iso()))
+                        (uid, lid, *vals, iso()))
         elif cur["status"] == "pending":  # the member may still be editing; the manager has not decided
             con.execute("UPDATE drafts SET subject=?, body=? WHERE id=?", (vals[4], vals[5], cur["id"]))
     for lid in (j.get("acked") or [])[:500]:
         try:
-            con.execute("UPDATE drafts SET delivered=1 WHERE user_id=? AND local_id=? AND status!='pending'", (u["id"], int(lid)))
+            con.execute("UPDATE drafts SET delivered=1 WHERE user_id=? AND local_id=? AND status!='pending'", (uid, int(lid)))
         except (ValueError, TypeError):
             pass
+    return n_ev
+
+
+def decisions_for(con, uid):
+    return [{"local_id": d["local_id"], "action": "approve" if d["status"] == "approved" else "reject",
+             "subject": d["subject"], "body": d["body"], "by": d["decided_by"]}
+            for d in con.execute("SELECT * FROM drafts WHERE user_id=? AND status!='pending' AND delivered=0", (uid,)).fetchall()]
+
+
+@app.post("/api/v1/sync")
+def api_sync():
+    u, dev = api_user()
+    if not u:
+        return jsonify(error="unauthorized"), 401
+    j = request.get_json(silent=True) or {}
+    con = db()
+    n_ev = ingest(con, u["id"], j)
     con.execute("UPDATE users SET last_seen=?, app_version=? WHERE id=?", (iso(), str(j.get("version", ""))[:20], u["id"]))
     con.execute("UPDATE devices SET last_seen=? WHERE id=?", (iso(), dev["id"]))
     con.commit()
-    dec = con.execute("SELECT * FROM drafts WHERE user_id=? AND status!='pending' AND delivered=0", (u["id"],)).fetchall()
-    return jsonify(policy=policy_for(u), accepted_events=n_ev,
-                   decisions=[{"local_id": d["local_id"], "action": "approve" if d["status"] == "approved" else "reject",
-                               "subject": d["subject"], "body": d["body"], "by": d["decided_by"]} for d in dec])
+    return jsonify(policy=policy_for(u), accepted_events=n_ev, decisions=decisions_for(con, u["id"]))
+
+
+# ---------------------------------------------------------------------------------------------- Google Drive team relay
+# The master deploys relay/Code.gs once under their own Google account. Team laptops sign in and report through it;
+# this console publishes users, limits and decisions to it and collects the reports, about once a minute.
+
+RELAY_EVERY = 60
+_relay_lock = threading.Lock()
+
+
+def _m_get(con, key, default=None):
+    r = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return r[0] if r else default
+
+
+def _m_set(con, key, value):
+    con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, value))
+    con.commit()
+
+
+def relay_key(create=False):
+    store = _secret_store()
+    k = store.load().get("HUB_RELAY_KEY", "")
+    if not k and create:
+        k = secrets.token_urlsafe(32)
+        store.set("HUB_RELAY_KEY", k)
+    return k
+
+
+def relay_doc(con):
+    users = {}
+    for u in con.execute("SELECT * FROM users").fetchall():
+        if not u["relay_pw"]:
+            continue
+        rec = json.loads(u["relay_pw"])
+        users[u["username"] or u["email"]] = dict(
+            rec, name=u["name"], email=u["email"], role=u["role"], status="disabled" if u["status"] == "disabled" else "active",
+            tv=u["tv"] or 1, daily_cap=u["daily_cap"] or 0, weekly_target=u["weekly_target"] or 0, approval=u["approval"] or "member",
+            decisions=decisions_for(con, u["id"]))
+    return {"org": _m_get(con, "org_name", "Your team"), "grace_hours": int(_m_get(con, "grace_hours", str(GRACE_HOURS)) or 0), "users": users}
+
+
+def relay_cycle(con=None):
+    """Collect reports from the relay, then publish users/limits/decisions. Returns (ok, message)."""
+    own = con is None
+    if own:
+        con = sqlite3.connect(str(DB_PATH), timeout=30)
+        con.row_factory = sqlite3.Row
+    try:
+        url, key = _m_get(con, "relay_url", ""), relay_key()
+        if not (url and key):
+            return False, "The Google Drive connection isn't set up yet."
+        with _relay_lock:
+            try:
+                done, rounds, got = [], 0, 0
+                while rounds < 10:
+                    rounds += 1
+                    res = relay.call(url, {"action": "admin_pull", "admin_key": key, "done": done})
+                    done = []
+                    for it in res.get("items") or []:
+                        body = it.get("body") or {}
+                        u = con.execute("SELECT id FROM users WHERE username=? OR email=?", (body.get("user"), body.get("user"))).fetchone()
+                        if u:
+                            ingest(con, u["id"], body.get("data") or {})
+                            got += 1
+                        done.append(it["id"])
+                    con.commit()
+                    for name, seen in (res.get("seen") or {}).items():
+                        at = str(seen.get("at", ""))[:19] + "Z"
+                        con.execute("UPDATE users SET last_seen=?, app_version=COALESCE(NULLIF(?, ''), app_version), "
+                                    "status=CASE WHEN status='invited' THEN 'active' ELSE status END "
+                                    "WHERE (username=? OR email=?) AND (last_seen IS NULL OR last_seen<?)",
+                                    (at, str(seen.get("version", ""))[:20], name, name, at))
+                    con.commit()
+                    if not done:
+                        break
+                doc = relay_doc(con)
+                h = sha(json.dumps(doc, sort_keys=True))
+                last = float(_m_get(con, "relay_pub_at", "0") or 0)
+                if h != _m_get(con, "relay_pub_hash") or time.time() - last > 600:
+                    relay.call(url, {"action": "admin_publish", "admin_key": key, "doc": doc})
+                    _m_set(con, "relay_pub_hash", h)
+                    _m_set(con, "relay_pub_at", str(time.time()))
+                _m_set(con, "relay_last_ok", iso())
+                _m_set(con, "relay_last_error", "")
+                return True, f"Synced with Google Drive ({got} report{'s' if got != 1 else ''} collected)."
+            except relay.RelayError as e:
+                msg = str(e)
+                if e.code == 401:
+                    msg = "Google Drive refused this console's key. Paste the latest script from this page into your Apps Script project and deploy a new version."
+                _m_set(con, "relay_last_error", f"{iso()} {msg}")
+                return False, msg
+    finally:
+        if own:
+            con.close()
+
+
+def _relay_loop():
+    while True:
+        time.sleep(RELAY_EVERY)
+        try:
+            relay_cycle()
+        except Exception as e:      # never let the background sync die
+            print("relay:", e)
+
+
+@app.route("/relay/Code.gs")
+@need("owner")
+def relay_script():
+    resp = app.response_class(relay.script_text(relay_key(create=True)), mimetype="text/plain")
+    resp.headers["Content-Disposition"] = "attachment; filename=Code.gs"
+    return resp
+
+
+@app.get("/hub.js")
+def hub_js():
+    js = ("document.querySelectorAll('[data-copy]').forEach(function(b){b.addEventListener('click',function(){"
+          "var t=document.getElementById(b.dataset.copy);t.select();try{navigator.clipboard.writeText(t.value)}catch(e){document.execCommand('copy')}"
+          "b.textContent='Copied';setTimeout(function(){b.textContent='Copy script'},2000)})});")
+    return app.response_class(js, mimetype="text/javascript")
 
 
 @app.get("/api/v1/ping")
@@ -849,7 +1006,7 @@ BASE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name=
 {% if me %}<div class="top">{{ logo(30, tile=True, uid='tp', weight='b', label='BSO')|safe }}<b>BSO Master console</b><small>{{ org }}</small><span class="sp"></span>
 <small>{{ me.name }} · {{ me.role }}</small><form method="post" action="{{ url_for('logout') }}" style="margin:0"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" style="padding:4px 10px">Sign out</button></form></div>
 <div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('users','Users','users'),('approvals','Approvals','approvals'),('activity','Activity','activity')] + ([('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
-<div class="wrap">{% if request.args.get('err') %}<div class="err">{{ request.args.get('err') }}</div>{% endif %}{% block body %}{% endblock %}</div></body></html>"""
+<div class="wrap">{% if request.args.get('err') %}<div class="err">{{ request.args.get('err') }}</div>{% endif %}{% block body %}{% endblock %}</div><script src="/hub.js"></script></body></html>"""
 
 T = {}
 T["base.html"] = BASE
@@ -938,6 +1095,21 @@ T["activity.html"] = """{% extends 'base.html' %}{% block title %}Activity{% end
 <div class="card"><table><tr><th>When</th><th>User</th><th>Event</th><th>Lead</th><th>Inbox</th><th>Detail</th></tr>{% for e in rows %}<tr><td class="muted">{{ e.at|dt }}</td><td>{{ e.uname }}</td><td>{{ e.type }}</td><td>{{ e.lead_email }}{% if e.company %}<br><span class="muted">{{ e.company }}</span>{% endif %}</td><td class="muted">{{ e.sender }}</td><td>{{ e.detail }}</td></tr>{% else %}<tr><td colspan="6" class="muted">No activity yet.</td></tr>{% endfor %}</table></div>{% endblock %}"""
 T["audit.html"] = """{% extends 'base.html' %}{% block title %}Audit log{% endblock %}{% block body %}<div class="card"><div class="card-h"><h2>Who changed what in this console</h2></div><table><tr><th>When</th><th>Who</th><th>Action</th><th>Detail</th></tr>{% for r in rows %}<tr><td class="muted">{{ r.at|dt }}</td><td>{{ r.actor }}</td><td>{{ r.action }}</td><td>{{ r.detail }}</td></tr>{% endfor %}</table></div>{% endblock %}"""
 T["settings.html"] = """{% extends 'base.html' %}{% block title %}Settings{% endblock %}{% block body %}{% if msg %}<div class="note">{{ msg }}</div>{% endif %}
+<div class="card"><div class="card-h"><h2>Team connection through your Google Drive</h2>{% if relay_url and relay_ok and not relay_err %}<span class="badge b-ok">Connected</span>{% elif relay_url %}<span class="badge b-bad">Problem</span>{% else %}<span class="badge b-warn">Not set up</span>{% endif %}</div><div class="card-b">
+{% if relay_url %}<p style="margin-top:0">Team laptops sign in and report through <b>{{ relay_url }}</b>. Last sync: {{ relay_ok|dt if relay_ok else 'never' }}.{% if relay_err %}<br><span style="color:#ba0517">{{ relay_err }}</span>{% endif %}</p>
+<form method="post" style="display:inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" name="action" value="relay_sync">Sync now</button></form>
+<details style="margin-top:12px"><summary>Set up again or change the address</summary>{% endif %}
+<ol style="line-height:1.7">
+<li>Copy this script (it is unique to this console; keep it private): <button type="button" class="btn" data-copy="relayscript" style="padding:3px 10px">Copy script</button> or <a href="{{ url_for('relay_script') }}">download Code.gs</a>
+<textarea id="relayscript" readonly style="min-height:90px;margin-top:6px">{{ relay_script }}</textarea></li>
+<li>Open <a href="https://script.google.com/home" target="_blank" rel="noopener">script.google.com</a>, signed in to the Google account that should hold the team data → <b>New project</b>. Delete what's there, paste, and click <b>Save</b>.</li>
+<li><b>Deploy → New deployment</b> → gear icon → <b>Web app</b>. Execute as: <b>Me</b>. Who has access: <b>Anyone</b>. Click <b>Deploy</b>.</li>
+<li>Click <b>Authorize access</b> and choose your account. Google warns the app isn't verified (it's your own script): <b>Advanced → Go to … → Allow</b>.</li>
+<li>Copy the <b>Web app URL</b> and paste it here:</li></ol>
+<form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="relay_url">
+<input name="relay_url" value="{{ relay_url }}" placeholder="https://script.google.com/macros/s/…/exec"><p><button class="btn brand">Save &amp; test</button></p></form>
+<p class="muted" style="margin-bottom:0">Team laptops must use the same address: it is built into the BSO you give them. If you ever change it (a new deployment gives a new address), they need a BSO with the new one. To update the script itself, use <b>Deploy → Manage deployments → Edit → New version</b>, which keeps the address.</p>
+{% if relay_url %}</details>{% endif %}</div></div>
 <div class="card"><div class="card-h"><h2>Hub settings</h2></div><div class="card-b"><form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="org">
 <label>Team or company name</label><input name="org" value="{{ org }}"><label>Public address of this hub (what laptops connect to, e.g. https://hub.example.com). Shown with new users' sign-in details.</label><input name="public_url" value="{{ public_url }}" placeholder="https://hub.your-company.com">
 <label>If a laptop cannot reach the hub for this many hours, it pauses sending (0 = never)</label><input name="grace_hours" type="number" min="0" max="720" value="{{ grace }}"><p><button class="btn brand">Save</button></p></form></div></div>
@@ -1008,7 +1180,8 @@ def main(argv=None):
         pw = getpass.getpass(f"New password for {row[1]} (10+ characters): ")
         if not strong(pw) or pw != getpass.getpass("Again: "):
             sys.exit("Not changed: passwords must match and be at least 10 characters.")
-        con.execute("UPDATE users SET pw_hash=? WHERE id=?", (generate_password_hash(pw), row[0]))
+        con.row_factory = sqlite3.Row
+        set_password(con, row[0], pw)
         con.execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)", (iso(), "local", "owner_password_reset_cli", ""))
         con.commit()
         print("Owner password changed.")
@@ -1017,6 +1190,7 @@ def main(argv=None):
     print(f"  Open http://{'127.0.0.1' if a.host == '0.0.0.0' else a.host}:{a.port}")
     if key:
         print(f"\n  FIRST-TIME SETUP KEY (needed to create the owner account): {key}\n")
+    threading.Thread(target=_relay_loop, daemon=True).start()
     if a.host not in ("127.0.0.1", "localhost"):
         print("  This hub is reachable from other computers. Put it behind HTTPS before using it over the internet.\n")
     try:

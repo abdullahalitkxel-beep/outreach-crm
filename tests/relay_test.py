@@ -1,0 +1,133 @@
+"""End-to-end test of team mode through the Google Drive relay.
+Runs relay/Code.gs in a local stand-in for Google Apps Script (needs Node.js), the master console,
+and a team laptop.     python tests/relay_test.py
+"""
+import hashlib, json, os, re, subprocess, sys, tempfile, time
+from pathlib import Path
+
+root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(root))
+tmp = Path(tempfile.mkdtemp(prefix="relay-test-"))
+os.environ["OUTREACH_HOME"] = str(tmp / "laptop")
+os.environ["HUB_HOME"] = str(tmp / "hub")
+(tmp / "laptop").mkdir()
+
+import hub, bot, team, relay  # noqa: E402
+
+n = 0
+def check(cond, what):
+    global n
+    print(("PASS " if cond else "FAIL ") + what, flush=True)
+    if not cond:
+        sys.exit(1)
+    n += 1
+
+PORT = 8793
+URL = f"http://127.0.0.1:{PORT}/exec"
+hub.prepare(str(tmp / "hub"))
+key = hub.relay_key(create=True)
+node = subprocess.Popen(["node", str(root / "relay" / "test_double.js"), str(PORT), hashlib.sha256(key.encode()).hexdigest()])
+try:
+    for _ in range(50):
+        try:
+            relay.call(URL, {"action": "ping"}, timeout=2)
+            break
+        except relay.RelayError:
+            time.sleep(0.2)
+    c = hub.app.test_client()
+    tok = lambda path: re.search(r'name="_csrf" value="([^"]+)"', c.get(path).get_data(as_text=True)).group(1)
+
+    # --- master: account, a member, connect the relay
+    c.post("/setup", data={"_csrf": tok("/setup"), "org": "NeoSOFT", "name": "Omar", "email": "omar@blacswanken.com",
+                           "password": "owner-pass-123", "password2": "owner-pass-123"})
+    check(c.get("/").status_code == 200, "master account created")
+    c.post("/users/new", data={"_csrf": tok("/users"), "name": "Ayesha", "email": "a@x.com", "username": "ayesha", "role": "member",
+                               "daily_cap": "2", "approval": "master", "password": "ayesha-pass-1"})
+    page = c.get("/settings").get_data(as_text=True)
+    check("script.google.com" in page and hashlib.sha256(key.encode()).hexdigest() in page and key not in page,
+          "settings show the script with the key's fingerprint, never the key")
+    r = c.post("/settings", data={"_csrf": tok("/settings"), "action": "relay_url", "relay_url": "https://example.com/not-a-script"})
+    check(b"script.google.com/macros" in r.data, "a wrong address is refused")
+    r = c.post("/settings", data={"_csrf": tok("/settings"), "action": "relay_url", "relay_url": URL})
+    check(b"Connected" in r.data, "relay connected and test passed")
+
+    # --- laptop: sign in with only ID and password (relay address built in)
+    team.built_in_hub = lambda: URL
+    con = bot.db_connect("outreach.db")
+    for i in range(1, 4):
+        con.execute("INSERT INTO leads(email, first_name, company, status, step, created_at) VALUES (?,?,?,?,0,'2026-01-01')",
+                    (f"l{i}@acme.com", f"L{i}", "Acme", "active"))
+    con.commit()
+    try:
+        team.sign_in(con, "ayesha", "wrong-password", consent=True)
+        check(False, "wrong password refused")
+    except ValueError as e:
+        check("wrong" in str(e), "wrong password refused by the relay")
+    team.sign_in(con, "ayesha", "ayesha-pass-1", consent=True)
+    check(team.signed_in() == "ayesha" and team.holds_approval() and team.policy().get("daily_cap") == 2,
+          "member signs in through the relay and gets their limits")
+    team.sign_out()
+    team.sign_in(con, "omar@blacswanken.com", "owner-pass-123", consent=True)
+    check(team.signed_in() == "omar@blacswanken.com", "master can sign in to BSO with the master email")
+    team.leave()
+    team.sign_in(con, "ayesha", "ayesha-pass-1", consent=True)
+
+    # --- activity and a draft travel up
+    bot.log_event(con, 1, "sent", "step 1", "me@x.com", "A")
+    bot.log_event(con, 1, "reply", "interested", "me@x.com")
+    con.execute("INSERT INTO outbox(lead_id, step, sender, subject, body, status, created_at) VALUES (2,0,'me@x.com','Hello','Body text','pending','2026-01-01')")
+    con.commit()
+    ok, msg = team.sync(con)
+    check(ok, "laptop report accepted by the relay")
+    files = json.loads(__import__("urllib.request").request.urlopen(f"http://127.0.0.1:{PORT}/_files").read())
+    check(any(f["name"] == "BSO Team Data" for f in files) and any(f["name"].startswith("ayesha_") for f in files),
+          "report stored in the master's Drive folder")
+    ok, msg = hub.relay_cycle()
+    check(ok and "1 report" in msg, "master console collects it: " + msg)
+    act = c.get("/activity").get_data(as_text=True)
+    check("l1@acme.com" in act and "interested" in act, "activity visible in the console")
+    check("Online" in c.get("/").get_data(as_text=True), "laptop shows as online")
+    files = json.loads(__import__("urllib.request").request.urlopen(f"http://127.0.0.1:{PORT}/_files").read())
+    check(not any(f["name"].startswith("ayesha_") for f in files), "collected reports are cleared from Drive")
+
+    # --- approval travels down, acknowledgement back up
+    ap = c.get("/approvals").get_data(as_text=True)
+    did = int(re.search(r"/approvals/(\d+)", ap).group(1))
+    c.post(f"/approvals/{did}", data={"_csrf": tok("/approvals"), "action": "approve", "subject": "Hello there", "body": "Edited by manager"})
+    hub.relay_cycle()
+    team.sync(con)
+    o = con.execute("SELECT * FROM outbox WHERE lead_id=2").fetchone()
+    check(o["status"] == "approved" and o["body"] == "Edited by manager" and o["subject"] == "Hello there", "approved, edited draft reaches the laptop")
+    team.sync(con)
+    hub.relay_cycle()
+    check("waiting for their laptop" not in c.get("/approvals").get_data(as_text=True), "console knows it was delivered")
+
+    # --- pause, resume, password reset
+    uid = hub.sqlite3.connect(str(hub.DB_PATH)).execute("SELECT id FROM users WHERE username='ayesha'").fetchone()[0]
+    c.post(f"/users/{uid}", data={"_csrf": tok(f"/users/{uid}"), "action": "disable"})
+    hub.relay_cycle()
+    allowed, why, _ = team.gate(con)
+    check(not allowed and "paused" in why.lower(), "pausing in the console stops sending on the laptop")
+    c.post(f"/users/{uid}", data={"_csrf": tok(f"/users/{uid}"), "action": "enable"})
+    hub.relay_cycle()
+    check(team.gate(con)[0], "resuming lets it send again")
+    c.post(f"/users/{uid}", data={"_csrf": tok(f"/users/{uid}"), "action": "resetpw", "password": "new-ayesha-pass"})
+    hub.relay_cycle()
+    ok, msg = team.sync(con)
+    check(not ok and "disconnected" in msg, "password reset signs the laptop out")
+    try:
+        team.sign_in(con, "ayesha", "ayesha-pass-1")
+        check(False, "old password refused")
+    except ValueError:
+        check(True, "old password refused")
+    team.sign_in(con, "ayesha", "new-ayesha-pass")
+    check(team.sync(con)[0], "new password works")
+
+    # --- relay unreachable: laptop keeps working within the grace period
+    team.built_in_hub = lambda: "http://127.0.0.1:1/exec"
+    team.sign_out()
+    team.sign_in(con, "ayesha", "new-ayesha-pass")
+    check(team.signed_in() and team.SIGNED_IN.get("offline"), "relay unreachable: same person can still sign in on this laptop")
+    print(f"\nAll {n} relay checks passed.")
+finally:
+    node.terminate()

@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
+import relay
 from bot import DATA, SECRETS, env, log_event, now_utc, iso, set_stage
 
 TOKEN_KEY = "BSO_TEAM_TOKEN"
@@ -31,7 +32,7 @@ DISCLOSURE = [
     "Your manager can see the label of each reply (for example “interested”), but not what the reply says.",
     "If your manager requires approval, they can read, edit and approve or reject your drafts before they send.",
     "Your manager can pause your account, set a daily send cap and a weekly target, and see when this laptop last connected.",
-    "Never shared: your passwords, API keys, inbox logins, your lead list, your notes, or the text of replies.",
+    "Never shared: your email passwords, API keys, inbox logins, your lead list, your notes, or the text of replies.",
     "Your data stays on this laptop; your manager keeps the activity log already sent. If you stop working with the team, your admin removes your account.",
 ]
 
@@ -150,6 +151,20 @@ def _private_host(host):
 
 
 def _post(url, path, payload, token=None, timeout=20):
+    if relay.is_relay(url):         # the Google Drive team relay: same requests, carried by Google
+        body = dict(payload, action=path.rsplit("/", 1)[-1])
+        if token:
+            body["token"] = token
+        try:
+            return 200, relay.call(url, body, timeout=max(timeout, 30))
+        except relay.RelayError as e:
+            if e.code == 0:
+                raise urllib.error.URLError(str(e))
+            return e.code, {"error": str(e)}
+    return _post_http(url, path, payload, token, timeout)
+
+
+def _post_http(url, path, payload, token=None, timeout=20):
     req = urllib.request.Request(url + path, data=json.dumps(payload).encode(), method="POST",
                                  headers={"Content-Type": "application/json", "User-Agent": "BSO-team/1"})
     if token:
@@ -204,7 +219,7 @@ def sign_in(con, username, password, consent=False, hub=None):
             status, j = _post(url, "/api/v1/login", {"username": username, "password": password, "device": device})
         except (urllib.error.URLError, OSError, TimeoutError):
             # on the computer that runs the master console itself, use it directly while the public address isn't live
-            if url == LOCAL_HUB or not _local_hub_running():
+            if url == LOCAL_HUB or relay.is_relay(url) or not _local_hub_running():
                 raise
             url = LOCAL_HUB
             status, j = _post(url, "/api/v1/login", {"username": username, "password": password, "device": device})

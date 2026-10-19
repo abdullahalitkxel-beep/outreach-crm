@@ -11,7 +11,22 @@ On first start the console opens on the setup page: enter your team name, name, 
 
 The hub's data (users, activity, drafts awaiting approval) is in `hub.db` inside the hub data folder (`<BSO data folder>\hub` by default). Back it up.
 
-## 2. Make it reachable at https://hub.blacswanken.com
+## 2. Connect your Google Drive (recommended: no server, no domain)
+
+Team laptops sign in and report through a small Google Apps Script that runs under **your** Google account. Their reports are kept in a private **BSO Team Data** folder in your Drive; your console collects them about once a minute whenever it's open. Team members need no Google account and no sharing. Your laptop doesn't have to stay on: reports wait in Drive until your console next opens.
+
+1. In the master console: **Settings → Team connection through your Google Drive → Copy script.** The script is unique to your console; keep it private.
+2. Go to script.google.com (signed in to the account that should hold the data) → **New project**. Delete what's there, paste, **Save**.
+3. **Deploy → New deployment →** gear icon → **Web app**. Execute as: **Me**. Who has access: **Anyone**. **Deploy.**
+4. **Authorize access**, choose your account. Google warns the app isn't verified because it's your own script: **Advanced → Go to … → Allow**.
+5. Copy the **Web app URL** (https://script.google.com/macros/s/…/exec), paste it into the console and click **Save & test**.
+6. That address must be built into the BSO your team installs (or put in `team-defaults.json` next to `BSO.exe`).
+
+To update the script later, use **Deploy → Manage deployments → Edit → Version: New version**, which keeps the same address. A brand-new deployment gets a new address, and team laptops would need it.
+
+Limits: Google's free quotas are comfortably enough for a team of about 20–30 people checking in every couple of minutes.
+
+## Alternative: your own server at https://hub.blacswanken.com
 
 That address is built into BSO, so team members only ever type their ID and password. It has to lead to the computer running the master console. The simplest free way is a Cloudflare Tunnel (no open ports, HTTPS included):
 
