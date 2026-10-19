@@ -164,6 +164,17 @@ def _post(url, path, payload, token=None, timeout=20):
             return e.code, {}
 
 
+LOCAL_HUB = "http://127.0.0.1:8780"
+
+
+def _local_hub_running():
+    try:
+        with socket.create_connection(("127.0.0.1", 8780), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
 def _verifier(username, password, salt=None):
     salt = salt or secrets.token_hex(16)
     h = hashlib.pbkdf2_hmac("sha256", f"{username}\0{password}".encode(), bytes.fromhex(salt), 200_000).hex()
@@ -189,7 +200,14 @@ def sign_in(con, username, password, consent=False, hub=None):
     url = check_hub_url(hub or hub_url())
     device = os.getenv("COMPUTERNAME") or socket.gethostname()
     try:
-        status, j = _post(url, "/api/v1/login", {"username": username, "password": password, "device": device})
+        try:
+            status, j = _post(url, "/api/v1/login", {"username": username, "password": password, "device": device})
+        except (urllib.error.URLError, OSError, TimeoutError):
+            # on the computer that runs the master console itself, use it directly while the public address isn't live
+            if url == LOCAL_HUB or not _local_hub_running():
+                raise
+            url = LOCAL_HUB
+            status, j = _post(url, "/api/v1/login", {"username": username, "password": password, "device": device})
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         # hub unreachable: allow the same person back in on this laptop for a limited time
         grace = int(((s.get("policy") or {}).get("grace_hours", 72)) or 0)

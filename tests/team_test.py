@@ -14,6 +14,9 @@ os.environ["HUB_HOME"] = str(tmp / "hub")
 import hub, bot, team  # noqa: E402
 from werkzeug.serving import make_server  # noqa: E402
 
+BUILT_IN = team.built_in_hub()
+team.built_in_hub = lambda: ""        # most checks below use a hub on this machine instead of the built-in address
+
 n = 0
 def check(cond, what):
     global n
@@ -33,6 +36,7 @@ def csrf(path="/login"):
 
 check(b"omar@blacswanken.com" in c.get("/setup").data, "setup page pre-fills the master email")
 # --- owner setup and login
+check(BUILT_IN == "https://hub.blacswanken.com", "hub.blacswanken.com is built in")
 check(c.get("/").status_code == 302, "console needs sign-in")
 rc = hub.app.test_client()
 REMOTE = {"REMOTE_ADDR": "203.0.113.9"}
@@ -221,6 +225,15 @@ check(b'name="hub"' not in _sp and b'name="username"' in _sp, "built-in hub addr
 r = w0.post("/signin", data={"username": "ayesha", "password": "brand-new-pass-1", "consent": "1"})
 check(r.status_code == 302 and team.hub_url() == "http://127.0.0.1:8791", "sign-in uses the built-in hub")
 w0.post("/signout")
+# public address not live yet, but the master console runs on this computer: sign in to it directly
+team.built_in_hub = lambda: "https://hub.invalid"
+_lh = team.LOCAL_HUB; team.LOCAL_HUB = "http://127.0.0.1:8791"; _lr = team._local_hub_running; team._local_hub_running = lambda: True
+team.leave()
+team.sign_in(con, "ayesha", "brand-new-pass-1", consent=True)
+check(team.signed_in() and team.state()["hub"] == "http://127.0.0.1:8791", "public hub not live: hub computer signs in to its local console")
+check(team.sync(con)[0], "and syncs with it")
+team.LOCAL_HUB, team._local_hub_running = _lh, _lr
+team.sign_out()
 team.built_in_hub = _orig_bi
 (tmp / "laptop" / "team-defaults.json").write_text(json.dumps({"hub": "http://127.0.0.1:8791", "required": True}))
 crm.write_settings({"legal_acceptance": {"version": str(crm.cfg().get("legal", {}).get("version", "1.0"))}})

@@ -11,7 +11,18 @@ On first start the console opens on the setup page: enter your team name, name, 
 
 The hub's data (users, activity, drafts awaiting approval) is in `hub.db` inside the hub data folder (`<BSO data folder>\hub` by default). Back it up.
 
-## 2. Put it behind HTTPS (required for anything beyond your own office network)
+## 2. Make it reachable at https://hub.blacswanken.com
+
+That address is built into BSO, so team members only ever type their ID and password. It has to lead to the computer running the master console. The simplest free way is a Cloudflare Tunnel (no open ports, HTTPS included):
+
+1. Add the blacswanken.com domain to a free Cloudflare account (Cloudflare shows the two name-server addresses to set at your domain registrar).
+2. In Cloudflare: Zero Trust → Networks → Tunnels → Create a tunnel → Cloudflared. Install the connector it shows on the hub computer.
+3. Add a public hostname: subdomain `hub`, domain `blacswanken.com`, service `http://localhost:8780`.
+4. Open https://hub.blacswanken.com: the master console sign-in page should appear.
+
+The hub computer must stay on and awake while the team works. Until the address is live, BSO on the hub computer itself signs in to the local console automatically; other laptops can't sign in yet.
+
+## Other ways to use HTTPS
 
 BSO laptops refuse to join a plain `http://` hub unless it is on a private network address. Choose one:
 

@@ -41,6 +41,7 @@ ROLES = ("owner", "manager", "member")
 EVENT_TYPES = ("sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "settings", "app_start", "paused")
 ONLINE_MINUTES = 10
 GRACE_HOURS = 72
+DEFAULT_PUBLIC_URL = "https://hub.blacswanken.com"   # the address built into BSO (hub_address.txt)
 _lock = threading.Lock()
 
 
@@ -426,7 +427,7 @@ def forgot():
                 db().execute("INSERT INTO reset_tokens(user_id, token_hash, expires_at) VALUES (?,?,?)",
                              (u["id"], sha(token), iso(now() + timedelta(minutes=RESET_MINUTES))))
                 db().commit()
-                base = (meta_get("public_url") or request.host_url).rstrip("/")
+                base = (meta_get("public_url", DEFAULT_PUBLIC_URL) or request.host_url).rstrip("/")
                 try:
                     send_mail(u["email"], "Reset your BSO master password",
                               f"Hello {u['name']},\n\nSomeone asked to reset the password for your BSO master console account.\n"
@@ -535,7 +536,7 @@ def clean_username(v):
 
 def creds_note(name, username, password):
     return {"name": name, "username": username, "password": password,
-            "url": (meta_get("public_url") or request.host_url).rstrip("/")}
+            "url": (meta_get("public_url", DEFAULT_PUBLIC_URL) or request.host_url).rstrip("/")}
 
 
 @app.post("/users/new")
@@ -658,7 +659,7 @@ def activity():
 @need("owner")
 def team_defaults_file():
     """Drop this file next to BSO.exe to make that install sign-in-only and point it at this hub."""
-    url = (meta_get("public_url") or request.host_url).rstrip("/")
+    url = (meta_get("public_url", DEFAULT_PUBLIC_URL) or request.host_url).rstrip("/")
     resp = app.response_class(json.dumps({"hub": url, "required": True}, indent=1), mimetype="application/json")
     resp.headers["Content-Disposition"] = "attachment; filename=team-defaults.json"
     return resp
@@ -719,7 +720,7 @@ def hub_settings():
                 db().commit()
                 audit("password_changed")
                 msg = "Password changed."
-    return render("settings.html", msg=msg, smtp=smtp_conf(), public_url=meta_get("public_url", ""), grace=meta_get("grace_hours", str(GRACE_HOURS)), tab="settings")
+    return render("settings.html", msg=msg, smtp=smtp_conf(), public_url=meta_get("public_url", DEFAULT_PUBLIC_URL), grace=meta_get("grace_hours", str(GRACE_HOURS)), tab="settings")
 
 
 # ---------------------------------------------------------------------------------------------- API used by team laptops
