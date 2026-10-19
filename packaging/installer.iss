@@ -44,6 +44,13 @@ Source: "..\dist\BSO\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 Name: "{autoprograms}\BSO"; Filename: "{app}\BSO.exe"
 Name: "{autodesktop}\BSO"; Filename: "{app}\BSO.exe"; Tasks: desktopicon
 
+[InstallDelete]
+; upgrading from the "Outreach CRM" builds: remove the old program file and shortcuts so only BSO remains
+Type: files; Name: "{app}\OutreachCRM.exe"
+Type: files; Name: "{autoprograms}\Outreach CRM.lnk"
+Type: files; Name: "{autodesktop}\Outreach CRM.lnk"
+Type: filesandordirs; Name: "{autoprograms}\Outreach CRM"
+
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
 
@@ -55,3 +62,12 @@ Filename: "{cmd}"; Parameters: "/C taskkill /IM BSO.exe /F"; Flags: runhidden; R
 
 [Messages]
 FinishedLabel=BSO – BlacSwanken Outreach is installed. Your data is kept in %APPDATA%\OutreachCRM and is not removed when you uninstall.
+
+[Code]
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  rc: Integer;
+begin
+  if CurStep = ssInstall then
+    Exec(ExpandConstant('{cmd}'), '/C taskkill /IM OutreachCRM.exe /F', '', SW_HIDE, ewWaitUntilTerminated, rc);
+end;

@@ -111,6 +111,25 @@ jobs:
           Start-Process "$env:LOCALAPPDATA\Programs\BSO\unins000.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES" -Wait
           if (Test-Path $exe) { throw "uninstall left the app behind" }
 
+      - name: Test upgrading from the old "Outreach CRM" build (old program and shortcuts must go)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v1.0.5 --repo ${{ github.repository }} --pattern OutreachCRM-Setup.exe --dir build --clobber
+          Start-Process build\OutreachCRM-Setup.exe -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /TASKS=desktopicon" -Wait
+          $old = "$env:LOCALAPPDATA\Programs\Outreach CRM"
+          if (-not (Test-Path "$old\OutreachCRM.exe")) { throw "old build did not install (test setup)" }
+          Start-Process dist\BSO-Setup.exe -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /TASKS=desktopicon" -Wait
+          $sm = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs"
+          $left = @("$old\OutreachCRM.exe", "$sm\Outreach CRM.lnk", "$env:USERPROFILE\Desktop\Outreach CRM.lnk") | Where-Object { Test-Path $_ }
+          if ($left) { throw "old files remain after upgrading: $left" }
+          $dir = (Get-ChildItem "$env:LOCALAPPDATA\Programs" -Directory | Where-Object { Test-Path "$($_.FullName)\BSO.exe" } | Select-Object -First 1)
+          if (-not $dir) { throw "BSO.exe not found after upgrade" }
+          if (-not (Test-Path "$sm\BSO.lnk")) { throw "BSO Start menu shortcut missing after upgrade" }
+          Write-Host "::notice title=Upgrade::old build replaced by BSO in $($dir.FullName)"
+          Start-Process "$($dir.FullName)\unins000.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES" -Wait
+
       - name: Build Microsoft Store package (BSO-Store.msix)
         shell: pwsh
         run: packaging\msix.ps1 -Mode pack
