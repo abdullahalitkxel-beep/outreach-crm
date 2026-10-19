@@ -330,7 +330,7 @@ def setup():
             g.me = dict(db().execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone())
             audit("owner_created", f["email"])
             return redirect(url_for("dashboard"))
-    return render("setup.html", err=err)
+    return render("setup.html", err=err, owner_email=meta_get("owner_email", "omar@blacswanken.com"))
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -844,7 +844,7 @@ T["setup.html"] = """{% extends 'base.html' %}{% block title %}Set up{% endblock
 <form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}">
 <label>Setup key (shown in the window where the hub was started, and saved in <code>setup-key.txt</code> in the hub's data folder)</label><input name="setup_key" autocomplete="off" required>
 <label>Team or company name</label><input name="org" placeholder="e.g. NeoSOFT outreach team">
-<label>Your name</label><input name="name" required><label>Your email (your sign-in)</label><input name="email" type="email" required>
+<label>Your name</label><input name="name" required><label>Your email (your sign-in, and where password-reset links go)</label><input name="email" type="email" required value="{{ owner_email }}">
 <label>Password (at least 10 characters)</label><input name="password" type="password" autocomplete="new-password" required>
 <label>Password again</label><input name="password2" type="password" autocomplete="new-password" required>
 <p><button class="btn brand">Create the owner account</button></p></form></div></div>{% endblock %}"""
@@ -976,9 +976,12 @@ def main(argv=None):
     ap.add_argument("--host", default="127.0.0.1", help="use 0.0.0.0 to let other computers connect")
     ap.add_argument("--port", type=int, default=8780)
     ap.add_argument("--data", help="folder for the hub database (default: the BSO data folder)")
+    ap.add_argument("--owner-email", help="pre-fill the master sign-in email on the setup page (default omar@blacswanken.com)")
     ap.add_argument("--reset-owner-password", action="store_true", help="locked out and email isn't set up? Set a new owner password from this computer")
     a = ap.parse_args(argv)
     d, key = prepare(a.data)
+    if a.owner_email:
+        _c = sqlite3.connect(str(DB_PATH)); _c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('owner_email',?)", (a.owner_email.strip().lower(),)); _c.commit(); _c.close()
     if a.reset_owner_password:
         import getpass
         con = sqlite3.connect(str(DB_PATH))

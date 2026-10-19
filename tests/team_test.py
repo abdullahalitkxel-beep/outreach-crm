@@ -31,6 +31,7 @@ def csrf(path="/login"):
     html = c.get(path).get_data(as_text=True)
     return re.search(r'name="_csrf" value="([^"]+)"', html).group(1)
 
+check(b"omar@blacswanken.com" in c.get("/setup").data, "setup page pre-fills the master email")
 # --- owner setup and login
 check(c.get("/").status_code == 302, "console needs sign-in")
 r = c.post("/setup", data={"_csrf": csrf("/setup"), "setup_key": "wrong", "name": "Omar", "email": "o@x.com", "password": "correct-horse-9", "password2": "correct-horse-9"})
