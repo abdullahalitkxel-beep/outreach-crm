@@ -573,9 +573,10 @@ REPORTS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block t
 
 REVIEW = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}Review queue{% endblock %}{% block body %}
 {% call m.header('t-rev', '✉', 'Review', drafts|length ~ ' draft(s) waiting · ' ~ approved ~ ' approved') %}
- {% if drafts %}<form method="post" action="{{ url_for('approve_all') }}" onsubmit="return confirm('Approve all {{ drafts|length }} drafts as they are?')"><button class="btn">Approve all</button></form>{% endif %}
+ {% if drafts and not held %}<form method="post" action="{{ url_for('approve_all') }}" onsubmit="return confirm('Approve all {{ drafts|length }} drafts as they are?')"><button class="btn">Approve all</button></form>{% endif %}
  {% if approved %}<form method="post" action="{{ url_for('job_start') }}"><input type="hidden" name="cmd" value="run"><button class="btn brand">▶ Send approved now</button></form>{% endif %}
 {% endcall %}
+{% if held %}<div class="help" style="margin-bottom:12px"><b>Your manager approves your emails.</b> Drafts are sent to your manager automatically (at the next check-in, within a couple of minutes). Once approved they send on the next bot run. You can still read them here.</div>{% endif %}
 {% call m.help('review', 'Nothing is sent until you approve it') %}
 <ol><li>Read the draft. The first line is written by AI from the lead's website and profile.</li>
 <li>Edit anything you like, or click <b>New AI opener</b> for a different first line.</li>
@@ -592,8 +593,8 @@ REVIEW = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block ti
   <label>Subject</label><input name="subject" value="{{ d.subject }}" {{ 'readonly title="Follow-ups keep the same subject so they thread"' if d.step > 0 }}>
   <label>Body</label><textarea name="body" style="min-height:230px;font-family:ui-monospace,Menlo,Consolas,monospace">{{ d.body }}</textarea>
   <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
-   <button class="btn brand" name="action" value="approve">✓ Approve</button>
-   <button class="btn" name="action" value="save">Save edits</button>
+   {% if held %}<span class="badge b-info">Awaiting your manager</span>{% else %}<button class="btn brand" name="action" value="approve">✓ Approve</button>
+   <button class="btn" name="action" value="save">Save edits</button>{% endif %}
    {% if d.step == 0 %}<button class="btn" name="action" value="regenerate" {{ 'disabled title="Add ANTHROPIC_API_KEY to .env to use AI openers"' if not ai_on }}>↻ New AI opener</button>{% endif %}
    <span style="flex:1"></span>
    <button class="btn danger" name="action" value="reject" onclick="return confirm('Reject this lead? No emails will be sent to them.')">Reject lead</button>
@@ -670,7 +671,7 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
 {% call m.header('t-setup', '⚙', 'Settings', 'Set up your outreach') %}<a class="btn" href="{{ url_for('setup') }}">Getting Started checklist</a>{% endcall %}
 {% if result %}<div class="toast {{ '' if ok else 'err' }}">{{ result }}</div>{% endif %}
 <div class="settings">
-<nav class="snav">{% for k, lbl, n in [('inbox','Email inboxes','1'),('safety','Safety & automation','2'),('keys','AI & Apollo keys','3'),('emails','Your offer & emails','4'),('targeting','Lead targeting','5'),('schedule','Sending schedule','6')] %}
+<nav class="snav">{% for k, lbl, n in [('inbox','Email inboxes','1'),('safety','Safety & automation','2'),('keys','AI & Apollo keys','3'),('emails','Your offer & emails','4'),('targeting','Lead targeting','5'),('schedule','Sending schedule','6'),('team','Team','7')] %}
  <a href="{{ url_for('settings', tab=k) }}" class="{{ 'on' if tab == k }}"><span class="sn">{{ n }}</span>{{ lbl }}</a>{% endfor %}</nav>
 <div class="spanel">
 
@@ -782,6 +783,29 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  {% set gap = c.delay_between_sends_seconds or [60, 180] %}
  <div class="grid2"><div><label>Gap between emails, at least (seconds)</label><input name="gap_min" type="number" min="0" value="{{ gap[0] }}"></div><div><label>at most (seconds)</label><input name="gap_max" type="number" min="0" value="{{ gap[1] }}"></div></div>
  <button class="btn brand" style="margin-top:12px">Save schedule</button></form></div></div>
+
+{% elif tab == 'team' %}
+{% if team.joined %}
+<div class="card"><div class="card-h"><h2>You're on a team</h2></div><div class="card-b">
+ <p style="margin-top:0"><b>{{ team.policy.org or 'Your team' }}</b> · signed in as {{ team.policy.name }} ({{ team.policy.role }})<br>
+ <span class="muted">Hub: {{ team.hub }} · last connected {{ team.last_ok or 'never' }}</span></p>
+ {% if team.revoked %}<div class="help" style="border-color:#c23934">Your manager disconnected this laptop. Ask for a new invite and join again.</div>{% endif %}
+ <table class="tbl"><tr><td>Account</td><td>{{ 'Active' if team.policy.enabled else 'Paused by your manager' }}</td></tr>
+ <tr><td>Daily send cap</td><td>{{ team.policy.daily_cap or 'No cap set' }}</td></tr>
+ <tr><td>Weekly target</td><td>{{ team.policy.weekly_target or 'None set' }}</td></tr>
+ <tr><td>Who approves your emails</td><td>{{ 'Your manager' if team.policy.approval == 'master' else 'You' }}</td></tr></table>
+ <h3 style="margin-bottom:4px">What your manager can see</h3><ul>{% for line in team.disclosure %}<li>{{ line }}</li>{% endfor %}</ul>
+ <div style="display:flex;gap:6px;flex-wrap:wrap"><form method="post" action="{{ url_for('team_sync') }}"><button class="btn">Check in now</button></form>
+ <form method="post" action="{{ url_for('team_leave') }}" onsubmit="return confirm('Leave this team? Your manager stops seeing new activity and BSO goes back to your own settings.')"><button class="btn danger">Leave the team</button></form></div>
+</div></div>
+{% else %}
+<div class="card"><div class="card-h"><h2>Join a team</h2></div><div class="card-b">
+ <p class="muted" style="margin-top:0">Only if your manager asked you to. Paste the invite they sent you. You'll see exactly what they can see before you agree.</p>
+ <form method="post" action="{{ url_for('team_join') }}"><label>Invite</label><input name="invite" placeholder="BSO1.…" autocomplete="off" required>
+ <h3 style="margin-bottom:4px">What your manager will be able to see</h3><ul>{% for line in team.disclosure %}<li>{{ line }}</li>{% endfor %}</ul>
+ <label class="check"><input type="checkbox" name="consent" value="1"> I've read this and I agree to share it with my manager.</label>
+ <button class="btn brand" style="margin-top:12px">Join team</button></form></div></div>
+{% endif %}
 {% endif %}
 </div></div>
 {% endblock %}{% block scripts %}<script>

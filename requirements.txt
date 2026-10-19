@@ -8,3 +8,4 @@ openpyxl
 tzdata
 pystray
 pillow
+waitress

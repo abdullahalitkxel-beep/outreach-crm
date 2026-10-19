@@ -19,6 +19,7 @@ from pathlib import Path
 from flask import Flask, Response, abort, g, jsonify, redirect, request, url_for
 from jinja2 import DictLoader
 import brand
+import team
 from bot import find_avoid, template_avoid_hits
 
 from bot import (DATA, HUMAN_STAGES, env, LEAD_OPEN_STAGES, OPP_OPEN_STAGES, OPP_STAGES, ROOT, STAGES, settings_path,
@@ -726,7 +727,7 @@ def review():
         r["name"] = " ".join(p for p in (r["first_name"], r["x"].get("last_name")) if p) or r["email"]
         r["avoid"] = find_avoid(cfg(), r["subject"], r["body"])
         data.append(r)
-    return render("review.html", drafts=data, approved=one("SELECT COUNT(*) FROM outbox WHERE status='approved'"),
+    return render("review.html", held=team.holds_approval(), drafts=data, approved=one("SELECT COUNT(*) FROM outbox WHERE status='approved'"),
                   ai_on=bool(env("ANTHROPIC_API_KEY")), lead_count=one("SELECT COUNT(*) FROM leads"))
 
 
@@ -737,6 +738,8 @@ def review_action(draft_id):
     if not d:
         return redirect(url_for("review", msg="That draft was already handled."))
     action = request.form.get("action")
+    if team.holds_approval() and action in ("save", "approve"):
+        return redirect(url_for("review", msg="Your manager approves your emails, so this draft is waiting for them."))
     subject = request.form.get("subject", d["subject"]).strip() or d["subject"]
     body = request.form.get("body", d["body"]).replace("\r\n", "\n").strip()
     if d["step"] > 0:
@@ -768,6 +771,8 @@ def review_action(draft_id):
 
 @app.post("/review/approve-all")
 def approve_all():
+    if team.holds_approval():
+        return redirect(url_for("review", msg="Your manager approves your emails."))
     con = db()
     ids = [r["id"] for r in rows("SELECT id, lead_id, step FROM outbox WHERE status='pending'")]
     for r in rows("SELECT lead_id, step FROM outbox WHERE status='pending'"):
@@ -1131,7 +1136,44 @@ def settings():
                   keys={"ANTHROPIC_API_KEY": mask(env("ANTHROPIC_API_KEY")), "APOLLO_API_KEY": mask(env("APOLLO_API_KEY")),
                         "SLACK_WEBHOOK_URL": mask(env("SLACK_WEBHOOK_URL"))},
                   tab=request.args.get("tab", "inbox"), result=request.args.get("result"),
-                  ok=request.args.get("ok"), avoid_hits=template_avoid_hits(c), avoid_n=len(c.get("avoid_phrases") or []))
+                  ok=request.args.get("ok"), avoid_hits=template_avoid_hits(c), avoid_n=len(c.get("avoid_phrases") or []),
+                  team=dict(team.state(), joined=team.joined(), policy=team.policy(), disclosure=team.DISCLOSURE))
+
+
+@app.post("/settings/team/join")
+def team_join():
+    try:
+        pol, url = team.join(request.form.get("invite", ""), request.form.get("consent") == "1")
+    except ValueError as e:
+        return redirect(url_for("settings", tab="team", result=str(e)))
+    team.finish_join(db(), url, pol)
+    return redirect(url_for("settings", tab="team", result="You're on the team.", ok=1))
+
+
+@app.post("/settings/team/leave")
+def team_leave():
+    team.leave()
+    return redirect(url_for("settings", tab="team", result="You left the team.", ok=1))
+
+
+@app.post("/settings/team/sync")
+def team_sync():
+    ok, msg = team.sync(db())
+    return redirect(url_for("settings", tab="team", result=msg, ok=1 if ok else None))
+
+
+def _team_loop():
+    """While the app is open and on a team, check in with the hub every couple of minutes."""
+    import time as _t
+    while True:
+        _t.sleep(120)
+        try:
+            if team.joined():
+                con = db_connect(load_config(CONFIG_PATH).get("database", "outreach.db"))
+                team.sync(con)
+                con.close()
+        except Exception as e:
+            print("team sync:", e)
 
 
 def _inbox_from_form(f, n):

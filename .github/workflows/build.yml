@@ -46,6 +46,9 @@ jobs:
       - name: Prepare version info, licence text, Store manifest, third-party notices
         run: python packaging/prepare.py ${{ github.run_number }}
 
+      - name: Test team mode (hub and laptop)
+        run: python tests/team_test.py
+
       - name: Test from source
         run: python tests/smoke_test.py app.py
 
@@ -63,6 +66,9 @@ jobs:
           --hidden-import apollo
           --hidden-import legal
           --hidden-import brand
+          --hidden-import hub
+          --hidden-import team
+          --hidden-import waitress
           --hidden-import secretstore
           --hidden-import bs4
           --hidden-import openpyxl

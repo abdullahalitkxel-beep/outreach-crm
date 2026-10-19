@@ -581,6 +581,14 @@ def cmd_run(cfg, con, args):
     if str((cfg.get("legal_acceptance") or {}).get("version")) != lg_ver and not args.dry_run:
         print("PROBLEM: Open BSO and accept the Terms of Use first.")
         sys.exit(1)
+    team_cap = 0
+    team_mod = None
+    if not args.dry_run:
+        import team as team_mod
+        ok, why, team_cap = team_mod.gate(con)
+        if not ok:
+            print("PROBLEM:", why)
+            sys.exit(1)
     if not args.force and not in_send_window(cfg):
         print("Outside the sending window; nothing sent (use --force to override).")
         return
@@ -594,7 +602,13 @@ def cmd_run(cfg, con, args):
         return
     capacity = {s["email"]: s["daily_limit"] - sent_today(con, s["email"], cfg) for s in senders}
 
-    review = (cfg.get("review") or {}).get("enabled", False) and not args.dry_run
+    review = ((cfg.get("review") or {}).get("enabled", False) or (team_mod and team_mod.holds_approval())) and not args.dry_run
+    cap_left = None
+    if team_cap:
+        cap_left = max(0, team_cap - team_mod.sent_today_total(con))
+        if cap_left == 0:
+            print(f"Your manager's daily cap ({team_cap}) is reached; nothing more is sent today.")
+            return
     tm = cfg.get("test_mode") or {}
     redirect = tm.get("redirect_to") if tm.get("enabled") else None
     if tm.get("enabled") and not redirect:
@@ -604,6 +618,8 @@ def cmd_run(cfg, con, args):
     # never queue more drafts than the inboxes can send today
     queued = con.execute("SELECT COUNT(*) FROM outbox WHERE status IN ('pending','approved')").fetchone()[0]
     draft_budget = max(0, sum(max(c, 0) for c in capacity.values()) - queued)
+    if cap_left is not None:
+        draft_budget = min(draft_budget, max(0, cap_left - queued))
 
     due = con.execute(
         "SELECT * FROM leads WHERE status='active' AND next_send_at<=? "
@@ -669,6 +685,8 @@ def cmd_run(cfg, con, args):
         if redirect:  # test mode: real lead data, but it lands in your own inbox
             to, shown_subject = redirect, f"[TEST for {lead['email']}] {subject}"
 
+        if cap_left is not None and sent >= cap_left:
+            break
         if sent > 0 and not args.dry_run:
             time.sleep(random.uniform(lo, hi))  # human-ish pacing
         try:
@@ -716,6 +734,11 @@ def cmd_run(cfg, con, args):
         log.info("Sent step %d to %s via %s", idx + 1, to, sender["email"])
 
     con.commit()
+    if team_mod:
+        try:
+            team_mod.sync(con)
+        except Exception as e:  # reporting must never break sending
+            log.warning("Team sync failed: %s", e)
     msg = f"{'Previewed' if args.dry_run else 'Sent'} {sent} email(s)."
     if review:
         msg += f" Drafted {drafted} new for review; {waiting} waiting for your approval in the CRM."

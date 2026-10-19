@@ -19,8 +19,8 @@ legal:
   company_name: ""     # exact registered name, e.g. "BlacSwanken (Private) Limited"
   address: ""          # registered business address
   contact_email: "omar@blacswanken.com"    # legal & privacy contact
-  version: "1.0"
-  effective_date: "2026-10-15"
+  version: "1.1"
+  effective_date: "2026-10-19"
 currency: "$"
 sender_address: "NeoSOFT, 8 The Green, #13906, Dover, DE 19901, USA"
 

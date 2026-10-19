@@ -72,7 +72,7 @@ try:
 
     for page in ["/", "/leads", "/review", "/accounts", "/opportunities", "/tasks", "/reports", "/jobs",
                  "/settings?tab=inbox", "/settings?tab=safety", "/settings?tab=keys", "/settings?tab=emails",
-                 "/settings?tab=targeting", "/settings?tab=schedule", "/import", "/new"]:
+                 "/settings?tab=targeting", "/settings?tab=schedule", "/settings?tab=team", "/import", "/new"]:
         check(requests.get(base + page, timeout=10).status_code == 200, f"page {page}")
 
     s = requests.Session()

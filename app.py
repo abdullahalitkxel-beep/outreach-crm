@@ -113,6 +113,13 @@ def main():
         bot.main(sys.argv[2:])
         return
 
+    if len(sys.argv) > 1 and sys.argv[1] == "--hub":
+        import bot
+        _ensure_stdio(bot.DATA / "hub.log")
+        import hub
+        hub.main(sys.argv[2:])
+        return
+
     import bot  # sets up the data folder (%APPDATA%\OutreachCRM) on first run
     _ensure_stdio(bot.DATA / "app.log")
 
@@ -123,6 +130,7 @@ def main():
     import crm
     tray_ref = {}
     threading.Thread(target=crm._autorun_loop, daemon=True).start()
+    threading.Thread(target=crm._team_loop, daemon=True).start()
     threading.Thread(target=watchdog, args=(crm, tray_ref), daemon=True).start()
     server = threading.Thread(target=lambda: crm.app.run(host="127.0.0.1", port=PORT, threaded=True, use_reloader=False),
                               daemon=True)
