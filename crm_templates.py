@@ -202,9 +202,13 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
 <div id="tour-dim"><div id="tour-spot"></div><div id="tour-pop"><h3></h3><p></p><div class="ft"><span></span>
 <button class="btn sm" id="tour-skip">Skip</button><button class="btn sm" id="tour-back">Back</button><button class="btn brand sm" id="tour-next">Next</button></div></div></div>
 <script>
-// ---- tell the app this window is open (it quits ~45s after the last window closes, unless auto-run is on)
+// ---- tell the app this window is open; it quits about a minute after the last window is closed (unless auto-run is on)
 function beat(){ try{ fetch('/heartbeat',{method:'POST',keepalive:true}); }catch(e){} }
 beat(); setInterval(beat, 10000);
+document.addEventListener('visibilitychange', function(){ if(!document.hidden) beat(); });
+window.addEventListener('focus', beat);
+window.addEventListener('pageshow', beat);
+window.addEventListener('pagehide', function(){ try{ navigator.sendBeacon('/bye'); }catch(e){} });
 // ---- dismissible help boxes
 function ls(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v)}catch(e){return null}}
 document.querySelectorAll('.help[data-id]').forEach(function(h){

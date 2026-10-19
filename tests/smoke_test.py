@@ -57,6 +57,7 @@ try:
     ic = requests.get(base + "/favicon.ico", timeout=10)
     check(ic.status_code == 200 and ic.content[:4] == b"\x00\x00\x01\x00" and 'rel="icon"' in requests.get(base + "/welcome", timeout=10).text,
           "window/taskbar icon is served (favicon.ico + link tag)")
+    check(requests.post(base + "/bye", timeout=10).status_code == 204, "window close signal (/bye) accepted")
     check(requests.get(base + "/manifest.webmanifest", timeout=10).json().get("short_name") == "BSO", "web manifest names the app BSO")
     tp = requests.get(base + "/legal/third-party", timeout=10).text
     check("flask" in tp.lower() and "Python Software Foundation" in tp, "third-party notices list bundled components")

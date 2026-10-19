@@ -49,6 +49,9 @@ jobs:
       - name: Test team mode (hub and laptop)
         run: python tests/team_test.py
 
+      - name: Test the app doesn't quit while its window is hidden or asleep
+        run: python tests/watchdog_test.py
+
       - name: Test from source
         run: python tests/smoke_test.py app.py
 

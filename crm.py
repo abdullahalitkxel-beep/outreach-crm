@@ -84,6 +84,7 @@ def require_password():
 
 
 LAST_SEEN = None  # last time an app window pinged /heartbeat
+LAST_BYE = None   # last time a window said it was closing (/bye)
 
 
 @app.post("/heartbeat")
@@ -91,6 +92,15 @@ def heartbeat():
     global LAST_SEEN
     import time as _t
     LAST_SEEN = _t.time()
+    return ("", 204)
+
+
+@app.post("/bye")
+def bye():
+    """Sent by a window as it closes or moves to another page; the next page pings straight away."""
+    global LAST_BYE
+    import time as _t
+    LAST_BYE = _t.time()
     return ("", 204)
 
 
@@ -102,7 +112,7 @@ def job_running():
         con.close()
 
 
-OPEN_ENDPOINTS = {"signin", "welcome", "accept_terms", "legal_doc", "about", "heartbeat", "quit_app", "static", "app_icon", "favicon", "web_manifest"}
+OPEN_ENDPOINTS = {"signin", "welcome", "accept_terms", "legal_doc", "about", "heartbeat", "bye", "quit_app", "static", "app_icon", "favicon", "web_manifest"}
 
 
 @app.route("/favicon.ico")

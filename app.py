@@ -65,19 +65,36 @@ def shutdown():
     os._exit(0)
 
 
+CLOSE_GRACE = 75          # seconds after a window says goodbye before quitting (a hidden window still pings at least once a minute)
+FIRST_WINDOW = 180        # how long the first window gets to appear
+STALE = 6 * 3600          # no sign of any window for this long (browser crashed): quit anyway
+
+
+def should_quit(now, started, last_seen, last_bye, keep=False, busy=False):
+    """Decide whether the app should quit because its window is gone.
+
+    Windows ping /heartbeat every 10 s while open, but Edge/Chrome slow that to about once a minute
+    (or stop it) when the window is minimised, hidden or the laptop sleeps. So silence alone is not a
+    reason to quit; a window that is really closed says goodbye (/bye) as it goes."""
+    if keep or busy:
+        return False
+    if last_seen is None:
+        return now - started > FIRST_WINDOW and last_bye is None
+    if last_bye and last_bye >= last_seen and now - last_bye > CLOSE_GRACE:
+        return True
+    return now - last_seen > STALE
+
+
 def watchdog(crm, tray_ref):
-    """Quit when the window has been closed, unless automatic runs are switched on.
-    The page pings /heartbeat every 10 seconds while it's open."""
+    """Quit after the last window is closed, unless automatic runs are switched on."""
     started = time.time()
     while True:
         time.sleep(5)
         try:
             c = crm.cfg()
             keep = bool((c.get("autorun") or {}).get("enabled"))
-            idle = time.time() - (crm.LAST_SEEN or started)
-            busy = crm.job_running()
-            limit = 45 if crm.LAST_SEEN else 180  # first window gets longer to appear
-            if not keep and not busy and idle > limit and not os.getenv("OUTREACH_NO_WINDOW"):
+            if should_quit(time.time(), started, crm.LAST_SEEN, crm.LAST_BYE, keep, crm.job_running()) \
+                    and not os.getenv("OUTREACH_NO_WINDOW"):
                 if tray_ref.get("icon"):
                     tray_ref["icon"].stop()
                 shutdown()
