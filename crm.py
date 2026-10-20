@@ -1108,7 +1108,7 @@ def set_startup(on):
     if not startup_supported():
         return False
     import winreg
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:   # opens it, or creates it if missing
         if on:
             winreg.SetValueEx(k, "BSO", 0, winreg.REG_SZ, f'"{sys.executable}" --background')
         else:
