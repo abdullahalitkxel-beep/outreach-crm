@@ -21,15 +21,16 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import relay
-from bot import DATA, SECRETS, env, log_event, now_utc, iso, set_stage
+from bot import add_task, DATA, SECRETS, env, log_event, now_utc, iso, set_stage
 
 TOKEN_KEY = "BSO_TEAM_TOKEN"
 STATE = Path(DATA) / "team.json"
 CONSENT_VERSION = "1"
-SHARED_TYPES = {"sent", "reply", "drafted", "approved", "rejected", "bounce", "error"}
+SHARED_TYPES = {"sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "handover", "prospect_stage"}
+PROSPECT_STAGES = ["new", "contacted", "meeting", "proposal", "won", "lost"]
 DISCLOSURE = [
     "Your manager can see how many emails you send, which leads they go to (email address and company), which step, and from which of your inboxes.",
-    "Your manager can see the label of each reply (for example “interested”), but not what the reply says.",
+    "Your manager can see the label of each reply (for example “interested”). When a prospect replies with interest, a meeting request or a question, they are handed to a lead gen supervisor, who receives the prospect’s details, their reply and the emails you sent them.",
     "If your manager requires approval, they can read, edit and approve or reject your drafts before they send.",
     "Your manager can pause your account, set a daily send cap and a weekly target, and see when this laptop last connected.",
     "Never shared: your email passwords, API keys, inbox logins, your lead list, your notes, or the text of replies.",
@@ -293,7 +294,7 @@ def _collect_events(con, after):
         if e["type"] == "error":
             detail = "send failed"          # raw error text can contain server details; keep it generic
         elif e["type"] == "reply":
-            detail = detail if detail in ("interested", "not_interested", "unsubscribe", "out_of_office", "referral", "other") else "other"
+            detail = detail if detail in ("interested", "meeting_request", "question", "not_interested", "unsubscribe", "out_of_office", "referral", "other") else "other"
         out.append({"id": e["id"], "type": e["type"], "detail": detail, "sender": e["sender"], "at": _z(e["at"]),
                     "lead_email": e["email"], "company": e["company"], "step": _step(e["detail"]), "variant": e["variant"]})
     return out
@@ -308,13 +309,74 @@ def _collect_drafts(con, sent_ids):
              "subject": r["subject"], "body": r["body"]} for r in con.execute(q) if r["id"] not in sent_ids]
 
 
+def supervisors():
+    """Lead gen supervisors published by the master console: [{id, name, email, count}]."""
+    return [sv for sv in (state().get("supervisors") or []) if sv.get("email")]
+
+
+def _receive_handover(con, d):
+    """A prospect handed to me (I'm a supervisor): add it to My prospects."""
+    L = d.get("lead") or {}
+    email = str(L.get("email") or "").strip().lower()
+    if not email:
+        return
+    at = iso(now_utc())
+    who_from = d.get("from") or d.get("from_name") or "a colleague"
+    extra = {k: L.get(k) for k in ("last_name", "title", "linkedin", "city", "country") if L.get(k)}
+    extra["handover_label"] = d.get("label", "")
+    row = con.execute("SELECT id, extra FROM leads WHERE email=?", (email,)).fetchone()
+    if row:
+        lid = row["id"]
+        merged = dict(json.loads(row["extra"] or "{}"), **extra)
+        con.execute("UPDATE leads SET handed_from=?, prospect_stage=COALESCE(prospect_stage,'new'), status='replied', extra=? WHERE id=?",
+                    (who_from, json.dumps(merged), lid))
+    else:
+        con.execute("INSERT INTO leads(email, first_name, company, website, extra, status, step, created_at, stage, handed_from, prospect_stage) "
+                    "VALUES (?,?,?,?,?,'replied',0,?,'qualified',?,'new')",
+                    (email, L.get("first_name") or "", L.get("company") or "", L.get("website") or "", json.dumps(extra), at, who_from))
+        lid = con.execute("SELECT id FROM leads WHERE email=?", (email,)).fetchone()["id"]
+    text = [f"Handed over by {who_from} ({str(d.get('label', '')).replace('_', ' ')} reply) on {str(d.get('at', at))[:16].replace('T', ' ')}.",
+            "", "--- Their reply ---", d.get("reply") or "(not available)"]
+    if d.get("intro"):
+        text += ["", "--- Introduction sent (you were in CC) ---", d["intro"]]
+    for i, t in enumerate(d.get("thread") or [], 1):
+        text += ["", f"--- Our email {i} ({str(t.get('at', ''))[:10]}): {t.get('subject', '')} ---", t.get("body", "")]
+    con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'email')", (lid, "\n".join(text), at))
+    name = " ".join(p for p in (L.get("first_name"), L.get("last_name")) if p) or email
+    add_task(con, f"Contact {name}{' at ' + L['company'] if L.get('company') else ''}: handed over by {who_from}",
+             due_date=at[:10], lead_id=lid)
+    log_event(con, lid, "handover_in", who_from)
+
+
 def _apply_decisions(con, decisions):
-    done = []
+    """Apply what the master console sent. Returns (draft ids done, handover ids received)."""
+    done, ho_done = [], []
     for d in decisions:
+        action = d.get("action")
+        if action == "config":
+            s = state()
+            s["supervisors"] = d.get("supervisors") or []
+            s["sup_as_of"] = d.get("as_of", "")
+            save_state(s)
+            continue
+        if action == "handover":
+            s = state()
+            seen = s.get("ho_seen", [])
+            if d.get("handover_id") not in seen:      # the same handover can arrive again until the console sees our receipt
+                try:
+                    _receive_handover(con, d)
+                except Exception as e:     # one bad item must not block the rest
+                    print("handover:", e)
+                s["ho_seen"] = (seen + [d.get("handover_id")])[-1000:]
+                save_state(s)
+            ho_done.append(d.get("handover_id"))
+            continue
+        if d.get("local_id") is None:
+            continue
         o = con.execute("SELECT * FROM outbox WHERE id=?", (d["local_id"],)).fetchone()
         if o and o["status"] == "pending":
             when = iso(now_utc())
-            if d["action"] == "approve":
+            if action == "approve":
                 subject = d["subject"] if o["step"] == 0 and d.get("subject") else o["subject"]
                 con.execute("UPDATE outbox SET status='approved', subject=?, body=?, decided_at=? WHERE id=?",
                             (subject, d.get("body") or o["body"], when, o["id"]))
@@ -325,7 +387,7 @@ def _apply_decisions(con, decisions):
                 log_event(con, o["lead_id"], "rejected", f"step {o['step'] + 1} (manager)")
         done.append(d["local_id"])
     con.commit()
-    return done
+    return done, ho_done
 
 
 def sync(con, version=""):
@@ -336,7 +398,12 @@ def sync(con, version=""):
     try:
         events = _collect_events(con, s.get("last_event_id", 0))
         drafts = _collect_drafts(con, set(s.get("drafts_sent", [])))
-        status, j = _post(s["hub"], "/api/v1/sync", {"events": events, "drafts": drafts, "acked": s.get("ack", []), "version": version},
+        hos = con.execute("SELECT id, payload FROM handover_out WHERE synced=0 ORDER BY id LIMIT 50").fetchall()
+        handovers = [dict(json.loads(h["payload"]), out_id=h["id"]) for h in hos]
+        # handovers travel inside the existing fields, so an already-deployed Google relay passes them on unchanged
+        packed = events + [{"id": f"h{h['out_id']}", "type": "__handover", "data": h} for h in handovers]
+        acked = list(s.get("ack", [])) + [f"ho:{x}" for x in s.get("ho_ack", []) if x is not None]
+        status, j = _post(s["hub"], "/api/v1/sync", {"events": packed, "drafts": drafts, "acked": acked, "version": version},
                           token=env(TOKEN_KEY))
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         return False, f"Can't reach the hub ({getattr(e, 'reason', e)})."
@@ -353,7 +420,12 @@ def sync(con, version=""):
     s["drafts_sent"] = sorted(set(s.get("drafts_sent", [])) | {d["id"] for d in drafts})[-2000:]
     s["policy"] = j.get("policy") or s.get("policy", {})
     s["last_ok"] = iso(now_utc())
-    s["ack"] = _apply_decisions(con, j.get("decisions") or [])
+    if handovers:
+        con.execute(f"UPDATE handover_out SET synced=1 WHERE id IN ({','.join('?' * len(handovers))})", [h["out_id"] for h in handovers])
+        con.commit()
+    save_state(s)
+    s["ack"], s["ho_ack"] = _apply_decisions(con, j.get("decisions") or [])
+    s = dict(state(), ack=s["ack"], ho_ack=s["ho_ack"])   # keep the supervisor list _apply_decisions saved
     save_state(s)
     return True, "Synced."
 

@@ -38,8 +38,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 import brand
 import relay
 
-ROLES = ("owner", "manager", "member")
-EVENT_TYPES = ("sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "settings", "app_start", "paused")
+ROLES = ("owner", "manager", "member", "supervisor")
+EVENT_TYPES = ("sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "handover", "prospect_stage", "settings", "app_start", "paused")
 ONLINE_MINUTES = 10
 GRACE_HOURS = 72
 DEFAULT_PUBLIC_URL = ""          # set in Settings if you run this console as a server for the team
@@ -90,6 +90,12 @@ CREATE TABLE IF NOT EXISTS drafts (
     status TEXT DEFAULT 'pending',                   -- pending | approved | rejected
     decided_by TEXT, decided_at TEXT, delivered INTEGER DEFAULT 0,
     UNIQUE(user_id, local_id)
+);
+CREATE TABLE IF NOT EXISTS handovers (
+    id INTEGER PRIMARY KEY, from_user_id INTEGER, lead_local_id INTEGER, supervisor_id INTEGER, label TEXT, at TEXT,
+    lead_email TEXT, lead_name TEXT, company TEXT, title TEXT, payload TEXT,
+    delivered INTEGER DEFAULT 0, status TEXT DEFAULT 'new', status_at TEXT,
+    UNIQUE(from_user_id, lead_local_id)
 );
 CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, at TEXT, actor TEXT, action TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS reset_tokens (id INTEGER PRIMARY KEY, user_id INTEGER, token_hash TEXT UNIQUE, expires_at TEXT, used_at TEXT);
@@ -490,7 +496,7 @@ def user_stats(days=7):
     since = iso(now() - timedelta(days=days))
     wk = iso(now() - timedelta(days=7))
     out = []
-    for u in db().execute("SELECT * FROM users WHERE role IN ('member','manager','owner') ORDER BY name").fetchall():
+    for u in db().execute("SELECT * FROM users WHERE role IN ('member','manager','owner','supervisor') ORDER BY name").fetchall():
         c = lambda t, s=since: db().execute("SELECT COUNT(*) FROM events WHERE user_id=? AND type=? AND at>=?", (u["id"], t, s)).fetchone()[0]
         sent, replies, bounces = c("sent"), c("reply"), c("bounce")
         interested = db().execute("SELECT COUNT(*) FROM events WHERE user_id=? AND type='reply' AND at>=? AND detail IN ('interested','question','meeting_request')",
@@ -521,7 +527,8 @@ def dashboard():
     members = [s for s in stats if s["u"]["status"] != "invited" or s["sent"]]
     totals = dict(sent=sum(s["sent"] for s in stats), replies=sum(s["replies"] for s in stats),
                   interested=sum(s["interested"] for s in stats), pending=sum(s["pending"] for s in stats),
-                  online=sum(1 for s in stats if s["online"]))
+                  online=sum(1 for s in stats if s["online"]),
+                  handed=db().execute("SELECT COUNT(*) FROM handovers WHERE at>=?", (iso(now() - timedelta(days=7)),)).fetchone()[0])
     series = daily_series()
     mx = max([n for _, n in series] + [1])
     return render("dashboard.html", stats=stats, totals=totals, series=series, mx=mx, tab="dashboard")
@@ -650,6 +657,24 @@ def approval_action(did):
         audit("draft_" + action + "d", f"{d['lead_email']} (user {d['user_id']})")
     db().commit()
     return redirect(url_for("approvals") + f"#d{did}" if action == "save" else url_for("approvals"))
+
+
+@app.route("/handovers")
+@need()
+def handovers_page():
+    sid = request.args.get("sup", type=int)
+    q = ("SELECT h.*, f.name fromname, s.name supname FROM handovers h LEFT JOIN users f ON f.id=h.from_user_id "
+         "LEFT JOIN users s ON s.id=h.supervisor_id")
+    rows = db().execute(q + (" WHERE h.supervisor_id=?" if sid else "") + " ORDER BY h.at DESC LIMIT 300", ((sid,) if sid else ())).fetchall()
+    def hours(a, b):
+        da, db_ = parse(a), parse(b)
+        return round((db_ - da).total_seconds() / 3600, 1) if da and db_ else None
+    items = [dict(r, wait=hours(r["at"], r["status_at"]) if r["status"] != "new" else None) for r in rows]
+    sups = db().execute("SELECT u.id, u.name, u.status, (SELECT COUNT(*) FROM handovers h WHERE h.supervisor_id=u.id) n, "
+                        "(SELECT COUNT(*) FROM handovers h WHERE h.supervisor_id=u.id AND h.status='new') open_n, "
+                        "(SELECT COUNT(*) FROM handovers h WHERE h.supervisor_id=u.id AND h.status IN ('meeting','proposal','won')) good "
+                        "FROM users u WHERE u.role='supervisor' ORDER BY u.name").fetchall()
+    return render("handovers.html", items=items, sups=sups, sid=sid, tab="handovers")
 
 
 @app.route("/activity")
@@ -804,13 +829,19 @@ def api_login():
 def ingest(con, uid, j):
     """Store one report from a team laptop (events, drafts awaiting approval, delivered decisions). Returns events accepted."""
     n_ev = 0
-    for e in (j.get("events") or [])[:500]:
+    for e in (j.get("events") or [])[:600]:
+        if isinstance(e, dict) and e.get("type") == "__handover":
+            store_handover(con, uid, e.get("data") or {})
+            continue
         try:
             con.execute("INSERT OR IGNORE INTO events(user_id, local_id, at, type, detail, sender, lead_email, company, step, variant) VALUES (?,?,?,?,?,?,?,?,?,?)",
                         (uid, int(e["id"]), str(e.get("at", iso()))[:25], str(e.get("type", ""))[:30], str(e.get("detail", ""))[:300],
                          str(e.get("sender") or "")[:120], str(e.get("lead_email") or "")[:200], str(e.get("company") or "")[:200],
                          e.get("step"), str(e.get("variant") or "")[:80]))
             n_ev += 1
+            if e.get("type") == "prospect_stage" and e.get("lead_email"):
+                con.execute("UPDATE handovers SET status=?, status_at=? WHERE supervisor_id=? AND lead_email=?",
+                            (str(e.get("detail", ""))[:30], str(e.get("at", iso()))[:25], uid, str(e["lead_email"]).lower()))
         except (KeyError, ValueError, TypeError):
             continue
     for dr in (j.get("drafts") or [])[:200]:
@@ -826,7 +857,13 @@ def ingest(con, uid, j):
                         (uid, lid, *vals, iso()))
         elif cur["status"] == "pending":  # the member may still be editing; the manager has not decided
             con.execute("UPDATE drafts SET subject=?, body=? WHERE id=?", (vals[4], vals[5], cur["id"]))
-    for lid in (j.get("acked") or [])[:500]:
+    for lid in (j.get("acked") or [])[:600]:
+        if isinstance(lid, str) and lid.startswith("ho:"):
+            try:
+                con.execute("UPDATE handovers SET delivered=1 WHERE id=? AND supervisor_id=?", (int(lid[3:]), uid))
+            except ValueError:
+                pass
+            continue
         try:
             con.execute("UPDATE drafts SET delivered=1 WHERE user_id=? AND local_id=? AND status!='pending'", (uid, int(lid)))
         except (ValueError, TypeError):
@@ -834,10 +871,45 @@ def ingest(con, uid, j):
     return n_ev
 
 
+def store_handover(con, uid, h):
+    """A prospect handed over from a team member's laptop: route it to the chosen supervisor."""
+    lead = h.get("lead") or {}
+    sid = str(h.get("supervisor") or "")
+    sup = con.execute("SELECT id FROM users WHERE role='supervisor' AND (username=? OR email=?)", (sid, sid)).fetchone() \
+        or con.execute("SELECT id FROM users WHERE role='supervisor' AND status!='disabled' ORDER BY id LIMIT 1").fetchone()
+    try:
+        lid = int(h.get("lead_local_id"))
+    except (TypeError, ValueError):
+        return
+    name = " ".join(p for p in (lead.get("first_name"), lead.get("last_name")) if p) or lead.get("email", "")
+    con.execute("INSERT OR IGNORE INTO handovers(from_user_id, lead_local_id, supervisor_id, label, at, lead_email, lead_name, company, title, payload) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (uid, lid, sup["id"] if sup else None, str(h.get("label", ""))[:30], str(h.get("at") or iso())[:25],
+                 str(lead.get("email", "")).lower()[:200], name[:200], str(lead.get("company") or "")[:200], str(lead.get("title") or "")[:200],
+                 json.dumps(h)[:60000]))
+
+
+def supervisor_config(con):
+    sups = []
+    for u in con.execute("SELECT * FROM users WHERE role='supervisor' AND status!='disabled' ORDER BY id").fetchall():
+        n = con.execute("SELECT COUNT(*) FROM handovers WHERE supervisor_id=? AND at>=?", (u["id"], iso(now() - timedelta(days=30)))).fetchone()[0]
+        sups.append({"id": u["username"] or u["email"], "name": u["name"], "email": u["email"], "count": n})
+    last = con.execute("SELECT MAX(at) FROM handovers").fetchone()[0] or ""
+    return {"action": "config", "local_id": None, "supervisors": sups, "as_of": last}
+
+
 def decisions_for(con, uid):
-    return [{"local_id": d["local_id"], "action": "approve" if d["status"] == "approved" else "reject",
-             "subject": d["subject"], "body": d["body"], "by": d["decided_by"]}
-            for d in con.execute("SELECT * FROM drafts WHERE user_id=? AND status!='pending' AND delivered=0", (uid,)).fetchall()]
+    out = [{"local_id": d["local_id"], "action": "approve" if d["status"] == "approved" else "reject",
+            "subject": d["subject"], "body": d["body"], "by": d["decided_by"]}
+           for d in con.execute("SELECT * FROM drafts WHERE user_id=? AND status!='pending' AND delivered=0", (uid,)).fetchall()]
+    out.append(supervisor_config(con))
+    for h in con.execute("SELECT h.*, u.name fromname FROM handovers h LEFT JOIN users u ON u.id=h.from_user_id "
+                         "WHERE h.supervisor_id=? AND h.delivered=0 ORDER BY h.id LIMIT 25", (uid,)).fetchall():
+        p = json.loads(h["payload"] or "{}")
+        out.append({"action": "handover", "local_id": None, "handover_id": h["id"], "lead": p.get("lead") or {}, "label": h["label"],
+                    "reply": p.get("reply", ""), "intro": p.get("intro", ""), "thread": (p.get("thread") or [])[:6],
+                    "from": h["fromname"] or p.get("from_name", ""), "from_name": p.get("from_name", ""), "at": h["at"]})
+    return out
 
 
 @app.post("/api/v1/sync")
@@ -1017,7 +1089,7 @@ BASE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name=
 <title>{% block title %}Master console{% endblock %} · BSO</title><style>""" + CSS + """{{ logo_css|safe }}</style></head><body>
 {% if me %}<div class="top">{{ logo(30, tile=True, uid='tp', weight='b', label='BSO')|safe }}<b>BSO Master console</b><small>{{ org }}</small><span class="sp"></span>
 <small>{{ me.name }} · {{ me.role }}</small><form method="post" action="{{ url_for('logout') }}" style="margin:0"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" style="padding:4px 10px">Sign out</button></form></div>
-<div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('users','Users','users'),('approvals','Approvals','approvals'),('activity','Activity','activity')] + ([('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
+<div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('users','Users','users'),('approvals','Approvals','approvals'),('handovers','Handovers','handovers_page'),('activity','Activity','activity')] + ([('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
 <div class="wrap">{% if request.args.get('err') %}<div class="err">{{ request.args.get('err') }}</div>{% endif %}{% block body %}{% endblock %}</div><script src="/hub.js"></script></body></html>"""
 
 T = {}
@@ -1049,7 +1121,8 @@ T["reset.html"] = """{% extends 'base.html' %}{% block title %}Choose a new pass
 T["dashboard.html"] = """{% extends 'base.html' %}{% block body %}
 <div class="stats"><div class="stat"><small>Sent (7 days)</small><div>{{ totals.sent }}</div></div><div class="stat"><small>Replies (7 days)</small><div>{{ totals.replies }}</div></div>
 <div class="stat"><small>Interested replies</small><div>{{ totals.interested }}</div></div><div class="stat"><small>Drafts awaiting approval</small><div><a href="{{ url_for('approvals') }}">{{ totals.pending }}</a></div></div>
-<div class="stat"><small>Laptops online now</small><div>{{ totals.online }}</div></div></div>
+<div class="stat"><small>Laptops online now</small><div>{{ totals.online }}</div></div>
+<div class="stat"><small>Prospects handed over (7 days)</small><div><a href="{{ url_for('handovers_page') }}">{{ totals.handed }}</a></div></div></div>
 <div class="card"><div class="card-h"><h2>Emails sent per day, whole team</h2></div><div class="card-b">
 <svg viewBox="0 0 {{ series|length * 40 }} 120" width="100%" height="140" role="img" aria-label="Emails sent per day">{% for d, n in series %}<g><rect x="{{ loop.index0 * 40 + 6 }}" y="{{ 96 - (n * 90 // mx) }}" width="28" height="{{ (n * 90 // mx) or 1 }}" rx="3" fill="#0176d3"/>
 <text x="{{ loop.index0 * 40 + 20 }}" y="{{ 92 - (n * 90 // mx) }}" font-size="10" text-anchor="middle" fill="#444">{{ n if n }}</text><text x="{{ loop.index0 * 40 + 20 }}" y="112" font-size="9" text-anchor="middle" fill="#777">{{ d[:6] }}</text></g>{% endfor %}</svg></div></div>
@@ -1072,7 +1145,7 @@ T["users.html"] = """{% extends 'base.html' %}{% block title %}Users{% endblock 
 {% if me.role == 'owner' %}<div class="card"><div class="card-h"><h2>Add a user</h2></div><div class="card-b"><form method="post" action="{{ url_for('user_new') }}"><input type="hidden" name="_csrf" value="{{ csrf }}">
 <div class="grid"><div><label>Name</label><input name="name" required></div><div><label>Email</label><input name="email" type="email" required></div>
 <div><label>Sign-in ID (blank = part of email before @)</label><input name="username" autocomplete="off"></div>
-<div><label>Role</label><select name="role"><option value="member">Member (uses BSO on their laptop)</option><option value="manager">Manager (member + can use this console)</option></select></div>
+<div><label>Role</label><select name="role"><option value="member">Member (uses BSO on their laptop)</option><option value="manager">Manager (member + can use this console)</option><option value="supervisor">Lead Gen Supervisor (receives interested prospects)</option></select></div>
 <div><label>Password (10+ characters; blank = generate one)</label><input name="password" autocomplete="off"></div>
 <div><label>Daily send cap (0 = no cap)</label><input name="daily_cap" type="number" min="0" value="0"></div><div><label>Weekly target (emails, 0 = none)</label><input name="weekly_target" type="number" min="0" value="0"></div>
 <div><label>Who approves their emails</label><select name="approval"><option value="member">They approve their own</option><option value="master">The master approves every email</option></select></div></div>
@@ -1084,7 +1157,7 @@ T["user.html"] = """{% extends 'base.html' %}{% block title %}{{ u.name }}{% end
 {% if me.role == 'owner' %}<div class="card"><div class="card-h"><h2>{{ u.name }} <span class="badge {{ 'b-ok' if u.status == 'active' else 'b-bad' if u.status == 'disabled' else 'b-warn' }}">{{ u.status }}</span></h2></div><div class="card-b">
 <form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="save"><div class="grid">
 <div><label>Name</label><input name="name" value="{{ u.name }}"></div><div><label>Email</label><input value="{{ u.email }}" disabled></div><div><label>Sign-in ID</label><input value="{{ u.username or u.email }}" disabled></div>
-<div><label>Role</label><select name="role" {{ 'disabled' if u.role == 'owner' }}>{% for r in ['member','manager'] %}<option {{ 'selected' if u.role == r }}>{{ r }}</option>{% endfor %}{% if u.role == 'owner' %}<option selected>owner</option>{% endif %}</select></div>
+<div><label>Role</label><select name="role" {{ 'disabled' if u.role == 'owner' }}>{% for r in ['member','manager','supervisor'] %}<option {{ 'selected' if u.role == r }}>{{ r }}</option>{% endfor %}{% if u.role == 'owner' %}<option selected>owner</option>{% endif %}</select></div>
 <div><label>Daily send cap (0 = no cap)</label><input name="daily_cap" type="number" min="0" value="{{ u.daily_cap or 0 }}"></div><div><label>Weekly target</label><input name="weekly_target" type="number" min="0" value="{{ u.weekly_target or 0 }}"></div>
 <div><label>Who approves their emails</label><select name="approval"><option value="member" {{ 'selected' if u.approval != 'master' }}>They approve their own</option><option value="master" {{ 'selected' if u.approval == 'master' }}>The master approves every email</option></select></div>
 </div>
@@ -1101,6 +1174,17 @@ T["approvals.html"] = """{% extends 'base.html' %}{% block title %}Approvals{% e
 <p><button class="btn brand" name="action" value="approve">✓ Approve</button> <button class="btn" name="action" value="save">Save edits</button> <button class="btn danger" name="action" value="reject">Reject</button></p></form></div></div>
 {% else %}<div class="card"><div class="card-b muted">Nothing is waiting for approval.</div></div>{% endfor %}
 {% if done %}<div class="card"><div class="card-h"><h2>Recently decided</h2></div><table>{% for d in done %}<tr><td>{{ d.uname }}</td><td>{{ d.lead_email }}</td><td><span class="badge {{ 'b-ok' if d.status == 'approved' else 'b-bad' }}">{{ d.status }}</span></td><td class="muted">{{ d.decided_by }} · {{ d.decided_at|dt }}</td><td class="muted">{{ 'delivered' if d.delivered else 'waiting for their laptop' }}</td></tr>{% endfor %}</table></div>{% endif %}{% endblock %}"""
+T["handovers.html"] = """{% extends 'base.html' %}{% block title %}Handovers{% endblock %}{% block body %}
+<div class="note">Interested, meeting-request and question replies are handed to the <b>Lead Gen Supervisors</b> in turn (add one under Users with the role <i>Lead Gen Supervisor</i>). The original inbox sends a short introduction with the supervisor in CC, the supervisor gets a briefing email, and the prospect appears in their BSO under <b>My prospects</b>.</div>
+<div class="card"><div class="card-h"><h2>Supervisors</h2></div><table><tr><th>Supervisor</th><th class="r">Handed over</th><th class="r">Not yet contacted</th><th class="r">Meeting / proposal / won</th><th></th></tr>
+{% for s in sups %}<tr><td><b>{{ s.name }}</b>{% if s.status == 'disabled' %} <span class="badge b-bad">paused: gets no new prospects</span>{% endif %}</td><td class="r">{{ s.n }}</td><td class="r">{{ s.open_n }}</td><td class="r">{{ s.good }}</td><td><a href="{{ url_for('handovers_page', sup=s.id) }}">show</a></td></tr>
+{% else %}<tr><td colspan="5" class="muted">No supervisors yet. Add a user with the role <b>Lead Gen Supervisor</b>. Until then, interested replies stay with the person who received them.</td></tr>{% endfor %}</table></div>
+<div class="card"><div class="card-h"><h2>Handed-over prospects{% if sid %} <a href="{{ url_for('handovers_page') }}" style="font-weight:400;font-size:13px">show all</a>{% endif %}</h2></div>
+<table><tr><th>When</th><th>Prospect</th><th>Reply</th><th>From</th><th>Supervisor</th><th>Stage</th><th class="r">Hours to first update</th></tr>
+{% for h in items %}<tr><td class="muted">{{ h.at|dt }}</td><td><b>{{ h.lead_name }}</b><br><span class="muted">{{ h.title }}{{ ', ' if h.title and h.company }}{{ h.company }}<br>{{ h.lead_email }}</span></td>
+<td>{{ (h.label or '').replace('_', ' ') }}</td><td>{{ h.fromname or '–' }}</td><td>{{ h.supname or '–' }}{% if not h.delivered %}<br><span class="muted">waiting for their BSO</span>{% endif %}</td>
+<td><span class="badge {{ 'b-ok' if h.status in ('meeting','proposal','won') else 'b-bad' if h.status == 'lost' else 'b-warn' if h.status == 'new' else '' }}">{{ h.status }}</span></td><td class="r">{{ h.wait if h.wait is not none else '–' }}</td></tr>
+{% else %}<tr><td colspan="7" class="muted">No prospects handed over yet.</td></tr>{% endfor %}</table></div>{% endblock %}"""
 T["activity.html"] = """{% extends 'base.html' %}{% block title %}Activity{% endblock %}{% block body %}
 <form method="get" class="card"><div class="card-b grid"><div><label>User</label><select name="user"><option value="">Everyone</option>{% for u in ulist %}<option value="{{ u.id }}" {{ 'selected' if uid == u.id }}>{{ u.name }}</option>{% endfor %}</select></div>
 <div><label>Event</label><select name="type"><option value="">All</option>{% for t in types %}<option {{ 'selected' if typ == t }}>{{ t }}</option>{% endfor %}</select></div><div style="align-self:end"><button class="btn brand">Filter</button></div></div></form>

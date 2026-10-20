@@ -96,7 +96,8 @@ log = logging.getLogger("outreach")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 FIND_EMAILS_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 CORE_FIELDS = {"email", "first_name", "company", "website"}
-REPLY_LABELS = ["interested", "not_interested", "unsubscribe", "out_of_office", "referral", "other"]
+REPLY_LABELS = ["interested", "meeting_request", "question", "not_interested", "unsubscribe", "out_of_office", "referral", "other"]
+HANDOVER_LABELS = ("interested", "meeting_request", "question")
 
 
 # ---------------------------------------------------------------- helpers
@@ -193,6 +194,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY, cmd TEXT, args TEXT, status TEXT, output TEXT, started_at TEXT, finished_at TEXT
 );
+CREATE TABLE IF NOT EXISTS handover_out (                -- handovers waiting to reach the team hub
+    id INTEGER PRIMARY KEY, lead_id INTEGER, supervisor TEXT, payload TEXT, at TEXT, synced INTEGER DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS apollo_seen (apollo_id TEXT PRIMARY KEY, result TEXT, at TEXT);
 CREATE TABLE IF NOT EXISTS apollo_progress (search TEXT PRIMARY KEY, page INTEGER);
 """
@@ -235,6 +239,10 @@ def db_connect(path):
         _add_column(con, "notes", "kind", "TEXT DEFAULT 'note'")
         _add_column(con, "outbox", "variant", "TEXT")
         _add_column(con, "events", "variant", "TEXT")
+        _add_column(con, "leads", "handed_to", "TEXT")          # supervisor this prospect was handed to (sender side)
+        _add_column(con, "leads", "handed_at", "TEXT")
+        _add_column(con, "leads", "handed_from", "TEXT")        # who handed it over (supervisor side)
+        _add_column(con, "leads", "prospect_stage", "TEXT")     # supervisor's stage for a handed-over prospect
         con.execute("UPDATE leads SET stage='qualified' WHERE stage IN ('meeting','proposal','won')")
         con.execute("UPDATE leads SET stage='unqualified' WHERE stage='lost'")
         con.commit()
@@ -444,11 +452,13 @@ def classify_reply(cfg, msg, body):
         return keyword_label(low)  # default: sorted on this computer; reply text isn't sent anywhere
     prompt = f"""Classify this reply to a cold sales email. Answer with exactly one label from:
 {', '.join(REPLY_LABELS)}
-(referral = they point us to someone else; other = anything that needs a human look)
+(interested = positive, wants to know more; meeting_request = asks for or proposes a call/meeting/time;
+question = asks something specific such as price, process or examples; referral = they point us to someone else;
+other = anything that needs a human look)
 
 Reply:
 \"\"\"{body[:2000]}\"\"\""""
-    label = llm(cfg, "classify", prompt, max_tokens=10)
+    label = llm(cfg, "classify", prompt, max_tokens=12)
     if label is None:
         return keyword_label(low)
     label = label.lower().strip(" .\n")
@@ -463,8 +473,14 @@ def keyword_label(low):
         return "not_interested"
     if re.search(r"\b(reach out to|contact|speak (to|with)|talk to) [a-z]+ (instead|who|on our)|\bright person\b|\bnot the right (person|contact)\b", low):
         return "referral"
-    if re.search(r"\b(interested|let'?s (talk|chat|connect|meet)|(can|could|shall) we (talk|chat|meet|speak|connect|set up)|happy to (talk|chat|connect)|sounds (good|interesting)|tell me more|send (me )?(more )?(info|details)|schedule|book a|call|meeting|available|calendar)\b", low):
+    if re.search(r"\b(schedule|book a|set up a (call|meeting|time)|(a|quick|short|intro) (call|chat|meeting)|meeting|calendar|calendly|zoom|teams call|google meet|"
+                 r"what time|which time|(are|is) you (free|available)|i'?m (free|available)|available (on|next|this|tomorrow)|"
+                 r"(monday|tuesday|wednesday|thursday|friday)( at| morning| afternoon)?|tomorrow at|next week)\b", low):
+        return "meeting_request"
+    if re.search(r"\b(interested|let'?s (talk|chat|connect|meet)|(can|could|shall) we (talk|chat|meet|speak|connect)|happy to (talk|chat|connect)|sounds (good|interesting|great)|tell me more|send (me |over )?(your |the |some )?(more )?(info|information|details|deck|brochure|pricing)|keen to (learn|hear))\b", low):
         return "interested"
+    if "?" in low and re.search(r"\b(how much|price|pricing|cost|rates?|fees?|budget|case stud(y|ies)|examples?|portfolio|references?|how (does|do|would|long)|what (is|are|would|does)|do you (have|offer|work|do)|can you|which (tech|stack|technolog))", low):
+        return "question"
     return "other"
 
 
@@ -499,10 +515,12 @@ def render(template, lead, sender, cfg):
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def send_email(sender, to, subject, body, in_reply_to=None, dry_run=False):
+def send_email(sender, to, subject, body, in_reply_to=None, dry_run=False, cc=None):
     msg = EmailMessage()
     msg["From"] = f'{sender["name"]} <{sender["email"]}>'
     msg["To"] = to
+    if cc:
+        msg["Cc"] = cc
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
     msg_id = make_msgid(domain=sender["email"].split("@")[1])
@@ -843,10 +861,137 @@ def handle_message(cfg, con, sender, msg):
     con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'email')",
                 (lead["id"], f"[{label} reply]\n{body[:2000]}", iso(now_utc())))
     who = lead["first_name"] or frm
+    if label in HANDOVER_LABELS and handover(cfg, con, dict(lead), sender, msg, body, label):
+        return
     add_task(con, f"Respond to {who} ({label.replace('_', ' ')} reply)", lead_id=lead["id"])
     snippet = body[:300].replace("\n", " ")
     notify(f"📬 {label.upper()} reply from {lead['first_name'] or ''} <{frm}> "
            f"({lead['company'] or ''}) in {sender['email']}:\n{snippet}", cfg)
+
+
+# ---------------------------------------------------------------- handover to a lead gen supervisor
+
+DEFAULT_INTRO = """Hi {first_name},
+
+Thanks for getting back to me. I'm looping in my colleague {supervisor_name}, who works with our clients on exactly this. {supervisor_first_name} will take it from here and can find a time that suits you.
+
+Best,
+{sender_name}"""
+
+
+def supervisors(cfg):
+    """[{id, name, email, count}]: from the master console when on a team, else from Settings → Handover."""
+    try:
+        import team
+        if team.joined():
+            return team.supervisors()
+    except Exception as e:
+        log.warning("Team supervisors unavailable: %s", e)
+    out = []
+    for sv in (cfg.get("handover") or {}).get("supervisors") or []:
+        if EMAIL_RE.match(str(sv.get("email", "")).strip()):
+            out.append({"id": sv["email"].strip().lower(), "name": sv.get("name") or sv["email"], "email": sv["email"].strip().lower(), "count": 0})
+    return out
+
+
+def pick_supervisor(cfg, con):
+    """Take turns: the supervisor with the fewest handovers gets the next one."""
+    sups = supervisors(cfg)
+    if not sups:
+        return None
+    since = ""
+    try:
+        import team
+        since = team.state().get("sup_as_of", "") if team.joined() else ""
+    except Exception:
+        pass
+    def load(sv):
+        local = con.execute("SELECT COUNT(*) FROM leads WHERE handed_to=? AND handed_at>?", (sv["email"], since)).fetchone()[0]
+        return (sv.get("count", 0) + local, sups.index(sv))
+    return min(sups, key=load)
+
+
+def _thread(con, lead_id):
+    return [{"at": r["sent_at"] or r["created_at"], "subject": r["subject"], "body": r["body"]}
+            for r in con.execute("SELECT * FROM outbox WHERE lead_id=? AND status='sent' ORDER BY id", (lead_id,))]
+
+
+def handover(cfg, con, lead, sender, msg, body, label):
+    """Hand an interested prospect to a lead gen supervisor. Returns False when there's nobody to hand to."""
+    hc = cfg.get("handover") or {}
+    if not hc.get("enabled", True):
+        return False
+    sup = pick_supervisor(cfg, con)
+    if not sup:
+        return False
+    tm = cfg.get("test_mode") or {}
+    redirect = tm.get("redirect_to") if tm.get("enabled") else None
+    name = " ".join(p for p in (lead.get("first_name"), json.loads(lead.get("extra") or "{}").get("last_name")) if p) or lead["email"]
+    company = lead.get("company") or ""
+    sup_first = (sup["name"] or "").split()[0] if sup.get("name") else "they"
+
+    # 1. warm intro from the same inbox, in the same thread, supervisor in CC
+    intro_note = ""
+    intro_text = ""
+    if hc.get("intro_enabled", True):
+        tpl = (hc.get("intro_template") or DEFAULT_INTRO).replace("{supervisor_name}", sup["name"]).replace("{supervisor_first_name}", sup_first)
+        intro_text = render(tpl, lead, sender, cfg)
+        hits = find_avoid(cfg, intro_text)
+        subject = msg.get("Subject", "") or ("Re: " + (lead.get("first_subject") or ""))
+        subject = subject if subject.lower().startswith("re:") else "Re: " + subject
+        try:
+            if redirect:
+                send_email(sender, redirect, f"[TEST for {lead['email']}, CC {sup['email']}] {subject}", intro_text, msg.get("Message-ID"))
+            else:
+                send_email(sender, lead["email"], subject, intro_text, msg.get("Message-ID"), cc=sup["email"])
+            log_event(con, lead["id"], "sent", "handover intro" + (" (test)" if redirect else ""), sender["email"])
+            if hits:
+                log.warning("Handover intro uses avoided words: %s", ", ".join(hits))
+        except Exception as e:
+            log.error("Handover intro to %s failed: %s", lead["email"], e)
+            intro_note = f"\n⚠ The introduction email could not be sent ({e}). Please contact the prospect directly.\n"
+            intro_text = ""
+
+    # 2. brief for the supervisor
+    thread = _thread(con, lead["id"])
+    x = json.loads(lead.get("extra") or "{}")
+    member = ""
+    try:
+        import team
+        member = (team.policy() or {}).get("name", "") if team.joined() else ""
+    except Exception:
+        pass
+    lines = [f"{sup['name']}, a prospect has been handed over to you.", intro_note,
+             f"Prospect:   {name}", f"Title:      {x.get('title', '')}", f"Company:    {company}", f"Email:      {lead['email']}",
+             f"Website:    {lead.get('website') or ''}", f"LinkedIn:   {x.get('linkedin', '')}",
+             f"Reply type: {label.replace('_', ' ')}", f"From:       {member or sender['name']} ({sender['email']})", "",
+             "--- Their reply ---", body.strip()[:4000], ""]
+    if intro_text:
+        lines += ["--- Introduction we sent (you were in CC) ---", intro_text, ""]
+    for i, t in enumerate(thread, 1):
+        lines += [f"--- Our email {i} ({str(t['at'])[:10]}): {t['subject']} ---", t["body"], ""]
+    lines.append("Reply to the prospect from your own mailbox. In BSO, open My prospects to track the stage, notes and tasks.")
+    brief_to = redirect or sup["email"]
+    try:
+        send_email(sender, brief_to, f"{'[TEST] ' if redirect else ''}Handover: {name}, {company} ({label.replace('_', ' ')})", "\n".join(lines))
+    except Exception as e:
+        log.error("Handover brief to %s failed: %s", sup["email"], e)
+
+    # 3. record it
+    at = iso(now_utc())
+    con.execute("UPDATE leads SET handed_to=?, handed_at=? WHERE id=?", (sup["email"], at, lead["id"]))
+    set_stage(con, lead["id"], "qualified", auto=False)
+    con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",
+                (lead["id"], f"Handed over to {sup['name']} <{sup['email']}> ({label.replace('_', ' ')} reply).", at))
+    log_event(con, lead["id"], "handover", sup["id"], sender["email"])
+    payload = {"lead_local_id": lead["id"], "supervisor": sup["id"], "label": label, "at": at,
+               "lead": {"email": lead["email"], "first_name": lead.get("first_name"), "last_name": x.get("last_name"), "title": x.get("title"),
+                        "company": company, "website": lead.get("website"), "linkedin": x.get("linkedin"), "city": x.get("city"), "country": x.get("country")},
+               "reply": body.strip()[:4000], "intro": intro_text, "thread": thread, "from_inbox": sender["email"], "from_name": sender["name"]}
+    con.execute("INSERT INTO handover_out(lead_id, supervisor, payload, at) VALUES (?,?,?,?)", (lead["id"], sup["id"], json.dumps(payload), at))
+    con.commit()
+    notify(f"🤝 Handed over {name} ({company}) to {sup['name']}: {label.replace('_', ' ')} reply in {sender['email']}", cfg)
+    return True
 
 
 def process_inbox(cfg, con, sender):

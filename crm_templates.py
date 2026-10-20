@@ -677,7 +677,7 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
 {% call m.header('t-setup', '⚙', 'Settings', 'Set up your outreach') %}<a class="btn" href="{{ url_for('setup') }}">Getting Started checklist</a>{% endcall %}
 {% if result %}<div class="toast {{ '' if ok else 'err' }}">{{ result }}</div>{% endif %}
 <div class="settings">
-<nav class="snav">{% for k, lbl, n in [('inbox','Email inboxes','1'),('safety','Safety & automation','2'),('keys','AI & Apollo keys','3'),('emails','Your offer & emails','4'),('targeting','Lead targeting','5'),('schedule','Sending schedule','6'),('team','Team','7')] %}
+<nav class="snav">{% for k, lbl, n in [('inbox','Email inboxes','1'),('safety','Safety & automation','2'),('keys','AI & Apollo keys','3'),('emails','Your offer & emails','4'),('targeting','Lead targeting','5'),('schedule','Sending schedule','6'),('handover','Handover','7'),('team','Team','8')] %}
  <a href="{{ url_for('settings', tab=k) }}" class="{{ 'on' if tab == k }}"><span class="sn">{{ n }}</span>{{ lbl }}</a>{% endfor %}</nav>
 <div class="spanel">
 
@@ -790,6 +790,21 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <div class="grid2"><div><label>Gap between emails, at least (seconds)</label><input name="gap_min" type="number" min="0" value="{{ gap[0] }}"></div><div><label>at most (seconds)</label><input name="gap_max" type="number" min="0" value="{{ gap[1] }}"></div></div>
  <button class="btn brand" style="margin-top:12px">Save schedule</button></form></div></div>
 
+{% elif tab == 'handover' %}
+<div class="card"><div class="card-h"><h2>Handover to a lead gen supervisor</h2></div><div class="card-b"><form method="post" action="{{ url_for('save_handover') }}">
+ <p class="muted" style="margin-top:0">When a prospect replies <b>interested</b>, asks for a <b>meeting</b> or asks a <b>question</b>, BSO hands them to a supervisor (taking turns): the inbox that received the reply sends a short introduction with the supervisor in CC, the supervisor gets a briefing email with the whole conversation, and the prospect stops getting automatic emails.</p>
+ <label class="check"><input type="checkbox" name="enabled" {{ 'checked' if ho.get('enabled', True) }}> Hand interested prospects over to a supervisor</label>
+ <label class="check"><input type="checkbox" name="intro_enabled" {{ 'checked' if ho.get('intro_enabled', True) }}> Send the prospect a short introduction (supervisor in CC)</label>
+ <label>Introduction email. <span class="muted">{first_name}, {company}, {sender_name}, {supervisor_name} and {supervisor_first_name} are filled in.</span></label>
+ <textarea name="intro_template" style="min-height:190px;font-family:ui-monospace,Menlo,Consolas,monospace">{{ ho.get('intro_template') or ho_default }}</textarea>
+ {% if team.joined %}<label>Supervisors (set by your manager in the Master Console)</label>
+ {% if team_sups %}<ul>{% for sv in team_sups %}<li>{{ sv.name }} &lt;{{ sv.email }}&gt;</li>{% endfor %}</ul>{% else %}<p class="muted">None yet: until your manager adds a Lead Gen Supervisor, interested replies stay with you as tasks.</p>{% endif %}
+ {% else %}<label>Supervisors, one per line: Name &lt;email&gt; <span class="muted">(prospects go to them in turn)</span></label>
+ <textarea name="supervisors" style="min-height:80px" placeholder="Ali Khan <ali@blacswanken.com>">{% for sv in ho.get('supervisors') or [] %}{{ sv.name }} <{{ sv.email }}>
+{% endfor %}</textarea>{% endif %}
+ <p class="hint">Test mode: the introduction and the briefing both go to your test address instead.</p>
+ <button class="btn brand" style="margin-top:12px">Save handover settings</button></form></div></div>
+
 {% elif tab == 'team' %}
 {% if team.joined %}
 <div class="card"><div class="card-h"><h2>Your team account</h2></div><div class="card-b">
@@ -876,6 +891,17 @@ ABOUT = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block tit
 </div></div>
 {% endblock %}"""
 
+PROSPECTS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}My prospects{% endblock %}{% block body %}
+{% call m.header('t-opp', '★', 'My prospects', items|length ~ ' handed over to you · ' ~ counts['new'] ~ ' not contacted yet') %}{% endcall %}
+<div class="help" style="margin-bottom:12px"><b>Prospects handed over to you.</b> Each one replied with interest, a meeting request or a question. Reply from your own mailbox (you were in CC on the introduction), then keep the stage up to date here; your manager sees it in the Master Console. Open a prospect for their reply, the full conversation, notes and tasks.</div>
+<div class="card">{% if items %}<table class="tbl"><thead><tr><th>Prospect</th><th>Company</th><th>Reply</th><th>Handed over by</th><th>Stage</th></tr></thead>
+{% for p in items %}<tr><td><a href="{{ url_for('lead', lead_id=p.id) }}"><b>{{ p.name }}</b></a><br><small class="muted">{{ p.x.title or '' }}<br>{{ p.email }}</small></td>
+<td>{{ p.company or '' }}{% if p.website %}<br><a href="https://{{ p.website }}" target="_blank" rel="noopener"><small>{{ p.website }} ↗</small></a>{% endif %}{% if p.x.linkedin %} <a href="{{ p.x.linkedin }}" target="_blank" rel="noopener"><small>LinkedIn ↗</small></a>{% endif %}</td>
+<td>{{ (p.x.handover_label or '').replace('_', ' ') }}</td><td>{{ p.handed_from }}<br><small class="muted">{{ (p.handed_at_in or '')[:10] }}</small></td>
+<td><form method="post" action="{{ url_for('prospect_stage', lead_id=p.id) }}"><select name="stage" onchange="this.form.submit()">{% for k, l in labels.items() %}<option value="{{ k }}" {{ 'selected' if (p.prospect_stage or 'new') == k }}>{{ l }}</option>{% endfor %}</select><noscript><button class="btn sm">Save</button></noscript></form></td></tr>{% endfor %}</table>
+{% else %}<div class="empty"><b>No prospects yet</b>When a prospect replies with interest, they're handed over to you here, and you also get a briefing email.</div>{% endif %}</div>
+{% endblock %}"""
+
 SIGNIN = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sign in · BlacSwanken Outreach</title><link rel="icon" href="{{ url_for('favicon') }}"><link rel="manifest" href="{{ url_for('web_manifest') }}"><meta name="theme-color" content="#1B1F24">
 <style>
@@ -919,5 +945,5 @@ TEMPLATES = {
     "base.html": BASE, "macros.html": MACROS, "home.html": HOME, "leads.html": LEADS, "lead.html": LEAD,
     "accounts.html": ACCOUNTS, "account.html": ACCOUNT, "opps.html": OPPS, "opp.html": OPP,
     "tasks.html": TASKS, "reports.html": REPORTS, "review.html": REVIEW, "setup.html": SETUP,
-    "job.html": JOB, "settings.html": SETTINGS, "welcome.html": WELCOME, "signin.html": SIGNIN, "legal.html": LEGAL, "about.html": ABOUT, "jobs.html": JOBS, "new.html": NEW_LEAD, "import.html": IMPORT, "search.html": SEARCH,
+    "job.html": JOB, "settings.html": SETTINGS, "welcome.html": WELCOME, "signin.html": SIGNIN, "prospects.html": PROSPECTS, "legal.html": LEGAL, "about.html": ABOUT, "jobs.html": JOBS, "new.html": NEW_LEAD, "import.html": IMPORT, "search.html": SEARCH,
 }

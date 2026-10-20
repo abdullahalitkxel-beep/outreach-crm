@@ -48,6 +48,14 @@ delay_between_sends_seconds: [60, 180]
 reply_lookback_days: 14
 
 # Who is told about interested replies (always shown in the app too). Sent from your first inbox.
+# Interested / meeting-request / question replies go to a lead gen supervisor (taking turns).
+# On a team, supervisors are the users with the Supervisor role in the Master Console.
+handover:
+  enabled: true
+  intro_enabled: true          # the original inbox replies "looping in my colleague…" with the supervisor in CC
+  intro_template: ""           # empty = the standard introduction
+  supervisors: []              # only used when not on a team: [{name: "Ali Khan", email: "ali@example.com"}]
+
 notifications:
   email: "omar@blacswanken.com"
 

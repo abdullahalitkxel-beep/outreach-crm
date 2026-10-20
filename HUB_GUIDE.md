@@ -62,6 +62,19 @@ Until someone signs in, BSO opens nothing and sends nothing, including automatic
 
 Roles: **owner** (everything, including users and settings), **manager** (sees everyone, approves drafts, signs in to the console), **member** (uses BSO on their laptop).
 
+## Handing interested prospects to supervisors
+
+Add one or more users with the role **Lead Gen Supervisor** (Users → Add a user). They sign in to BSO like everyone else and get a **My prospects** page.
+
+When a prospect replies **interested**, asks for a **meeting** or asks a **question**, the BSO that received the reply:
+1. sends the prospect a short introduction from the same inbox, in the same email thread, with the supervisor in CC (the wording is in BSO Settings → Handover);
+2. emails the supervisor a briefing with the prospect's details, their reply and every email sent to them;
+3. stops all automatic emails to that prospect and marks them as handed over.
+
+Supervisors take turns: each new prospect goes to the supervisor with the fewest in the last 30 days. Pausing a supervisor stops new prospects going to them. The prospect appears in the supervisor's BSO under **My prospects** the next time your Master Console syncs; the supervisor sets the stage there (Contacted → Meeting booked → Proposal sent → Won / Lost), and you follow it on the **Handovers** page, including how many hours each supervisor took to make a first update.
+
+In test mode, the introduction and the briefing both go to the test address instead.
+
 ## 4. What you control
 
 - **Pause / resume** an account: their BSO stops sending at its next check-in.

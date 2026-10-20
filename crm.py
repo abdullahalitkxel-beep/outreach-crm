@@ -9,6 +9,7 @@ import argparse
 import csv
 import io
 import json
+import re
 import os
 import subprocess
 import sys
@@ -210,6 +211,9 @@ def render(name, **ctx):
     nav = [("home", "Home", None), ("leads", "Leads", None), ("review", "Review", review_count or None),
            ("accounts", "Accounts", None), ("opportunities", "Opportunities", None),
            ("tasks", "Tasks", overdue or None), ("reports", "Reports", None), ("setup", "Getting Started", None), ("settings", "Settings", None)]
+    if (team.policy() or {}).get("role") == "supervisor" or one("SELECT COUNT(*) FROM leads WHERE handed_from IS NOT NULL"):
+        fresh = one("SELECT COUNT(*) FROM leads WHERE handed_from IS NOT NULL AND COALESCE(prospect_stage,'new')='new'")
+        nav.insert(1, ("prospects", "My prospects", fresh or None))
     active = {"lead": "leads", "new_lead": "leads", "import_page": "leads", "account": "accounts",
               "opp": "opportunities", "job": "setup", "jobs": "setup"}.get(request.endpoint, request.endpoint)
     return app.jinja_env.get_template(name).render(
@@ -286,6 +290,9 @@ def event_text(e):
         "error": ("sys", "!", f"Send error: {d}"),
         "converted": ("sys", "★", d),
         "opp_stage": ("sys", "→", f"Opportunity moved to {d}"),
+        "handover": ("sys", "🤝", f"Handed over to supervisor {d}"),
+        "handover_in": ("sys", "🤝", f"Handed over to you by {d}"),
+        "prospect_stage": ("sys", "→", f"Prospect stage: {PROSPECT_LABELS.get(d, d)}"),
     }.get(t, ("sys", "•", f"{t} {d}"))
     return {"icon": m[0], "letter": m[1], "title": m[2], "body": "", "text": m[2]}
 
@@ -762,6 +769,67 @@ def reports():
                   win_rate=f"{won / (won + lost):.0%}" if won + lost else "–")
 
 
+# ---------------------------------------------------------------- my prospects (lead gen supervisor)
+
+PROSPECT_LABELS = {"new": "New: not contacted yet", "contacted": "Contacted", "meeting": "Meeting booked",
+                   "proposal": "Proposal sent", "won": "Won", "lost": "Lost"}
+
+
+@app.route("/prospects")
+def prospects():
+    data = []
+    for r in rows("SELECT l.*, (SELECT MAX(at) FROM events e WHERE e.lead_id=l.id AND e.type='handover_in') handed_at_in "
+                  "FROM leads l WHERE l.handed_from IS NOT NULL "
+                  "ORDER BY CASE COALESCE(l.prospect_stage,'new') WHEN 'new' THEN 0 WHEN 'contacted' THEN 1 WHEN 'meeting' THEN 2 "
+                  "WHEN 'proposal' THEN 3 WHEN 'won' THEN 4 ELSE 5 END, handed_at_in DESC"):
+        r["x"] = json.loads(r.get("extra") or "{}")
+        r["name"] = " ".join(p for p in (r["first_name"], r["x"].get("last_name")) if p) or r["email"]
+        data.append(r)
+    counts = {k: sum(1 for d in data if (d["prospect_stage"] or "new") == k) for k in PROSPECT_LABELS}
+    return render("prospects.html", items=data, labels=PROSPECT_LABELS, counts=counts)
+
+
+@app.post("/prospects/<int:lead_id>/stage")
+def prospect_stage(lead_id):
+    st = request.form.get("stage", "")
+    if st not in PROSPECT_LABELS:
+        abort(400)
+    con = db()
+    con.execute("UPDATE leads SET prospect_stage=? WHERE id=? AND handed_from IS NOT NULL", (st, lead_id))
+    log_event(con, lead_id, "prospect_stage", st)
+    if st in ("won", "lost"):
+        con.execute("UPDATE tasks SET status='done', done_at=? WHERE lead_id=? AND status='open'", (today(), lead_id))
+    con.commit()
+    return redirect(request.form.get("back") or url_for("prospects"))
+
+
+# ---------------------------------------------------------------- handover settings
+
+@app.post("/settings/handover")
+def save_handover():
+    f = request.form
+    sups = []
+    for line in f.get("supervisors", "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^(.*?)[\s,;]*<?([^<>\s,;]+@[^<>\s,;]+)>?$", line)
+        if not m:
+            return redirect(url_for("settings", tab="handover", result=f"Couldn't read “{line}”. Use: Name <email@company.com>"))
+        sups.append({"name": m.group(1).strip() or m.group(2), "email": m.group(2).lower()})
+    tpl = f.get("intro_template", "").replace("\r\n", "\n").strip()
+    if tpl.replace(" ", "") == bot_default_intro().replace(" ", ""):
+        tpl = ""
+    write_settings({"handover": {"enabled": f.get("enabled") == "on", "intro_enabled": f.get("intro_enabled") == "on",
+                                 "intro_template": tpl, "supervisors": sups}})
+    return redirect(url_for("settings", tab="handover", result="Handover settings saved.", ok=1))
+
+
+def bot_default_intro():
+    from bot import DEFAULT_INTRO
+    return DEFAULT_INTRO
+
+
 # ---------------------------------------------------------------- review queue
 
 @app.route("/review")
@@ -1207,6 +1275,7 @@ def settings():
                         "SLACK_WEBHOOK_URL": mask(env("SLACK_WEBHOOK_URL"))},
                   tab=request.args.get("tab", "inbox"), result=request.args.get("result"),
                   ok=request.args.get("ok"), avoid_hits=template_avoid_hits(c), avoid_n=len(c.get("avoid_phrases") or []),
+                  ho=dict(c.get("handover") or {}), ho_default=bot_default_intro(), team_sups=team.supervisors() if team.joined() else [],
                   team=dict(team.state(), joined=team.joined(), policy=team.policy(), disclosure=team.DISCLOSURE, locked=team.locked_in(), signed=team.signed_in()))
 
 
