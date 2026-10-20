@@ -13,12 +13,23 @@ os.environ["HUB_HOME"] = str(tmp / "hub")
 import bot, team, hub  # noqa: E402,E401
 
 n = 0
+def gh_error(text):
+    if os.getenv("GITHUB_ACTIONS"):
+        print("::error title=bot_mode_test::" + text.replace("%", "%25").replace("\r", "").replace("\n", "%0A")[-3000:], flush=True)
+
 def check(cond, what):
     global n
     print(("PASS " if cond else "FAIL ") + what, flush=True)
     if not cond:
+        gh_error("FAIL " + what)
         sys.exit(1)
     n += 1
+
+def _crash(t, v, tb):
+    import traceback
+    gh_error("".join(traceback.format_exception(t, v, tb)))
+    sys.__excepthook__(t, v, tb)
+sys.excepthook = _crash
 
 con = bot.db_connect("outreach.db")
 cfg = bot.load_config(str(bot.DATA / "config.yaml"))
