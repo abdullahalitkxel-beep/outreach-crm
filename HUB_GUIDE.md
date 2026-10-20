@@ -85,6 +85,8 @@ Supervisors take turns: Google (your BSO relay script) decides whose turn it is,
 
 In test mode, the introduction and the briefing both go to the test address instead.
 
+**Supervisors work in one window.** In BSO, Settings → Handover → *Your mailbox*, each supervisor connects the mailbox they're introduced to (Google Workspace: imap.gmail.com / smtp.gmail.com with an app password). Each prospect's page in **My prospects** then shows the whole conversation (including replies sent from their normal email app), has a reply box that sends from their mailbox in the same thread, and new replies are flagged and counted in the menu. If a handed-over prospect writes to the original sender's inbox again, that BSO forwards it to the supervisor straight away and it appears in the conversation, so nothing slips through.
+
 ## 4. What you control
 
 - **Pause / resume** an account: their BSO stops sending at its next check-in.

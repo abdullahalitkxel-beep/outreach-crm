@@ -433,6 +433,24 @@ LEAD = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block titl
  </form>
 {% endcall %}
 {{ m.path(lead_open, l.stage, url_for('lead_stage', lead_id=l.id), closed_label, closed_cls, next_stage) }}
+{% if l.handed_from %}
+<div class="card" id="convo"><div class="card-h"><div class="tile t-opp">★</div><h2>Conversation with {{ l.first_name or l.email }}</h2>
+ <span class="muted" style="margin-left:6px">handed over by {{ l.handed_from }}</span><span style="flex:1"></span>
+ <form method="post" action="{{ url_for('prospect_stage', lead_id=l.id) }}" style="margin:0"><input type="hidden" name="back" value="{{ url_for('lead', lead_id=l.id) }}"><select name="stage" onchange="this.form.submit()">{% for k, lbl in prospect_labels.items() %}<option value="{{ k }}" {{ 'selected' if (l.prospect_stage or 'new') == k }}>{{ lbl }}</option>{% endfor %}</select></form>
+ {% if mailbox_ok %}<form method="post" action="{{ url_for('mailbox_check') }}" style="margin:0 0 0 6px"><input type="hidden" name="back" value="{{ url_for('lead', lead_id=l.id) }}"><button class="btn sm">↻ Check mailbox</button></form>{% endif %}</div>
+ <div class="card-b">
+ {% if not mailbox_ok %}<div class="help" style="margin-top:0">Connect your mailbox in <a href="{{ url_for('settings', tab='handover') }}#mailbox">Settings → Handover</a> to see and send this prospect's emails here.</div>{% endif %}
+ {% for msg in convo %}<div style="border:1px solid var(--line);border-left:4px solid {{ '#2e844a' if msg.direction == 'in' else '#0176d3' }};border-radius:6px;padding:10px 12px;margin-bottom:10px;{{ 'background:#f3fbf5' if msg.id in unseen_ids }}">
+  <div style="display:flex;gap:8px;flex-wrap:wrap"><b>{{ 'From ' ~ (l.first_name or l.email) if msg.direction == 'in' else msg.frm }}</b>{% if msg.id in unseen_ids %}<span class="badge b-ok">new</span>{% endif %}<span class="muted">{{ msg.at[:16].replace('T', ' ') }}{% if msg.via == 'bso' %} · sent from BSO{% endif %}</span></div>
+  <div class="muted" style="font-size:12px">{{ msg.subject }}{% if msg.cc %} · CC {{ msg.cc }}{% endif %}</div>
+  <div style="white-space:pre-wrap;margin-top:6px">{{ msg.body }}</div></div>
+ {% else %}<p class="muted">{{ 'No emails with this prospect in your mailbox yet. The reply that led to the handover is in the timeline below.' if mailbox_ok else '' }}</p>{% endfor %}
+ {% if mailbox_ok %}<form method="post" action="{{ url_for('prospect_reply', lead_id=l.id) }}" onsubmit="this.querySelector('button').disabled=true">
+  <label>Reply to {{ l.email }} <span class="muted">(from your mailbox, in the same thread)</span></label>
+  <textarea name="body" style="min-height:140px" required placeholder="Hi {{ l.first_name or '' }},">{{ request.args.get('draft', '') }}</textarea>
+  <div style="display:flex;gap:8px;align-items:end;margin-top:8px"><div style="flex:1"><label>CC (optional)</label><input name="cc" placeholder="colleague@company.com"></div><button class="btn brand">Send reply</button></div></form>{% endif %}
+ </div></div>
+{% endif %}
 {% if pending_draft %}{% call m.help('lead-draft-'~pending_draft.id, 'A draft email is waiting for your review.') %} <a href="{{ url_for('review') }}#d{{ pending_draft.id }}">Review it now →</a>{% endcall %}{% endif %}
 <div class="cols"><div>
  <div class="card"><div class="card-h"><h2>Details</h2></div><div class="card-b">
@@ -804,6 +822,20 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
 {% endfor %}</textarea>{% endif %}
  <p class="hint">Test mode: the introduction and the briefing both go to your test address instead.</p>
  <button class="btn brand" style="margin-top:12px">Save handover settings</button></form></div></div>
+<div class="card" id="mailbox"><div class="card-h"><h2>Your mailbox (supervisors)</h2>{% if pm.email and pm_pw %}<span class="badge b-ok">connected: {{ pm.email }}</span>{% endif %}</div><div class="card-b">
+ <p class="muted" style="margin-top:0">If you receive handed-over prospects, connect the mailbox they're introduced to (the one in CC). BSO then shows every email with each prospect on their page in <b>My prospects</b>, including replies you send from your normal email app, lets you reply from BSO in the same thread, and flags new replies. It checks every few minutes while BSO is open.</p>
+ <form method="post" action="{{ url_for('save_mailbox') }}"><div class="grid2">
+  <div><label>Your email address</label><input name="email" type="email" value="{{ pm.email or '' }}" placeholder="ali@blacswanken.com" required></div>
+  <div><label>Your name (what prospects see)</label><input name="name" value="{{ pm.name or '' }}" placeholder="Ali Khan"></div>
+  <div><label>Password {% if pm_pw %}<span class="badge b-ok">saved {{ pm_pw }}</span>{% endif %}</label><input name="password" type="password" autocomplete="new-password" placeholder="{{ 'Leave blank to keep the saved one' if pm_pw else 'Mailbox password or app password' }}"></div>
+  <div></div>
+  <div><label>Sending server (SMTP)</label><input name="smtp_host" value="{{ pm.smtp_host or '' }}" placeholder="smtp.gmail.com" required></div>
+  <div><label>SMTP port</label><input name="smtp_port" type="number" value="{{ pm.smtp_port or 465 }}"></div>
+  <div><label>Receiving server (IMAP)</label><input name="imap_host" value="{{ pm.imap_host or '' }}" placeholder="imap.gmail.com" required></div>
+  <div><label>IMAP port</label><input name="imap_port" type="number" value="{{ pm.imap_port or 993 }}"></div>
+ </div>
+ <p class="hint">Google Workspace / Gmail: smtp.gmail.com port 465, imap.gmail.com, and an <b>App password</b> (Google Account → Security → 2-Step Verification → App passwords). SiteGround: mail.yourdomain.com, ports 465 and 993, your mailbox password.</p>
+ <button class="btn brand" style="margin-top:8px">Save &amp; test mailbox</button></form></div></div>
 
 {% elif tab == 'team' %}
 {% if team.joined %}
@@ -894,10 +926,12 @@ ABOUT = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block tit
 PROSPECTS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}My prospects{% endblock %}{% block body %}
 {% call m.header('t-opp', '★', 'My prospects', items|length ~ ' handed over to you · ' ~ counts['new'] ~ ' not contacted yet') %}{% endcall %}
 <div class="help" style="margin-bottom:12px"><b>Prospects handed over to you.</b> Each one replied with interest, a meeting request or a question. Reply from your own mailbox (you were in CC on the introduction), then keep the stage up to date here; your manager sees it in the Master Console. Open a prospect for their reply, the full conversation, notes and tasks.</div>
-<div class="card">{% if items %}<table class="tbl"><thead><tr><th>Prospect</th><th>Company</th><th>Reply</th><th>Handed over by</th><th>Stage</th></tr></thead>
+{% if not mailbox_ok %}<div class="help" style="margin-bottom:12px;border-color:#dd7a01">⚠️ <b>Connect your mailbox</b> in <a href="{{ url_for('settings', tab='handover') }}#mailbox">Settings → Handover</a> so each prospect's emails appear here and you can reply from BSO.</div>
+{% else %}<form method="post" action="{{ url_for('mailbox_check') }}" style="margin:0 0 10px"><button class="btn">↻ Check mailbox now</button> <span class="muted">{{ unseen_total }} new repl{{ 'y' if unseen_total == 1 else 'ies' }}</span></form>{% endif %}
+<div class="card">{% if items %}<table class="tbl"><thead><tr><th>Prospect</th><th>Company</th><th>Conversation</th><th>Handed over by</th><th>Stage</th></tr></thead>
 {% for p in items %}<tr><td><a href="{{ url_for('lead', lead_id=p.id) }}"><b>{{ p.name }}</b></a><br><small class="muted">{{ p.x.title or '' }}<br>{{ p.email }}</small></td>
 <td>{{ p.company or '' }}{% if p.website %}<br><a href="https://{{ p.website }}" target="_blank" rel="noopener"><small>{{ p.website }} ↗</small></a>{% endif %}{% if p.x.linkedin %} <a href="{{ p.x.linkedin }}" target="_blank" rel="noopener"><small>LinkedIn ↗</small></a>{% endif %}</td>
-<td>{{ (p.x.handover_label or '').replace('_', ' ') }}</td><td>{{ p.handed_from }}<br><small class="muted">{{ (p.handed_at_in or '')[:10] }}</small></td>
+<td>{% if p.unseen %}<span class="badge b-ok">● {{ p.unseen }} new repl{{ 'y' if p.unseen == 1 else 'ies' }}</span><br>{% endif %}<small class="muted">{{ (p.x.handover_label or '').replace('_', ' ') }}{% if p.last_msg %}<br>last email {{ p.last_msg[:10] }} ({{ 'from them' if p.last_dir == 'in' else 'from you' }}){% endif %}</small></td><td>{{ p.handed_from }}<br><small class="muted">{{ (p.handed_at_in or '')[:10] }}</small></td>
 <td><form method="post" action="{{ url_for('prospect_stage', lead_id=p.id) }}"><select name="stage" onchange="this.form.submit()">{% for k, l in labels.items() %}<option value="{{ k }}" {{ 'selected' if (p.prospect_stage or 'new') == k }}>{{ l }}</option>{% endfor %}</select><noscript><button class="btn sm">Save</button></noscript></form></td></tr>{% endfor %}</table>
 {% else %}<div class="empty"><b>No prospects yet</b>When a prospect replies with interest, they're handed over to you here, and you also get a briefing email.</div>{% endif %}</div>
 {% endblock %}"""

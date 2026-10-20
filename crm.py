@@ -21,6 +21,7 @@ from flask import Flask, Response, abort, g, jsonify, redirect, request, url_for
 from jinja2 import DictLoader
 import brand
 import team
+import mailbox
 from bot import find_avoid, template_avoid_hits
 
 from bot import (DATA, HUMAN_STAGES, env, LEAD_OPEN_STAGES, OPP_OPEN_STAGES, OPP_STAGES, ROOT, STAGES, settings_path,
@@ -212,7 +213,8 @@ def render(name, **ctx):
            ("accounts", "Accounts", None), ("opportunities", "Opportunities", None),
            ("tasks", "Tasks", overdue or None), ("reports", "Reports", None), ("setup", "Getting Started", None), ("settings", "Settings", None)]
     if (team.policy() or {}).get("role") == "supervisor" or one("SELECT COUNT(*) FROM leads WHERE handed_from IS NOT NULL"):
-        fresh = one("SELECT COUNT(*) FROM leads WHERE handed_from IS NOT NULL AND COALESCE(prospect_stage,'new')='new'")
+        fresh = one("SELECT COUNT(*) FROM leads WHERE handed_from IS NOT NULL AND (COALESCE(prospect_stage,'new')='new' "
+                    "OR id IN (SELECT lead_id FROM messages WHERE direction='in' AND seen=0))")
         nav.insert(1, ("prospects", "My prospects", fresh or None))
     active = {"lead": "leads", "new_lead": "leads", "import_page": "leads", "account": "accounts",
               "opp": "opportunities", "job": "setup", "jobs": "setup"}.get(request.endpoint, request.endpoint)
@@ -410,7 +412,67 @@ def lead(lead_id):
         opps=rows("SELECT * FROM opportunities WHERE lead_id=?", lead_id),
         open_tasks=rows("SELECT * FROM tasks WHERE lead_id=? AND status='open' ORDER BY due_date", lead_id),
         timeline=timeline_for(lead_id), opp_open=OPP_OPEN_STAGES,
-        default_close=(date.today() + timedelta(days=30)).isoformat())
+        default_close=(date.today() + timedelta(days=30)).isoformat(), **prospect_ctx(lead_id, l))
+
+
+def prospect_ctx(lead_id, l):
+    """Conversation + reply box for a handed-over prospect (the supervisor's view)."""
+    if not l.get("handed_from"):
+        return {}
+    msgs = rows("SELECT * FROM messages WHERE lead_id=? ORDER BY at, id", lead_id)
+    unseen = [m["id"] for m in msgs if not m["seen"]]
+    if unseen:
+        db().execute(f"UPDATE messages SET seen=1 WHERE id IN ({','.join('?' * len(unseen))})", unseen)
+        db().commit()
+    return {"convo": msgs, "unseen_ids": unseen, "mailbox_ok": bool(mailbox.conf(cfg())), "prospect_labels": PROSPECT_LABELS}
+
+
+@app.post("/lead/<int:lead_id>/reply")
+def prospect_reply(lead_id):
+    ok, msg = mailbox.send_reply(cfg(), db(), lead_id, request.form.get("body", ""), request.form.get("cc", ""))
+    return redirect(url_for("lead", lead_id=lead_id, msg=msg, _anchor="convo") if ok else
+                    url_for("lead", lead_id=lead_id, msg=msg, draft=request.form.get("body", "")[:4000], _anchor="convo"))
+
+
+@app.post("/mailbox/check")
+def mailbox_check():
+    n, msg = mailbox.check(cfg(), db())
+    back = request.form.get("back") or url_for("prospects")
+    return redirect(back + ("&" if "?" in back else "?") + "msg=" + __import__("urllib.parse").parse.quote(msg))
+
+
+@app.post("/settings/mailbox")
+def save_mailbox():
+    f = request.form
+    m = {"email": f.get("email", "").strip().lower(), "name": f.get("name", "").strip(),
+         "smtp_host": f.get("smtp_host", "").strip(), "smtp_port": int(f.get("smtp_port") or 465),
+         "imap_host": f.get("imap_host", "").strip(), "imap_port": int(f.get("imap_port") or 993)}
+    write_settings({"prospect_mailbox": m})
+    if f.get("password"):
+        set_secret(mailbox.PW_KEY, f["password"])
+    ok, msg = test_inbox(m, env(mailbox.PW_KEY))
+    if ok:
+        n, more = mailbox.check(cfg(), db())
+        msg += " " + more
+    return redirect(url_for("settings", tab="handover", result=msg, ok=1 if ok else None))
+
+
+def _mailbox_loop():
+    """While BSO is open: check the supervisor's mailbox for prospect emails every few minutes."""
+    import time as _t
+    while True:
+        _t.sleep(180)
+        try:
+            if team.required() and not team.signed_in():
+                continue
+            c = load_config(CONFIG_PATH)
+            if not mailbox.conf(c):
+                continue
+            con = db_connect(c.get("database", "outreach.db"))
+            mailbox.check(c, con)
+            con.close()
+        except Exception as e:
+            print("mailbox:", e)
 
 
 @app.post("/lead/<int:lead_id>/update")
@@ -778,15 +840,19 @@ PROSPECT_LABELS = {"new": "New: not contacted yet", "contacted": "Contacted", "m
 @app.route("/prospects")
 def prospects():
     data = []
-    for r in rows("SELECT l.*, (SELECT MAX(at) FROM events e WHERE e.lead_id=l.id AND e.type='handover_in') handed_at_in "
+    for r in rows("SELECT l.*, (SELECT MAX(at) FROM events e WHERE e.lead_id=l.id AND e.type='handover_in') handed_at_in, "
+                  "(SELECT COUNT(*) FROM messages m WHERE m.lead_id=l.id AND m.direction='in' AND m.seen=0) unseen, "
+                  "(SELECT MAX(at) FROM messages m WHERE m.lead_id=l.id) last_msg, "
+                  "(SELECT direction FROM messages m WHERE m.lead_id=l.id ORDER BY at DESC, id DESC LIMIT 1) last_dir "
                   "FROM leads l WHERE l.handed_from IS NOT NULL "
-                  "ORDER BY CASE COALESCE(l.prospect_stage,'new') WHEN 'new' THEN 0 WHEN 'contacted' THEN 1 WHEN 'meeting' THEN 2 "
+                  "ORDER BY unseen > 0 DESC, CASE COALESCE(l.prospect_stage,'new') WHEN 'new' THEN 0 WHEN 'contacted' THEN 1 WHEN 'meeting' THEN 2 "
                   "WHEN 'proposal' THEN 3 WHEN 'won' THEN 4 ELSE 5 END, handed_at_in DESC"):
         r["x"] = json.loads(r.get("extra") or "{}")
         r["name"] = " ".join(p for p in (r["first_name"], r["x"].get("last_name")) if p) or r["email"]
         data.append(r)
     counts = {k: sum(1 for d in data if (d["prospect_stage"] or "new") == k) for k in PROSPECT_LABELS}
-    return render("prospects.html", items=data, labels=PROSPECT_LABELS, counts=counts)
+    return render("prospects.html", items=data, labels=PROSPECT_LABELS, counts=counts, mailbox_ok=bool(mailbox.conf(cfg())),
+                  unseen_total=sum(d["unseen"] for d in data))
 
 
 @app.post("/prospects/<int:lead_id>/stage")
@@ -1275,7 +1341,7 @@ def settings():
                         "SLACK_WEBHOOK_URL": mask(env("SLACK_WEBHOOK_URL"))},
                   tab=request.args.get("tab", "inbox"), result=request.args.get("result"),
                   ok=request.args.get("ok"), avoid_hits=template_avoid_hits(c), avoid_n=len(c.get("avoid_phrases") or []),
-                  ho=dict(c.get("handover") or {}), ho_default=bot_default_intro(), team_sups=team.supervisors() if team.joined() else [],
+                  ho=dict(c.get("handover") or {}), pm=dict(c.get("prospect_mailbox") or {}), pm_pw=mask(env(mailbox.PW_KEY)), ho_default=bot_default_intro(), team_sups=team.supervisors() if team.joined() else [],
                   team=dict(team.state(), joined=team.joined(), policy=team.policy(), disclosure=team.DISCLOSURE, locked=team.locked_in(), signed=team.signed_in()))
 
 

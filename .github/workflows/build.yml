@@ -55,6 +55,9 @@ jobs:
       - name: Test that nobody needs anybody else online
         run: python tests/offline_test.py
 
+      - name: Test the supervisor's mailbox inside BSO
+        run: python tests/mailbox_test.py
+
       - name: Test the AI line with thinking models
         run: python tests/llm_test.py
 
@@ -86,6 +89,7 @@ jobs:
           --hidden-import hub
           --hidden-import team
           --hidden-import relay
+          --hidden-import mailbox
           --hidden-import waitress
           --hidden-import secretstore
           --hidden-import bs4

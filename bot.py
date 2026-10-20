@@ -194,6 +194,10 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY, cmd TEXT, args TEXT, status TEXT, output TEXT, started_at TEXT, finished_at TEXT
 );
+CREATE TABLE IF NOT EXISTS messages (                -- a supervisor's emails with handed-over prospects
+    id INTEGER PRIMARY KEY, lead_id INTEGER, msg_id TEXT UNIQUE, direction TEXT, at TEXT, frm TEXT, to_ TEXT, cc TEXT,
+    subject TEXT, body TEXT, seen INTEGER DEFAULT 0, via TEXT
+);
 CREATE TABLE IF NOT EXISTS handover_out (                -- handovers waiting to reach the team hub
     id INTEGER PRIMARY KEY, lead_id INTEGER, supervisor TEXT, payload TEXT, at TEXT, synced INTEGER DEFAULT 0
 );
@@ -515,12 +519,14 @@ def render(template, lead, sender, cfg):
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def send_email(sender, to, subject, body, in_reply_to=None, dry_run=False, cc=None):
+def send_email(sender, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None):
     msg = EmailMessage()
     msg["From"] = f'{sender["name"]} <{sender["email"]}>'
     msg["To"] = to
     if cc:
         msg["Cc"] = cc
+    for k, v in (headers or {}).items():
+        msg[k] = v
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
     msg_id = make_msgid(domain=sender["email"].split("@")[1])
@@ -842,6 +848,9 @@ def handle_message(cfg, con, sender, msg):
         return
 
     lead = con.execute("SELECT * FROM leads WHERE email=?", (frm,)).fetchone()
+    if lead and lead["handed_to"] and lead["status"] not in ("unsubscribed", "bounced"):
+        forward_to_supervisor(cfg, con, dict(lead), sender, msg, body)   # nothing slips through after a handover
+        return
     if not lead or lead["status"] in ("replied", "unsubscribed", "not_interested", "bounced"):
         return
 
@@ -979,7 +988,8 @@ def handover(cfg, con, lead, sender, msg, body, label):
     lines.append("Reply to the prospect from your own mailbox. In BSO, open My prospects to track the stage, notes and tasks.")
     brief_to = redirect or sup["email"]
     try:
-        send_email(sender, brief_to, f"{'[TEST] ' if redirect else ''}Handover: {name}, {company} ({label.replace('_', ' ')})", "\n".join(lines))
+        send_email(sender, brief_to, f"{'[TEST] ' if redirect else ''}Handover: {name}, {company} ({label.replace('_', ' ')})", "\n".join(lines),
+                   headers={"X-BSO-Kind": "brief", "X-BSO-Prospect": lead["email"]})
     except Exception as e:
         log.error("Handover brief to %s failed: %s", sup["email"], e)
 
@@ -998,6 +1008,25 @@ def handover(cfg, con, lead, sender, msg, body, label):
     con.commit()
     notify(f"🤝 Handed over {name} ({company}) to {sup['name']}: {label.replace('_', ' ')} reply in {sender['email']}", cfg)
     return True
+
+
+def forward_to_supervisor(cfg, con, lead, sender, msg, body):
+    """A handed-over prospect wrote to the original inbox again: pass it to their supervisor straight away."""
+    tm = cfg.get("test_mode") or {}
+    redirect = tm.get("redirect_to") if tm.get("enabled") else None
+    name = lead.get("first_name") or lead["email"]
+    text = (f"{name} <{lead['email']}> wrote to {sender['email']} after being handed over to you.\n"
+            f"Reply to them directly (Reply goes to {lead['email']}).\n\n--- Their message ---\n{body.strip()[:8000]}")
+    try:
+        send_email(sender, redirect or lead["handed_to"], f"{'[TEST] ' if redirect else ''}Fwd: {msg.get('Subject', '')} ({name} replied to {sender['email']})",
+                   text, headers={"X-BSO-Kind": "forward", "X-BSO-Prospect": lead["email"], "Reply-To": lead["email"]})
+        log_event(con, lead["id"], "reply", "after handover: forwarded to supervisor", sender["email"])
+    except Exception as e:
+        log.error("Forward to supervisor %s failed: %s", lead["handed_to"], e)
+        add_task(con, f"Pass on a new email from {name} to {lead['handed_to']} (forwarding failed)", lead_id=lead["id"])
+    if classify_reply(cfg, msg, body) == "unsubscribe":
+        suppress(con, lead["email"], "unsubscribe")
+    con.commit()
 
 
 def process_inbox(cfg, con, sender):

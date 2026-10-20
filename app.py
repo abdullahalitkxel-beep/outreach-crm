@@ -166,6 +166,7 @@ def main():
     tray_ref = {}
     threading.Thread(target=crm._autorun_loop, daemon=True).start()
     threading.Thread(target=crm._team_loop, daemon=True).start()
+    threading.Thread(target=crm._mailbox_loop, daemon=True).start()
     threading.Thread(target=watchdog, args=(crm, tray_ref), daemon=True).start()
     server = threading.Thread(target=lambda: crm.app.run(host="127.0.0.1", port=PORT, threaded=True, use_reloader=False),
                               daemon=True)
