@@ -68,7 +68,7 @@ Roles: **owner** (everything, including users and settings), **manager** (sees e
 2. **Users → Add a user** (or the BSO Bot): in *Their sending inboxes* paste one line per inbox: `email, name prospects see, password`.
 3. On the laptop: install BSO, sign in with the ID and password you created, accept the terms. BSO sets itself up straight away: inboxes, passwords, keys, schedule.
 
-Later changes (a new inbox on the user's page, a new key or schedule in BSO setup) reach each BSO at its next check-in; nobody signs in again. The user page and BSO setup show **applied** once a BSO has it. Inbox passwords and keys are stored encrypted on the console computer and travel encrypted with the person's sign-in password, so Google Drive only ever holds scrambled data. For people created before this existed, enter their current BSO password once in the setup box on their page (or reset their password).
+Later changes (a new inbox on the user's page, a new key or schedule in BSO setup) reach each BSO at its next check-in; nobody signs in again. Many inboxes at once: **BSO setup → Import inboxes from a spreadsheet** (download the Excel template there). The user page and BSO setup show **applied** once a BSO has it. Inbox passwords and keys are stored encrypted on the console computer and travel encrypted with the person's sign-in password, so Google Drive only ever holds scrambled data. For people created before this existed, enter their current BSO password once in the setup box on their page (or reset their password).
 
 ## Running BSO as a bot (recommended)
 
