@@ -921,7 +921,13 @@ def handover(cfg, con, lead, sender, msg, body, label):
     hc = cfg.get("handover") or {}
     if not hc.get("enabled", True):
         return False
-    sup = pick_supervisor(cfg, con)
+    sup = None
+    try:
+        import team
+        sup = team.assign_supervisor(lead["email"])     # the always-on relay keeps the turns fair for everyone
+    except Exception as e:
+        log.warning("Supervisor assignment unavailable: %s", e)
+    sup = sup or pick_supervisor(cfg, con)
     if not sup:
         return False
     tm = cfg.get("test_mode") or {}

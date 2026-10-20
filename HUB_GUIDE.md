@@ -62,6 +62,16 @@ Until someone signs in, BSO opens nothing and sends nothing, including automatic
 
 Roles: **owner** (everything, including users and settings), **manager** (sees everyone, approves drafts, signs in to the console), **member** (uses BSO on their laptop).
 
+## Who needs to be online? Nobody, at the same time
+
+Your Google script is the always-on middle. Each person's BSO talks only to it, whenever that person is online:
+- a sender's BSO hands prospects over and reports activity;
+- a supervisor's BSO collects their queue and reports stages;
+- your Master Console, whenever you open it, collects everything that happened and publishes your changes (users, limits, pauses, approvals), which each person picks up at their next sign-in.
+Only decisions that need a person (for example a draft waiting for your approval) wait for that person.
+
+After updating BSO, update the script once: Master Console → Settings shows a red box with the steps when the script in Google is older than the one BSO ships (copy, paste over, Deploy → Manage deployments → Edit → New version). The address doesn't change.
+
 ## Handing interested prospects to supervisors
 
 Add one or more users with the role **Lead Gen Supervisor** (Users → Add a user). They sign in to BSO like everyone else and get a **My prospects** page.
@@ -71,7 +81,7 @@ When a prospect replies **interested**, asks for a **meeting** or asks a **quest
 2. emails the supervisor a briefing with the prospect's details, their reply and every email sent to them;
 3. stops all automatic emails to that prospect and marks them as handed over.
 
-Supervisors take turns: each new prospect goes to the supervisor with the fewest in the last 30 days. Pausing a supervisor stops new prospects going to them. The prospect appears in the supervisor's BSO under **My prospects** the next time your Master Console syncs; the supervisor sets the stage there (Contacted → Meeting booked → Proposal sent → Won / Lost), and you follow it on the **Handovers** page, including how many hours each supervisor took to make a first update.
+Supervisors take turns: Google (your BSO relay script) decides whose turn it is, so it's fair across the whole team. Pausing a supervisor stops new prospects going to them. The prospect waits in that supervisor's own queue in your Drive and appears under **My prospects** as soon as they sign in, on any computer; a new laptop gets all their prospects back with their stages. Nobody needs anyone else, including you, to be online; the supervisor sets the stage there (Contacted → Meeting booked → Proposal sent → Won / Lost), and you follow it on the **Handovers** page, including how many hours each supervisor took to make a first update.
 
 In test mode, the introduction and the briefing both go to the test address instead.
 

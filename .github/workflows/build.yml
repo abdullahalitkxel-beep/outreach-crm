@@ -52,6 +52,9 @@ jobs:
       - name: Test handing prospects to supervisors (two laptops and the relay)
         run: python tests/handover_test.py
 
+      - name: Test that nobody needs anybody else online
+        run: python tests/offline_test.py
+
       - name: Test the AI line with thinking models
         run: python tests/llm_test.py
 

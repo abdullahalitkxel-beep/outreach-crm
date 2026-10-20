@@ -39,7 +39,7 @@ import brand
 import relay
 
 ROLES = ("owner", "manager", "member", "supervisor")
-EVENT_TYPES = ("sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "handover", "prospect_stage", "settings", "app_start", "paused")
+EVENT_TYPES = ("sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "handover", "handover_in", "prospect_stage", "settings", "app_start", "paused")
 ONLINE_MINUTES = 10
 GRACE_HOURS = 72
 DEFAULT_PUBLIC_URL = ""          # set in Settings if you run this console as a server for the team
@@ -772,7 +772,8 @@ def hub_settings():
                 db().commit()
                 audit("password_changed")
                 msg = "Password changed."
-    return render("settings.html", msg=msg, smtp=smtp_conf(), relay_url=meta_get("relay_url", ""), relay_ok=meta_get("relay_last_ok", ""),
+    return render("settings.html", msg=msg, smtp=smtp_conf(), relay_url=meta_get("relay_url", ""), relay_version=int(meta_get("relay_version", "1") or 1),
+                  relay_latest=RELAY_LATEST, relay_ok=meta_get("relay_last_ok", ""),
                   relay_err=meta_get("relay_last_error", ""), relay_script=relay.script_text(relay_key(create=True)), public_url=meta_get("public_url", DEFAULT_PUBLIC_URL), grace=meta_get("grace_hours", str(GRACE_HOURS)), tab="settings")
 
 
@@ -839,6 +840,8 @@ def ingest(con, uid, j):
                          str(e.get("sender") or "")[:120], str(e.get("lead_email") or "")[:200], str(e.get("company") or "")[:200],
                          e.get("step"), str(e.get("variant") or "")[:80]))
             n_ev += 1
+            if e.get("type") == "handover_in" and e.get("lead_email"):
+                con.execute("UPDATE handovers SET delivered=1 WHERE supervisor_id=? AND lead_email=?", (uid, str(e["lead_email"]).lower()))
             if e.get("type") == "prospect_stage" and e.get("lead_email"):
                 con.execute("UPDATE handovers SET status=?, status_at=? WHERE supervisor_id=? AND lead_email=?",
                             (str(e.get("detail", ""))[:30], str(e.get("at", iso()))[:25], uid, str(e["lead_email"]).lower()))
@@ -887,6 +890,16 @@ def store_handover(con, uid, h):
                 (uid, lid, sup["id"] if sup else None, str(h.get("label", ""))[:30], str(h.get("at") or iso())[:25],
                  str(lead.get("email", "")).lower()[:200], name[:200], str(lead.get("company") or "")[:200], str(lead.get("title") or "")[:200],
                  json.dumps(h)[:60000]))
+    # the supervisor's own reports may have arrived first (nobody waits for anybody): apply them now
+    if sup:
+        email = str(lead.get("email", "")).lower()
+        got = con.execute("SELECT 1 FROM events WHERE user_id=? AND type='handover_in' AND lower(lead_email)=?", (sup["id"], email)).fetchone()
+        last = con.execute("SELECT detail, at FROM events WHERE user_id=? AND type='prospect_stage' AND lower(lead_email)=? ORDER BY at DESC, id DESC LIMIT 1",
+                           (sup["id"], email)).fetchone()
+        if got:
+            con.execute("UPDATE handovers SET delivered=1 WHERE supervisor_id=? AND lead_email=?", (sup["id"], email))
+        if last:
+            con.execute("UPDATE handovers SET status=?, status_at=? WHERE supervisor_id=? AND lead_email=?", (last["detail"], last["at"], sup["id"], email))
 
 
 def supervisor_config(con):
@@ -898,11 +911,13 @@ def supervisor_config(con):
     return {"action": "config", "local_id": None, "supervisors": sups, "as_of": last}
 
 
-def decisions_for(con, uid):
+def decisions_for(con, uid, handovers=True):
     out = [{"local_id": d["local_id"], "action": "approve" if d["status"] == "approved" else "reject",
             "subject": d["subject"], "body": d["body"], "by": d["decided_by"]}
            for d in con.execute("SELECT * FROM drafts WHERE user_id=? AND status!='pending' AND delivered=0", (uid,)).fetchall()]
     out.append(supervisor_config(con))
+    if not handovers:          # the Google relay (version 2+) delivers handovers to the supervisor itself
+        return out
     for h in con.execute("SELECT h.*, u.name fromname FROM handovers h LEFT JOIN users u ON u.id=h.from_user_id "
                          "WHERE h.supervisor_id=? AND h.delivered=0 ORDER BY h.id LIMIT 25", (uid,)).fetchall():
         p = json.loads(h["payload"] or "{}")
@@ -931,6 +946,7 @@ def api_sync():
 # this console publishes users, limits and decisions to it and collects the reports, about once a minute.
 
 RELAY_EVERY = 60
+RELAY_LATEST = 2          # version of relay/Code.gs shipped with this BSO
 _relay_lock = threading.Lock()
 
 
@@ -970,9 +986,9 @@ def relay_doc(con):
         ident = u["username"] or u["email"]
         # relay keys can't contain dots (they're part of the sign-in token); the ID itself is matched via "email"
         users[relay_key_for(ident)] = dict(
-            rec, name=u["name"], email=ident, role=u["role"], status="disabled" if u["status"] == "disabled" else "active",
+            rec, name=u["name"], email=ident, mail=u["email"], role=u["role"], status="disabled" if u["status"] == "disabled" else "active",
             tv=u["tv"] or 1, daily_cap=u["daily_cap"] or 0, weekly_target=u["weekly_target"] or 0, approval=u["approval"] or "member",
-            decisions=decisions_for(con, u["id"]))
+            decisions=decisions_for(con, u["id"], handovers=int(_m_get(con, "relay_version", "1") or 1) < 2))
     return {"org": _m_get(con, "org_name", "Your team"), "grace_hours": int(_m_get(con, "grace_hours", str(GRACE_HOURS)) or 0), "users": users}
 
 
@@ -993,6 +1009,8 @@ def relay_cycle(con=None):
                     rounds += 1
                     res = relay.call(url, {"action": "admin_pull", "admin_key": key, "done": done})
                     done = []
+                    if str(res.get("relay_version", "1")) != _m_get(con, "relay_version", "1"):
+                        _m_set(con, "relay_version", str(res.get("relay_version", "1")))
                     for it in res.get("items") or []:
                         body = it.get("body") or {}
                         who = ident_from_relay(body.get("user"))
@@ -1192,9 +1210,11 @@ T["activity.html"] = """{% extends 'base.html' %}{% block title %}Activity{% end
 T["audit.html"] = """{% extends 'base.html' %}{% block title %}Audit log{% endblock %}{% block body %}<div class="card"><div class="card-h"><h2>Who changed what in this console</h2></div><table><tr><th>When</th><th>Who</th><th>Action</th><th>Detail</th></tr>{% for r in rows %}<tr><td class="muted">{{ r.at|dt }}</td><td>{{ r.actor }}</td><td>{{ r.action }}</td><td>{{ r.detail }}</td></tr>{% endfor %}</table></div>{% endblock %}"""
 T["settings.html"] = """{% extends 'base.html' %}{% block title %}Settings{% endblock %}{% block body %}{% if msg %}<div class="note">{{ msg }}</div>{% endif %}
 <div class="card"><div class="card-h"><h2>Team connection through your Google Drive</h2>{% if relay_url and relay_ok and not relay_err %}<span class="badge b-ok">Connected</span>{% elif relay_url %}<span class="badge b-bad">Problem</span>{% else %}<span class="badge b-warn">Not set up</span>{% endif %}</div><div class="card-b">
+{% if relay_url and relay_version < relay_latest %}<div class="err"><b>Update your Google script (one time, the address stays the same).</b> With the new version, handovers, queues and supervisors' prospects are handled by Google itself, so nobody ever needs this console to be open.
+<ol style="margin:6px 0 0"><li>Click <b>Copy script</b> below.</li><li>In script.google.com, open your BSO project, select all the code, paste over it and <b>Save</b>.</li><li><b>Deploy → Manage deployments →</b> pencil (Edit) <b>→ Version: New version → Deploy</b>.</li><li>Back here, click <b>Sync now</b>. This message disappears when the update is detected.</li></ol></div>{% endif %}
 {% if relay_url %}<p style="margin-top:0">Team laptops sign in and report through <b>{{ relay_url }}</b>. Last sync: {{ relay_ok|dt if relay_ok else 'never' }}.{% if relay_err %}<br><span style="color:#ba0517">{{ relay_err }}</span>{% endif %}</p>
 <form method="post" style="display:inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" name="action" value="relay_sync">Sync now</button></form>
-<details style="margin-top:12px"><summary>Set up again or change the address</summary>{% endif %}
+<details style="margin-top:12px" {{ 'open' if relay_version < relay_latest }}><summary>Set up again or change the address</summary>{% endif %}
 <ol style="line-height:1.7">
 <li>Copy this script (it is unique to this console; keep it private): <button type="button" class="btn" data-copy="relayscript" style="padding:3px 10px">Copy script</button> or <a href="{{ url_for('relay_script') }}">download Code.gs</a>
 <textarea id="relayscript" readonly style="min-height:90px;margin-top:6px">{{ relay_script }}</textarea></li>

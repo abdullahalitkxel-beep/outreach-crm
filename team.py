@@ -26,7 +26,7 @@ from bot import add_task, DATA, SECRETS, env, log_event, now_utc, iso, set_stage
 TOKEN_KEY = "BSO_TEAM_TOKEN"
 STATE = Path(DATA) / "team.json"
 CONSENT_VERSION = "1"
-SHARED_TYPES = {"sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "handover", "prospect_stage"}
+SHARED_TYPES = {"sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "handover", "handover_in", "prospect_stage"}
 PROSPECT_STAGES = ["new", "contacted", "meeting", "proposal", "won", "lost"]
 DISCLOSURE = [
     "Your manager can see how many emails you send, which leads they go to (email address and company), which step, and from which of your inboxes.",
@@ -251,6 +251,9 @@ def sign_in(con, username, password, consent=False, hub=None):
     save_state(s)
     SIGNED_IN.clear()
     SIGNED_IN.update(user=username, name=pol.get("name", username))
+    if first_time:
+        restore(con)
+        sync(con)          # pick up anything waiting in this person's queue straight away
     return pol
 
 
@@ -314,11 +317,16 @@ def supervisors():
     return [sv for sv in (state().get("supervisors") or []) if sv.get("email")]
 
 
-def _receive_handover(con, d):
-    """A prospect handed to me (I'm a supervisor): add it to My prospects."""
+def _receive_handover(con, d, restoring=False):
+    """A prospect handed to me (I'm a supervisor): add it to My prospects (once, however often it arrives)."""
     L = d.get("lead") or {}
     email = str(L.get("email") or "").strip().lower()
     if not email:
+        return
+    have = con.execute("SELECT id FROM leads WHERE email=? AND handed_from IS NOT NULL", (email,)).fetchone()
+    if have:
+        if restoring and d.get("stage"):
+            con.execute("UPDATE leads SET prospect_stage=? WHERE id=?", (d["stage"], have["id"]))
         return
     at = iso(now_utc())
     who_from = d.get("from") or d.get("from_name") or "a colleague"
@@ -328,12 +336,13 @@ def _receive_handover(con, d):
     if row:
         lid = row["id"]
         merged = dict(json.loads(row["extra"] or "{}"), **extra)
-        con.execute("UPDATE leads SET handed_from=?, prospect_stage=COALESCE(prospect_stage,'new'), status='replied', extra=? WHERE id=?",
-                    (who_from, json.dumps(merged), lid))
+        con.execute("UPDATE leads SET handed_from=?, prospect_stage=?, status='replied', extra=? WHERE id=?",
+                    (who_from, d.get("stage") or "new", json.dumps(merged), lid))
     else:
         con.execute("INSERT INTO leads(email, first_name, company, website, extra, status, step, created_at, stage, handed_from, prospect_stage) "
-                    "VALUES (?,?,?,?,?,'replied',0,?,'qualified',?,'new')",
-                    (email, L.get("first_name") or "", L.get("company") or "", L.get("website") or "", json.dumps(extra), at, who_from))
+                    "VALUES (?,?,?,?,?,'replied',0,?,'qualified',?,?)",
+                    (email, L.get("first_name") or "", L.get("company") or "", L.get("website") or "", json.dumps(extra), at, who_from,
+                     d.get("stage") or "new"))
         lid = con.execute("SELECT id FROM leads WHERE email=?", (email,)).fetchone()["id"]
     text = [f"Handed over by {who_from} ({str(d.get('label', '')).replace('_', ' ')} reply) on {str(d.get('at', at))[:16].replace('T', ' ')}.",
             "", "--- Their reply ---", d.get("reply") or "(not available)"]
@@ -343,9 +352,49 @@ def _receive_handover(con, d):
         text += ["", f"--- Our email {i} ({str(t.get('at', ''))[:10]}): {t.get('subject', '')} ---", t.get("body", "")]
     con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'email')", (lid, "\n".join(text), at))
     name = " ".join(p for p in (L.get("first_name"), L.get("last_name")) if p) or email
-    add_task(con, f"Contact {name}{' at ' + L['company'] if L.get('company') else ''}: handed over by {who_from}",
-             due_date=at[:10], lead_id=lid)
+    if (d.get("stage") or "new") == "new":
+        add_task(con, f"Contact {name}{' at ' + L['company'] if L.get('company') else ''}: handed over by {who_from}",
+                 due_date=at[:10], lead_id=lid)
     log_event(con, lid, "handover_in", who_from)
+
+
+def assign_supervisor(lead_email):
+    """Ask the always-on Google relay whose turn it is (fair across the whole team). None if it can't answer."""
+    s = state()
+    if not (joined() and relay.is_relay(s.get("hub", "")) and int(s.get("relay_version") or 1) >= 2):
+        return None
+    try:
+        r = relay.call(s["hub"], {"action": "assign", "token": env(TOKEN_KEY), "lead_email": lead_email}, timeout=30)
+    except relay.RelayError as e:
+        print("assign:", e)
+        return None
+    sv = r.get("supervisor")
+    return {"id": sv["id"], "name": sv["name"], "email": sv["email"], "count": 0} if sv else None
+
+
+def restore(con):
+    """First sign-in on this computer: bring back everything that belongs to this person (handed-over prospects and their stages)."""
+    s = state()
+    if not (relay.is_relay(s.get("hub", "")) and env(TOKEN_KEY)):
+        return 0
+    try:
+        r = relay.call(s["hub"], {"action": "restore", "token": env(TOKEN_KEY)}, timeout=60)
+    except relay.RelayError as e:
+        print("restore:", e)
+        return 0
+    n = 0
+    for item in r.get("items") or []:
+        try:
+            _receive_handover(con, item, restoring=True)
+            n += 1
+        except Exception as e:
+            print("restore item:", e)
+    con.commit()
+    s = state()
+    s["relay_version"] = int(r.get("relay_version") or s.get("relay_version") or 1)
+    s["restored"] = True
+    save_state(s)
+    return n
 
 
 def _apply_decisions(con, decisions):
@@ -419,6 +468,7 @@ def sync(con, version=""):
         s["last_event_id"] = events[-1]["id"]
     s["drafts_sent"] = sorted(set(s.get("drafts_sent", [])) | {d["id"] for d in drafts})[-2000:]
     s["policy"] = j.get("policy") or s.get("policy", {})
+    s["relay_version"] = int(j.get("relay_version") or (1 if relay.is_relay(s["hub"]) else 0))
     s["last_ok"] = iso(now_utc())
     if handovers:
         con.execute(f"UPDATE handover_out SET synced=1 WHERE id IN ({','.join('?' * len(handovers))})", [h["out_id"] for h in handovers])
