@@ -1,3 +1,2 @@
-# The master hub address built into BSO. Team members never type it.
+# The team address built into BSO (the Google Drive relay's Web app URL). Team members never type it.
 # Put the full https:// address on the line below (one line, no spaces), then rebuild.
-https://hub.blacswanken.com

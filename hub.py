@@ -42,7 +42,7 @@ ROLES = ("owner", "manager", "member")
 EVENT_TYPES = ("sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "settings", "app_start", "paused")
 ONLINE_MINUTES = 10
 GRACE_HOURS = 72
-DEFAULT_PUBLIC_URL = "https://hub.blacswanken.com"   # the address built into BSO (hub_address.txt)
+DEFAULT_PUBLIC_URL = ""          # set in Settings if you run this console as a server for the team
 _lock = threading.Lock()
 
 

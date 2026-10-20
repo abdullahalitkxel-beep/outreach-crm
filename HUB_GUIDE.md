@@ -26,14 +26,14 @@ To update the script later, use **Deploy → Manage deployments → Edit → Ver
 
 Limits: Google's free quotas are comfortably enough for a team of about 20–30 people checking in every couple of minutes.
 
-## Alternative: your own server at https://hub.blacswanken.com
+## Alternative: your own server
 
-That address is built into BSO, so team members only ever type their ID and password. It has to lead to the computer running the master console. The simplest free way is a Cloudflare Tunnel (no open ports, HTTPS included):
+Instead of Google Drive, the console can serve the team directly from an address such as https://hub.your-company.com. That address has to lead to the computer running the master console. The simplest free way is a Cloudflare Tunnel (no open ports, HTTPS included):
 
 1. Add the blacswanken.com domain to a free Cloudflare account (Cloudflare shows the two name-server addresses to set at your domain registrar).
 2. In Cloudflare: Zero Trust → Networks → Tunnels → Create a tunnel → Cloudflared. Install the connector it shows on the hub computer.
 3. Add a public hostname: subdomain `hub`, domain `blacswanken.com`, service `http://localhost:8780`.
-4. Open https://hub.blacswanken.com: the master console sign-in page should appear.
+4. Open the address: the master console sign-in page should appear.
 
 The hub computer must stay on and awake while the team works. Until the address is live, BSO on the hub computer itself signs in to the local console automatically; other laptops can't sign in yet.
 

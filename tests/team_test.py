@@ -36,7 +36,7 @@ def csrf(path="/login"):
 
 check(b"omar@blacswanken.com" in c.get("/setup").data, "setup page pre-fills the master email")
 # --- owner setup and login
-check(BUILT_IN == "https://hub.blacswanken.com", "hub.blacswanken.com is built in")
+check(BUILT_IN == "", "no team address built in until the Google Drive relay address is known")
 check(c.get("/").status_code == 302, "console needs sign-in")
 rc = hub.app.test_client()
 REMOTE = {"REMOTE_ADDR": "203.0.113.9"}
@@ -215,7 +215,7 @@ check(r.status_code == 302, "first sign-in with hub address works")
 r = w0.get("/")
 check(r.status_code == 302 and "/welcome" in r.headers["Location"], "after sign-in, terms come next")
 w0.post("/signout")
-_sp = w0.get("/signin").data; check(b"Hub address: http://127.0.0.1:8791" in _sp, "hub address is remembered")
+_sp = w0.get("/signin").data; check(b"Team address: http://127.0.0.1:8791" in _sp, "team address is remembered")
 (tmp / "laptop" / "team-defaults.json").unlink(missing_ok=True)
 _orig_bi = team.built_in_hub
 team.built_in_hub = lambda: "http://127.0.0.1:8791"

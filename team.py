@@ -126,7 +126,7 @@ def sign_out():
 def check_hub_url(url):
     url = (url or "").strip().rstrip("/")
     if not url:
-        raise ValueError("Enter the hub address your admin gave you.")
+        raise ValueError("Enter the team address your admin gave you.")
     if "://" not in url:
         url = "https://" + url
     u = urlparse(url)
@@ -212,7 +212,10 @@ def sign_in(con, username, password, consent=False, hub=None):
     first_time = s.get("username") != username
     if first_time and not consent:
         raise ValueError("Tick the box to confirm you've read what your manager will be able to see.")
-    url = check_hub_url(hub or hub_url())
+    target = hub or hub_url()
+    if not target and _local_hub_running():
+        target = LOCAL_HUB          # the computer that runs the Master Console needs no address
+    url = check_hub_url(target)
     device = os.getenv("COMPUTERNAME") or socket.gethostname()
     try:
         try:

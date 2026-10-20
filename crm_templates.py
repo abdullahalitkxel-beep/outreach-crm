@@ -896,8 +896,8 @@ details{margin-top:14px;font-size:13px;color:#3e3e3c}summary{cursor:pointer;colo
  <form method="post" action="{{ url_for('signin') }}"><input type="hidden" name="next" value="{{ nxt }}">
   <label for="u">ID</label><input id="u" type="text" name="username" value="{{ last_user }}" autocomplete="username" autocapitalize="none" spellcheck="false" required {{ '' if last_user else 'autofocus' }}>
   <label for="p">Password</label><input id="p" type="password" name="password" autocomplete="current-password" required {{ 'autofocus' if last_user else '' }}>
-  {% if not hub_fixed %}{% if hub_known %}<details><summary>Hub address: {{ hub }}</summary><label>Change it only if your admin tells you to</label><input name="hub" value="{{ hub }}"></details>
-  {% else %}<label>Hub address <span style="color:#706e6b">(from your admin)</span></label><input name="hub" value="" placeholder="https://hub.your-company.com" required>{% endif %}{% endif %}
+  {% if not hub_fixed %}{% if hub_known %}<details><summary>Team address: {{ hub }}</summary><label>Change it only if your admin tells you to</label><input name="hub" value="{{ hub }}"></details>
+  {% else %}<label>Team address <span style="color:#706e6b">(from your admin; leave empty on the computer running the Master Console)</span></label><input name="hub" value="" placeholder="https://script.google.com/macros/s/…/exec">{% endif %}{% endif %}
   {% if first %}<details open><summary>What your manager can see</summary><ul>{% for line in disclosure %}<li>{{ line }}</li>{% endfor %}</ul></details>
   <label class="chk"><input type="checkbox" name="consent" value="1"> I've read this and I agree.</label>
   {% else %}<details><summary>What your manager can see</summary><ul>{% for line in disclosure %}<li>{{ line }}</li>{% endfor %}</ul></details>{% endif %}
