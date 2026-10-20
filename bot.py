@@ -14,6 +14,7 @@ import argparse
 import csv
 import email
 import imaplib
+import io
 import json
 import logging
 import os
@@ -831,7 +832,83 @@ def notify(text, cfg=None):
             log.warning("Slack notify failed: %s", e)
 
 
+# ---------------------------------------------------------------- leads by email
+
+INTAKE_TYPES = (".csv", ".xlsx", ".xlsm")
+INTAKE_MAX_BYTES = 15 * 1024 * 1024
+
+
+def _sender_verified(msg, addr):
+    """True when the receiving mail server confirmed the sender (DMARC, or DKIM signed by the sender's own domain)."""
+    ar = " ".join(str(h) for h in (msg.get_all("Authentication-Results") or [])).lower()
+    dom = addr.split("@")[-1].lower()
+    return "dmarc=pass" in ar or ("dkim=pass" in ar and f"header.d={dom}" in ar)
+
+
+def intake_message(cfg, con, sender, msg):
+    """A lead file emailed to the bot's intake inbox by an allowed person: import it and reply with the result.
+    Returns True when the message was an intake email (handled here), False otherwise."""
+    li = cfg.get("lead_intake") or {}
+    allowed = {a.strip().lower() for a in li.get("allowed_senders") or [] if a.strip()}
+    if not li.get("enabled") or not allowed or sender["email"].lower() != str(li.get("inbox", "")).lower():
+        return False
+    frm = parseaddr(msg.get("From", ""))[1].lower()
+    if frm not in allowed:
+        return False
+    files = []
+    for part in msg.walk():
+        name = part.get_filename() or ""
+        if name.lower().endswith(INTAKE_TYPES):
+            files.append((name, part.get_payload(decode=True) or b""))
+    subject = msg.get("Subject", "") or "Leads"
+    def answer(text):
+        try:
+            send_email(sender, frm, subject if subject.lower().startswith("re:") else "Re: " + subject, text, msg.get("Message-ID"),
+                       headers={"X-BSO-Kind": "intake"})
+        except Exception as e:
+            log.error("Couldn't answer the lead file email: %s", e)
+    if not files:
+        answer("BSO found no lead file in your email. Attach a CSV or Excel (.xlsx) file with one lead per row and an email column, and send it again.")
+        return True
+    if li.get("verified_only", True) and not _sender_verified(msg, frm):
+        log.warning("Lead file from %s refused: sender not verified by the mail server", frm)
+        answer("BSO did not import this file: the mail server couldn't confirm it really came from your address (no DMARC/DKIM pass). "
+               "If you sent it, ask your admin to switch off \"verified senders only\" in BSO → Settings → Lead targeting, or send from your company mailbox.")
+        notify(f"⚠ A lead file emailed from {frm} was refused because the sender couldn't be verified.", cfg)
+        return True
+    status = "active" if li.get("add_to_sequence", True) else "paused"
+    lines, total = [], 0
+    for name, data in files:
+        if len(data) > INTAKE_MAX_BYTES:
+            lines.append(f"{name}: too large (over 15 MB), not imported.")
+            continue
+        try:
+            if name.lower().endswith(".csv"):
+                try:
+                    text = data.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    text = data.decode("latin-1")
+                rows = read_rows(io.StringIO(text), name)
+            else:
+                rows = read_rows(io.BytesIO(data), name)
+            added, skipped = import_rows(con, rows, status, source=f"emailed by {frm}: {name}")
+        except Exception as e:
+            lines.append(f"{name}: couldn't be read ({e}). Check it's a normal CSV or Excel file with a header row.")
+            continue
+        total += added
+        why = ", ".join(f"{n} {r}" for r, n in sorted(skipped.items(), key=lambda x: -x[1])) or "none"
+        lines.append(f"{name}: {added} lead(s) added. Skipped: {why}.")
+    seq = "They're in the email sequence and get their first email on the next runs." if status == "active" else "They were added without starting the email sequence."
+    waiting = con.execute("SELECT COUNT(*) FROM leads WHERE status='active' AND step=0").fetchone()[0]
+    answer("BSO imported your lead file.\n\n" + "\n".join(lines) + (f"\n\n{seq}" if total else "") +
+           f"\n\nLeads waiting for their first email: {waiting}.")
+    notify(f"📥 {total} lead(s) imported from a file emailed by {frm}", cfg)
+    return True
+
+
 def handle_message(cfg, con, sender, msg):
+    if intake_message(cfg, con, sender, msg):
+        return
     frm = parseaddr(msg.get("From", ""))[1].lower()
     body = get_text_body(msg)
 

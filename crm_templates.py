@@ -183,7 +183,7 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
     <button onclick="resetHelp()">Show all help tips again</button>
     <a href="{{ url_for('settings') }}">Settings</a>
     <a href="{{ url_for('about') }}">About &amp; legal</a>
-    {% if team_user %}<div class="muted" style="padding:6px 12px">Signed in as {{ team_name or team_user }}</div><form method="post" action="{{ url_for('signout') }}"><button>Sign out</button></form>{% endif %}
+    {% if team_user %}<div class="muted" style="padding:6px 12px">Signed in as {{ team_name or team_user }}{{ ' (bot, stays signed in)' if team_bot }}</div><form method="post" action="{{ url_for('signout') }}"><button>Sign out</button></form>{% endif %}
     <form method="post" action="{{ url_for('quit_app') }}" onsubmit="return confirm('Stop BSO? Automatic runs stop until you open it again.')"><button>Quit the app</button></form>
    </div>
   </div>
@@ -732,6 +732,9 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <label class="switch"><input type="checkbox" name="autorun" {{ 'checked' if (c.autorun or {}).enabled }}><span></span><b>Run automatically</b> and keep running in the background</label>
  <div style="max-width:220px"><label>Every</label><select name="every_minutes">{% for mins, lbl in [(30,'30 minutes'),(60,'hour'),(120,'2 hours'),(240,'4 hours')] %}<option value="{{ mins }}" {{ 'selected' if (c.autorun or {}).every_minutes == mins or (not (c.autorun or {}).every_minutes and mins == 60) }}>{{ lbl }}</option>{% endfor %}</select></div>
  <p class="hint">Each run drafts emails for due leads, sends approved ones (only in your sending hours, unless test mode is on) and checks for replies. When this is on, closing the window leaves the app running with an icon next to the clock (right-click it to open or quit). When it's off, closing the window quits the app.</p>
+ {% if startup_ok %}<label class="switch"><input type="checkbox" name="start_with_windows" {{ 'checked' if startup_on }}><span></span><b>Start BSO when Windows starts</b> &mdash; in the background, with the icon next to the clock</label>
+ <p class="hint">For the computer that runs the campaigns. With <b>Run automatically</b> on, BSO also stops Windows from going to sleep. Closing a laptop's lid still sleeps it unless you set Windows → Settings → System → Power → <i>Lid close action: Do nothing</i> (when plugged in).</p>{% endif %}
+ {% if is_bot %}<p class="hint">This BSO is signed in as the <b>BSO Bot</b>: it stays signed in after a restart, so campaigns carry on by themselves.</p>{% endif %}
  <button class="btn brand" style="margin-top:12px">Save</button></form></div></div>
 
 {% elif tab == 'keys' %}
@@ -796,6 +799,17 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <p class="hint">Only Apollo-verified emails are kept, and each lead costs about 1 Apollo credit.</p>
  <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px"><button class="btn brand">Save targeting</button>
  <button class="btn" formaction="{{ url_for('job_start') }}" name="cmd" value="apollo-preview">Preview Apollo searches (free)</button></div></form></div></div>
+
+{% if tab == 'targeting' %}<div class="card" id="intake"><div class="card-h"><h2>Leads by email</h2>{% if li.enabled %}<span class="badge b-ok">on: {{ li.inbox }}</span>{% endif %}</div><div class="card-b">
+ <form method="post" action="{{ url_for('save_intake') }}">
+ <p class="muted" style="margin-top:0">Email a CSV or Excel (.xlsx) lead file, for example an Instantly export, to the inbox below. On its next run BSO imports it, skips duplicates and do-not-contact addresses, and replies with what it added. Nobody needs to import leads by hand.</p>
+ <label class="check"><input type="checkbox" name="enabled" {{ 'checked' if li.enabled }}> Import lead files emailed to this inbox</label>
+ <div class="grid2"><div><label>Intake inbox (one of your inboxes)</label><select name="inbox">{% for e in inbox_emails %}<option {{ 'selected' if li.inbox == e }}>{{ e }}</option>{% endfor %}</select></div>
+ <div><label>Who may send lead files (one address per line)</label><textarea name="allowed_senders" style="min-height:70px" placeholder="omar@blacswanken.com">{{ (li.allowed_senders or [])|join('\n') }}</textarea></div></div>
+ <label class="check"><input type="checkbox" name="add_to_sequence" {{ 'checked' if li.get('add_to_sequence', True) }}> Start the email sequence for imported leads</label>
+ <label class="check"><input type="checkbox" name="verified_only" {{ 'checked' if li.get('verified_only', True) }}> Only accept files whose sender the mail server verified (recommended: stops someone faking your address)</label>
+ <p class="hint">Emails from anyone else are treated as normal mail. The confirmation reply goes to whoever sent the file, even in test mode.</p>
+ <button class="btn brand" style="margin-top:10px">Save</button></form></div></div>{% endif %}
 
 {% elif tab == 'schedule' %}
 <div class="card"><div class="card-h"><h2>Sending schedule</h2></div><div class="card-b"><form method="post" action="{{ url_for('save_schedule') }}">

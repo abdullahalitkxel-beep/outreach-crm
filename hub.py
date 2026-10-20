@@ -38,7 +38,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 import brand
 import relay
 
-ROLES = ("owner", "manager", "member", "supervisor")
+ROLES = ("owner", "manager", "member", "supervisor", "bot")
 EVENT_TYPES = ("sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "handover", "handover_in", "prospect_stage", "settings", "app_start", "paused")
 ONLINE_MINUTES = 10
 GRACE_HOURS = 72
@@ -136,7 +136,7 @@ def init_db():
         con.execute("ALTER TABLE users ADD COLUMN username TEXT")
         con.execute("UPDATE users SET username=lower(email) WHERE username IS NULL")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username)")
-    for col, decl in (("relay_pw", "TEXT"), ("tv", "INTEGER DEFAULT 1")):
+    for col, decl in (("relay_pw", "TEXT"), ("tv", "INTEGER DEFAULT 1"), ("bot_status", "TEXT")):
         if col not in {r[1] for r in con.execute("PRAGMA table_info(users)")}:
             con.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
     con.commit()
@@ -496,7 +496,7 @@ def user_stats(days=7):
     since = iso(now() - timedelta(days=days))
     wk = iso(now() - timedelta(days=7))
     out = []
-    for u in db().execute("SELECT * FROM users WHERE role IN ('member','manager','owner','supervisor') ORDER BY name").fetchall():
+    for u in db().execute("SELECT * FROM users WHERE role IN ('member','manager','owner','supervisor','bot') ORDER BY name").fetchall():
         c = lambda t, s=since: db().execute("SELECT COUNT(*) FROM events WHERE user_id=? AND type=? AND at>=?", (u["id"], t, s)).fetchone()[0]
         sent, replies, bounces = c("sent"), c("reply"), c("bounce")
         interested = db().execute("SELECT COUNT(*) FROM events WHERE user_id=? AND type='reply' AND at>=? AND detail IN ('interested','question','meeting_request')",
@@ -531,7 +531,27 @@ def dashboard():
                   handed=db().execute("SELECT COUNT(*) FROM handovers WHERE at>=?", (iso(now() - timedelta(days=7)),)).fetchone()[0])
     series = daily_series()
     mx = max([n for _, n in series] + [1])
-    return render("dashboard.html", stats=stats, totals=totals, series=series, mx=mx, tab="dashboard")
+    bots = []
+    for u in db().execute("SELECT * FROM users WHERE role='bot' ORDER BY name").fetchall():
+        st = json.loads(u["bot_status"] or "{}")
+        warn = []
+        if u["status"] == "disabled":
+            warn.append("Paused in the console: it isn't sending.")
+        if not is_online(u["last_seen"]):
+            warn.append(f"Not connected since {ago(u['last_seen'])}. Is its computer on, awake and online, with BSO open?")
+        lr = parse((st.get("last_run") or "").replace("+00:00", "Z")[:19] + "Z") if st.get("last_run") else None
+        if st.get("autorun") and lr and now() - lr > timedelta(minutes=(st.get("every_minutes") or 60) * 2 + 15):
+            warn.append(f"Hasn't run since {ago(iso(lr))}.")
+        if not st.get("autorun") and st:
+            warn.append("Automatic runs are off on the bot (BSO → Settings → Safety & automation).")
+        if st.get("last_run_status") == "failed":
+            warn.append("The last run reported a problem: " + (st.get("last_run_line") or "see Bot runs in BSO."))
+        if st.get("days_of_leads") is not None and st["days_of_leads"] < 3:
+            warn.append(f"Only about {st['days_of_leads']} days of new leads left: import more.")
+        if st.get("test_mode"):
+            warn.append("Test mode is on: nothing goes to real leads yet.")
+        bots.append(dict(u=dict(u), st=st, warn=warn, online=is_online(u["last_seen"]), last_run=ago(iso(lr)) if lr else "never"))
+    return render("dashboard.html", bots=bots, stats=stats, totals=totals, series=series, mx=mx, tab="dashboard")
 
 
 @app.route("/users")
@@ -833,6 +853,9 @@ def ingest(con, uid, j):
     for e in (j.get("events") or [])[:600]:
         if isinstance(e, dict) and e.get("type") == "__handover":
             store_handover(con, uid, e.get("data") or {})
+            continue
+        if isinstance(e, dict) and e.get("type") == "__status":
+            con.execute("UPDATE users SET bot_status=? WHERE id=?", (json.dumps(e.get("data") or {})[:5000], uid))
             continue
         try:
             con.execute("INSERT OR IGNORE INTO events(user_id, local_id, at, type, detail, sender, lead_email, company, step, variant) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -1141,6 +1164,12 @@ T["dashboard.html"] = """{% extends 'base.html' %}{% block body %}
 <div class="stat"><small>Interested replies</small><div>{{ totals.interested }}</div></div><div class="stat"><small>Drafts awaiting approval</small><div><a href="{{ url_for('approvals') }}">{{ totals.pending }}</a></div></div>
 <div class="stat"><small>Laptops online now</small><div>{{ totals.online }}</div></div>
 <div class="stat"><small>Prospects handed over (7 days)</small><div><a href="{{ url_for('handovers_page') }}">{{ totals.handed }}</a></div></div></div>
+{% for b in bots %}<div class="card" style="border-left:4px solid {{ '#ba0517' if b.warn else '#2e844a' }}"><div class="card-h"><h2>🤖 {{ b.u.name }}</h2>
+<span class="dot {{ 'on' if b.online }}"></span>{{ 'Online' if b.online else 'Offline' }}<span class="muted">· last run {{ b.last_run }}{% if b.st.autorun %} · runs every {{ b.st.every_minutes }} min{% endif %}{% if b.st.review %} · your approval required{% endif %}</span></div>
+<div class="card-b"><div class="stats" style="margin-bottom:{{ '10px' if b.warn else '0' }}"><div class="stat"><small>Sent today</small><div>{{ b.st.sent_today or 0 }}</div></div><div class="stat"><small>Replies today</small><div>{{ b.st.replies_today or 0 }}</div></div>
+<div class="stat"><small>Handed over today</small><div>{{ b.st.handovers_today or 0 }}</div></div><div class="stat"><small>Leads not yet emailed</small><div>{{ b.st.leads_not_started if b.st.leads_not_started is not none else '–' }}</div></div>
+<div class="stat"><small>Days of leads left</small><div>{{ b.st.days_of_leads if b.st.days_of_leads is not none else '–' }}</div></div><div class="stat"><small>Errors today</small><div>{{ b.st.errors_today or 0 }}</div></div></div>
+{% for w in b.warn %}<div class="err" style="margin-bottom:6px">⚠ {{ w }}</div>{% endfor %}</div></div>{% endfor %}
 <div class="card"><div class="card-h"><h2>Emails sent per day, whole team</h2></div><div class="card-b">
 <svg viewBox="0 0 {{ series|length * 40 }} 120" width="100%" height="140" role="img" aria-label="Emails sent per day">{% for d, n in series %}<g><rect x="{{ loop.index0 * 40 + 6 }}" y="{{ 96 - (n * 90 // mx) }}" width="28" height="{{ (n * 90 // mx) or 1 }}" rx="3" fill="#0176d3"/>
 <text x="{{ loop.index0 * 40 + 20 }}" y="{{ 92 - (n * 90 // mx) }}" font-size="10" text-anchor="middle" fill="#444">{{ n if n }}</text><text x="{{ loop.index0 * 40 + 20 }}" y="112" font-size="9" text-anchor="middle" fill="#777">{{ d[:6] }}</text></g>{% endfor %}</svg></div></div>
@@ -1163,7 +1192,7 @@ T["users.html"] = """{% extends 'base.html' %}{% block title %}Users{% endblock 
 {% if me.role == 'owner' %}<div class="card"><div class="card-h"><h2>Add a user</h2></div><div class="card-b"><form method="post" action="{{ url_for('user_new') }}"><input type="hidden" name="_csrf" value="{{ csrf }}">
 <div class="grid"><div><label>Name</label><input name="name" required></div><div><label>Email</label><input name="email" type="email" required></div>
 <div><label>Sign-in ID (blank = part of email before @)</label><input name="username" autocomplete="off"></div>
-<div><label>Role</label><select name="role"><option value="member">Member (uses BSO on their laptop)</option><option value="manager">Manager (member + can use this console)</option><option value="supervisor">Lead Gen Supervisor (receives interested prospects)</option></select></div>
+<div><label>Role</label><select name="role"><option value="member">Member (uses BSO on their laptop)</option><option value="manager">Manager (member + can use this console)</option><option value="supervisor">Lead Gen Supervisor (receives interested prospects)</option><option value="bot">BSO Bot (runs the campaigns on an always-on computer; stays signed in)</option></select></div>
 <div><label>Password (10+ characters; blank = generate one)</label><input name="password" autocomplete="off"></div>
 <div><label>Daily send cap (0 = no cap)</label><input name="daily_cap" type="number" min="0" value="0"></div><div><label>Weekly target (emails, 0 = none)</label><input name="weekly_target" type="number" min="0" value="0"></div>
 <div><label>Who approves their emails</label><select name="approval"><option value="member">They approve their own</option><option value="master">The master approves every email</option></select></div></div>
@@ -1175,7 +1204,7 @@ T["user.html"] = """{% extends 'base.html' %}{% block title %}{{ u.name }}{% end
 {% if me.role == 'owner' %}<div class="card"><div class="card-h"><h2>{{ u.name }} <span class="badge {{ 'b-ok' if u.status == 'active' else 'b-bad' if u.status == 'disabled' else 'b-warn' }}">{{ u.status }}</span></h2></div><div class="card-b">
 <form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="save"><div class="grid">
 <div><label>Name</label><input name="name" value="{{ u.name }}"></div><div><label>Email</label><input value="{{ u.email }}" disabled></div><div><label>Sign-in ID</label><input value="{{ u.username or u.email }}" disabled></div>
-<div><label>Role</label><select name="role" {{ 'disabled' if u.role == 'owner' }}>{% for r in ['member','manager','supervisor'] %}<option {{ 'selected' if u.role == r }}>{{ r }}</option>{% endfor %}{% if u.role == 'owner' %}<option selected>owner</option>{% endif %}</select></div>
+<div><label>Role</label><select name="role" {{ 'disabled' if u.role == 'owner' }}>{% for r in ['member','manager','supervisor','bot'] %}<option {{ 'selected' if u.role == r }}>{{ r }}</option>{% endfor %}{% if u.role == 'owner' %}<option selected>owner</option>{% endif %}</select></div>
 <div><label>Daily send cap (0 = no cap)</label><input name="daily_cap" type="number" min="0" value="{{ u.daily_cap or 0 }}"></div><div><label>Weekly target</label><input name="weekly_target" type="number" min="0" value="{{ u.weekly_target or 0 }}"></div>
 <div><label>Who approves their emails</label><select name="approval"><option value="member" {{ 'selected' if u.approval != 'master' }}>They approve their own</option><option value="master" {{ 'selected' if u.approval == 'master' }}>The master approves every email</option></select></div>
 </div>

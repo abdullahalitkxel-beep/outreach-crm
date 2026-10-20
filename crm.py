@@ -222,7 +222,7 @@ def render(name, **ctx):
         request=request, url_for=url_for, money=money, today=today(), status_labels=STATUS_LABELS,
         stages=STAGES, nav_items=nav, active=active, review_count=review_count, job_labels=JOB_LABELS,
         test_redirect=test_redirect(), test_mode_broken=tm.get("enabled") and not tm.get("redirect_to"),
-        team_user=team.signed_in(), team_name=team.SIGNED_IN.get("name"), currency=cfg().get("currency", "$"), app_version=legal_docs_version(), publisher=cfg().get("publisher", "BlacSwanken"),
+        team_user=team.signed_in(), team_name=team.SIGNED_IN.get("name"), team_bot=team.SIGNED_IN.get("bot"), currency=cfg().get("currency", "$"), app_version=legal_docs_version(), publisher=cfg().get("publisher", "BlacSwanken"),
         qs=lambda **kw: url_for(request.endpoint, **{**(request.view_args or {}), **request.args.to_dict(), **kw}),
         **ctx)
 
@@ -871,6 +871,21 @@ def prospect_stage(lead_id):
 
 # ---------------------------------------------------------------- handover settings
 
+@app.post("/settings/intake")
+def save_intake():
+    f = request.form
+    allowed = [a.strip().lower() for a in re.split(r"[\s,;]+", f.get("allowed_senders", "")) if a.strip()]
+    bad = [a for a in allowed if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", a)]
+    if bad:
+        return redirect(url_for("settings", tab="targeting", result=f"Not an email address: {', '.join(bad)}", _anchor="intake"))
+    on = f.get("enabled") == "on"
+    if on and not allowed:
+        return redirect(url_for("settings", tab="targeting", result="Add at least one address that may send lead files.", _anchor="intake"))
+    write_settings({"lead_intake": {"enabled": on, "inbox": f.get("inbox", "").strip().lower(), "allowed_senders": allowed,
+                                    "add_to_sequence": f.get("add_to_sequence") == "on", "verified_only": f.get("verified_only") == "on"}})
+    return redirect(url_for("settings", tab="targeting", result="Saved. Lead files emailed to that inbox are imported on each bot run.", ok=1, _anchor="intake"))
+
+
 @app.post("/settings/handover")
 def save_handover():
     f = request.form
@@ -1068,12 +1083,68 @@ def job_start():
     return redirect(url_for("job", job_id=job_id, msg="A run is already in progress." if busy else None))
 
 
+# ---------------------------------------------------------------- always-on helpers (BSO Bot computer)
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def startup_supported():
+    return sys.platform == "win32" and getattr(sys, "frozen", False)
+
+
+def startup_enabled():
+    if not startup_supported():
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            return bool(winreg.QueryValueEx(k, "BSO")[0])
+    except OSError:
+        return False
+
+
+def set_startup(on):
+    """Start BSO in the background when Windows starts (this Windows user only)."""
+    if not startup_supported():
+        return False
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if on:
+            winreg.SetValueEx(k, "BSO", 0, winreg.REG_SZ, f'"{sys.executable}" --background')
+        else:
+            try:
+                winreg.DeleteValue(k, "BSO")
+            except OSError:
+                pass
+    return True
+
+
+def keep_awake(on):
+    """Stop Windows going to sleep while automatic runs are on (not while the lid is closed: see the help text)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
+    except Exception as e:
+        print("keep awake:", e)
+
+
 def _autorun_loop():
     """While the app is open, run the bot on a timer if switched on in Settings."""
     import time as _t
     last = 0.0
+    awake = None
     while True:
         _t.sleep(30)
+        try:
+            want = bool((load_config(CONFIG_PATH).get("autorun") or {}).get("enabled"))
+            if want != awake:
+                keep_awake(want)
+                awake = want
+        except Exception as e:
+            print("keep awake:", e)
         try:
             if team.required() and not team.signed_in():
                 continue          # nothing runs until someone has signed in
@@ -1341,6 +1412,8 @@ def settings():
                         "SLACK_WEBHOOK_URL": mask(env("SLACK_WEBHOOK_URL"))},
                   tab=request.args.get("tab", "inbox"), result=request.args.get("result"),
                   ok=request.args.get("ok"), avoid_hits=template_avoid_hits(c), avoid_n=len(c.get("avoid_phrases") or []),
+                  li=dict(c.get("lead_intake") or {}), inbox_emails=[x.get("email") for x in (c.get("senders") or []) if x.get("email") and "example" not in x.get("email", "")],
+                  startup_ok=startup_supported(), startup_on=startup_enabled(), is_bot=team.is_bot(),
                   ho=dict(c.get("handover") or {}), pm=dict(c.get("prospect_mailbox") or {}), pm_pw=mask(env(mailbox.PW_KEY)), ho_default=bot_default_intro(), team_sups=team.supervisors() if team.joined() else [],
                   team=dict(team.state(), joined=team.joined(), policy=team.policy(), disclosure=team.DISCLOSURE, locked=team.locked_in(), signed=team.signed_in()))
 
@@ -1422,6 +1495,11 @@ def save_safety():
                     "review": {"enabled": bool(f.get("review"))},
                     "autorun": {"enabled": bool(f.get("autorun")), "every_minutes": int(f.get("every_minutes") or 60)}})
     msg = "Saved." + ("" if tm else " Test mode is OFF: approved emails now go to real leads.")
+    if startup_supported() and bool(f.get("start_with_windows")) != startup_enabled():
+        try:
+            set_startup(bool(f.get("start_with_windows")))
+        except OSError as e:
+            msg += f" Couldn't change 'start with Windows' ({e})."
     return redirect(url_for("settings", tab="safety", result=msg, ok=1))
 
 

@@ -121,7 +121,26 @@ def signed_in():
 
 
 def sign_out():
+    if SIGNED_IN.get("bot"):
+        st = state()
+        st["no_resume"] = True          # someone signed the bot out on purpose: ask for the password next time
+        save_state(st)
     SIGNED_IN.clear()
+
+
+def is_bot():
+    return (policy() or {}).get("role") == "bot"
+
+
+def resume():
+    """The BSO Bot account stays signed in on its computer, so campaigns carry on after a restart or power cut.
+    Human accounts always sign in with their password."""
+    st = state()
+    if not (joined() and is_bot() and st.get("username")) or st.get("revoked") or st.get("no_resume"):
+        return False
+    SIGNED_IN.clear()
+    SIGNED_IN.update(user=st["username"], name=(st.get("policy") or {}).get("name", st["username"]), bot=True)
+    return True
 
 
 def check_hub_url(url):
@@ -248,9 +267,10 @@ def sign_in(con, username, password, consent=False, hub=None):
     s.update(hub=url, username=username, policy=pol, consent=CONSENT_VERSION, last_ok=iso(now_utc()),
              verifier=_verifier(username, password), required=True)
     s.pop("revoked", None)
+    s.pop("no_resume", None)
     save_state(s)
     SIGNED_IN.clear()
-    SIGNED_IN.update(user=username, name=pol.get("name", username))
+    SIGNED_IN.update(user=username, name=pol.get("name", username), bot=pol.get("role") == "bot")
     if first_time:
         restore(con)
         sync(con)          # pick up anything waiting in this person's queue straight away
@@ -439,6 +459,34 @@ def _apply_decisions(con, decisions):
     return done, ho_done
 
 
+def status(con):
+    """How this BSO is doing (shown on the Master Console, mainly for the BSO Bot)."""
+    import bot as _bot
+    try:
+        cfg = _bot.load_config(str(Path(DATA) / "config.yaml"))
+    except Exception:
+        cfg = {}
+    day = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
+    q = lambda sql, *a: con.execute(sql, a).fetchone()[0]
+    run = con.execute("SELECT status, started_at, finished_at, output FROM jobs WHERE cmd='run' ORDER BY id DESC LIMIT 1").fetchone()
+    cap = sum(int(sv.get("daily_limit") or 0) for sv in (cfg.get("senders") or []) if sv.get("email") and "example" not in sv.get("email", ""))
+    fresh = q("SELECT COUNT(*) FROM leads WHERE status='active' AND step=0")
+    last_line = ""
+    if run and run["output"]:
+        lines = [l for l in run["output"].strip().splitlines() if l.strip()]
+        last_line = (lines[-1] if lines else "")[:200]
+    ar = cfg.get("autorun") or {}
+    return {"at": iso(now_utc()), "last_run": (run["finished_at"] or run["started_at"]) if run else None,
+            "last_run_status": run["status"] if run else None, "last_run_line": last_line,
+            "sent_today": sent_today_total(con), "replies_today": q("SELECT COUNT(*) FROM events WHERE type='reply' AND at>=?", iso(day)),
+            "handovers_today": q("SELECT COUNT(*) FROM events WHERE type='handover' AND at>=?", iso(day)),
+            "errors_today": q("SELECT COUNT(*) FROM events WHERE type='error' AND at>=?", iso(day)),
+            "leads_active": q("SELECT COUNT(*) FROM leads WHERE status='active'"), "leads_not_started": fresh,
+            "daily_capacity": cap, "days_of_leads": round(fresh / cap, 1) if cap else None,
+            "autorun": bool(ar.get("enabled")), "every_minutes": int(ar.get("every_minutes") or 0),
+            "test_mode": bool((cfg.get("test_mode") or {}).get("enabled")), "review": bool((cfg.get("review") or {}).get("enabled"))}
+
+
 def sync(con, version=""):
     """One round trip. Returns (ok, message). Never raises."""
     s = state()
@@ -451,6 +499,19 @@ def sync(con, version=""):
         handovers = [dict(json.loads(h["payload"]), out_id=h["id"]) for h in hos]
         # handovers travel inside the existing fields, so an already-deployed Google relay passes them on unchanged
         packed = events + [{"id": f"h{h['out_id']}", "type": "__handover", "data": h} for h in handovers]
+        st_now, st_extra = None, []
+        try:
+            st_now = status(con)
+            key = json.dumps({k: v for k, v in st_now.items() if k != "at"}, sort_keys=True)
+            due = not s.get("status_at") or now_utc() - datetime.fromisoformat(s["status_at"]).astimezone(timezone.utc) > timedelta(minutes=15)
+            if key != s.get("status_key") or due:
+                st_extra = [{"id": "s", "type": "__status", "data": st_now}]
+                st_now = (key, iso(now_utc()))
+            else:
+                st_now = None
+        except Exception as e:
+            print("status:", e)
+        packed += st_extra
         acked = list(s.get("ack", [])) + [f"ho:{x}" for x in s.get("ho_ack", []) if x is not None]
         status, j = _post(s["hub"], "/api/v1/sync", {"events": packed, "drafts": drafts, "acked": acked, "version": version},
                           token=env(TOKEN_KEY))
@@ -470,6 +531,8 @@ def sync(con, version=""):
     s["policy"] = j.get("policy") or s.get("policy", {})
     s["relay_version"] = int(j.get("relay_version") or (1 if relay.is_relay(s["hub"]) else 0))
     s["last_ok"] = iso(now_utc())
+    if st_now:
+        s["status_key"], s["status_at"] = st_now
     if handovers:
         con.execute(f"UPDATE handover_out SET synced=1 WHERE id IN ({','.join('?' * len(handovers))})", [h["out_id"] for h in handovers])
         con.commit()

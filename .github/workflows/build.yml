@@ -59,6 +59,9 @@ jobs:
       - name: Test the supervisor's mailbox inside BSO
         run: python tests/mailbox_test.py
 
+      - name: Test BSO Bot mode and leads by email
+        run: python tests/bot_mode_test.py
+
       - name: Test the AI line with thinking models
         run: python tests/llm_test.py
 

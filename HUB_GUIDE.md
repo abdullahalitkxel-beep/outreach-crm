@@ -62,6 +62,16 @@ Until someone signs in, BSO opens nothing and sends nothing, including automatic
 
 Roles: **owner** (everything, including users and settings), **manager** (sees everyone, approves drafts, signs in to the console), **member** (uses BSO on their laptop).
 
+## Running BSO as a bot (recommended)
+
+Let one BSO run every campaign by itself and make every person a Lead Gen Supervisor:
+1. **Users → Add a user**, role **BSO Bot**. Sign in to BSO with it on the computer that will run the campaigns. It stays signed in after restarts; people's accounts always need their password.
+2. On that computer, in BSO: connect all sending inboxes (Settings → Email inboxes), then Settings → Safety & automation → **Run automatically** and **Start BSO when Windows starts**. While automatic runs are on, BSO keeps Windows awake. On a laptop also set Windows → Settings → System → Power → *Lid close action: Do nothing* (plugged in), and keep it plugged in and online.
+3. **Leads by email**: Settings → Lead targeting → *Leads by email*: choose the intake inbox and who may send files (e.g. omar@blacswanken.com). Email a CSV/Excel file (an Instantly export works) to that inbox; the bot imports it on its next run and replies with what it added.
+4. Add the people as **Lead Gen Supervisors**. Interested prospects go to them in turn.
+
+The Master Console's Overview shows a **Bot** card: online, last run, sent and replies today, prospects handed over, leads not yet emailed and days of leads left, with warnings when it hasn't run, a run failed, test mode is still on or leads are running out.
+
 ## Who needs to be online? Nobody, at the same time
 
 Your Google script is the always-on middle. Each person's BSO talks only to it, whenever that person is online:

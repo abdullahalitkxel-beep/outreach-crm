@@ -92,7 +92,7 @@ def watchdog(crm, tray_ref):
         time.sleep(5)
         try:
             c = crm.cfg()
-            keep = bool((c.get("autorun") or {}).get("enabled"))
+            keep = bool((c.get("autorun") or {}).get("enabled")) or "--background" in sys.argv
             if should_quit(time.time(), started, crm.LAST_SEEN, crm.LAST_BYE, keep, crm.job_running()) \
                     and not os.getenv("OUTREACH_NO_WINDOW"):
                 if tray_ref.get("icon"):
@@ -158,11 +158,16 @@ def main():
     import bot  # sets up the data folder (%APPDATA%\OutreachCRM) on first run
     _ensure_stdio(bot.DATA / "app.log")
 
+    background = "--background" in sys.argv     # started with Windows: no window, just the icon next to the clock
     if _port_in_use():  # already running: just open another window
-        open_window()
+        if not background:
+            open_window()
         return
 
     import crm
+    import team
+    if team.resume():
+        print("BSO Bot: still signed in, carrying on")
     tray_ref = {}
     threading.Thread(target=crm._autorun_loop, daemon=True).start()
     threading.Thread(target=crm._team_loop, daemon=True).start()
@@ -171,7 +176,8 @@ def main():
     server = threading.Thread(target=lambda: crm.app.run(host="127.0.0.1", port=PORT, threaded=True, use_reloader=False),
                               daemon=True)
     server.start()
-    threading.Timer(1.0, open_window).start()
+    if not background:
+        threading.Timer(1.0, open_window).start()
     print(f"BSO running at {URL} (data folder: {bot.DATA})")
     if not run_tray(tray_ref):
         server.join()
