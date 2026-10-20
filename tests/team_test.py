@@ -36,7 +36,7 @@ def csrf(path="/login"):
 
 check(b"omar@blacswanken.com" in c.get("/setup").data, "setup page pre-fills the master email")
 # --- owner setup and login
-check(BUILT_IN == "", "no team address built in until the Google Drive relay address is known")
+check(BUILT_IN.startswith("https://script.google.com/macros/s/") and BUILT_IN.endswith("/exec"), "the Google Drive relay address is built in")
 check(c.get("/").status_code == 302, "console needs sign-in")
 rc = hub.app.test_client()
 REMOTE = {"REMOTE_ADDR": "203.0.113.9"}

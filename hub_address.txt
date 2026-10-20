@@ -1,2 +1,3 @@
 # The team address built into BSO (the Google Drive relay's Web app URL). Team members never type it.
 # Put the full https:// address on the line below (one line, no spaces), then rebuild.
+https://script.google.com/macros/s/AKfycby8XgdpuSurNtUOykxXkBUmSUtc_87R_OrEnGdDvizQqO0GPhxqJGYKAivf2qWFf6MD/exec
