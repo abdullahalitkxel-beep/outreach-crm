@@ -69,6 +69,17 @@ try:
     team.sign_out()
     team.sign_in(con, "omar@blacswanken.com", "owner-pass-123", consent=True)
     check(team.signed_in() == "omar@blacswanken.com", "master can sign in to BSO with the master email")
+    ok, msg = team.sync(con)
+    check(ok, "master's laptop checks in (ID with dots): " + msg)
+    check(team.gate(con)[0], "master's laptop is allowed to send")
+    c.post("/users/new", data={"_csrf": tok("/users"), "name": "Cole Reed", "email": "cole.reed@getneosofttech.com", "username": "cole.reed",
+                               "role": "member", "password": "cole-pass-1234"})
+    hub.relay_cycle()
+    team.leave()
+    team.sign_in(con, "cole.reed", "cole-pass-1234", consent=True)
+    check(team.sync(con)[0], "member with a dotted ID signs in and checks in")
+    hub.relay_cycle()
+    check("Cole Reed" in c.get("/").get_data(as_text=True), "dotted ID shows in the console")
     team.leave()
     team.sign_in(con, "ayesha", "ayesha-pass-1", consent=True)
 

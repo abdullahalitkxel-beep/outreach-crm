@@ -881,14 +881,24 @@ def relay_key(create=False):
     return k
 
 
+def relay_key_for(ident):
+    return ident.replace(".", "~")
+
+
+def ident_from_relay(key):
+    return str(key or "").replace("~", ".")
+
+
 def relay_doc(con):
     users = {}
     for u in con.execute("SELECT * FROM users").fetchall():
         if not u["relay_pw"]:
             continue
         rec = json.loads(u["relay_pw"])
-        users[u["username"] or u["email"]] = dict(
-            rec, name=u["name"], email=u["email"], role=u["role"], status="disabled" if u["status"] == "disabled" else "active",
+        ident = u["username"] or u["email"]
+        # relay keys can't contain dots (they're part of the sign-in token); the ID itself is matched via "email"
+        users[relay_key_for(ident)] = dict(
+            rec, name=u["name"], email=ident, role=u["role"], status="disabled" if u["status"] == "disabled" else "active",
             tv=u["tv"] or 1, daily_cap=u["daily_cap"] or 0, weekly_target=u["weekly_target"] or 0, approval=u["approval"] or "member",
             decisions=decisions_for(con, u["id"]))
     return {"org": _m_get(con, "org_name", "Your team"), "grace_hours": int(_m_get(con, "grace_hours", str(GRACE_HOURS)) or 0), "users": users}
@@ -913,13 +923,15 @@ def relay_cycle(con=None):
                     done = []
                     for it in res.get("items") or []:
                         body = it.get("body") or {}
-                        u = con.execute("SELECT id FROM users WHERE username=? OR email=?", (body.get("user"), body.get("user"))).fetchone()
+                        who = ident_from_relay(body.get("user"))
+                        u = con.execute("SELECT id FROM users WHERE username=? OR email=?", (who, who)).fetchone()
                         if u:
                             ingest(con, u["id"], body.get("data") or {})
                             got += 1
                         done.append(it["id"])
                     con.commit()
                     for name, seen in (res.get("seen") or {}).items():
+                        name = ident_from_relay(name)
                         at = str(seen.get("at", ""))[:19] + "Z"
                         con.execute("UPDATE users SET last_seen=?, app_version=COALESCE(NULLIF(?, ''), app_version), "
                                     "status=CASE WHEN status='invited' THEN 'active' ELSE status END "

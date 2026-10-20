@@ -190,12 +190,14 @@ function login_(req) {
 }
 
 function userFromToken_(doc, token) {
-  var parts = String(token || '').split('.');
-  if (parts.length !== 3) return null;
-  var u = doc.users[parts[0]];
-  if (!u || String(u.tv || 1) !== parts[1]) return null;        // password reset or laptop disconnected
-  if (!same_(tokenFor_(parts[0], parts[1]), token)) return null;
-  return { key: parts[0], u: u };
+  token = String(token || '');
+  var b = token.lastIndexOf('.'), a = token.lastIndexOf('.', b - 1);   // key.tv.signature (the key may contain dots)
+  if (a < 1 || b < 0) return null;
+  var key = token.substring(0, a), tv = token.substring(a + 1, b);
+  var u = doc.users[key];
+  if (!u || String(u.tv || 1) !== tv) return null;              // password reset or laptop disconnected
+  if (!same_(tokenFor_(key, tv), token)) return null;
+  return { key: key, u: u };
 }
 
 function sync_(req) {
