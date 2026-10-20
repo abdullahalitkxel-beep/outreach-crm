@@ -26,7 +26,7 @@ if len(sys.argv) > 1 and sys.argv[1] == "--supervisor":
            "tasks": [r[0] for r in con.execute("SELECT subject FROM tasks WHERE status='open'")]}
     crm.write_settings({"legal_acceptance": {"version": str(crm.cfg().get("legal", {}).get("version", "1.0"))}})
     w = crm.app.test_client()
-    page = w.get("/prospects").get_data(as_text=True)
+    page = w.get("/prospects?view=list").get_data(as_text=True)
     out["page_ok"] = "My prospects" in page and "sarah@acme.com" in page
     if out["prospects"]:
         lid = con.execute("SELECT id FROM leads WHERE email='sarah@acme.com'").fetchone()[0]

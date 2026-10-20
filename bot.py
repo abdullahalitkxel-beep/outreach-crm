@@ -206,6 +206,10 @@ CREATE TABLE IF NOT EXISTS campaigns (                   -- separate offers / se
 CREATE TABLE IF NOT EXISTS inbox_health (                -- inboxes the deliverability guard has paused
     email TEXT PRIMARY KEY, paused INTEGER DEFAULT 0, reason TEXT, at TEXT, login_failures INTEGER DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS comments (                    -- comments on prospects between team members (with @mentions)
+    id INTEGER PRIMARY KEY, uid TEXT UNIQUE, lead_email TEXT, lead_name TEXT, company TEXT, author TEXT, author_name TEXT,
+    text TEXT, at TEXT, to_ TEXT, mine INTEGER DEFAULT 0, synced INTEGER DEFAULT 0, seen INTEGER DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS domain_health (               -- SPF / DKIM / DMARC / MX checks of the sending domains
     domain TEXT PRIMARY KEY, at TEXT, result TEXT
 );
@@ -1305,6 +1309,7 @@ def handover(cfg, con, lead, sender, msg, body, label):
                 (lead["id"], f"Handed over to {sup['name']} <{sup['email']}> ({label.replace('_', ' ')} reply).", at))
     log_event(con, lead["id"], "handover", sup["id"], sender["email"])
     payload = {"lead_local_id": lead["id"], "supervisor": sup["id"], "label": label, "at": at,
+               "campaign": campaign_row(con, lead.get("campaign_id"))["name"],
                "lead": {"email": lead["email"], "first_name": lead.get("first_name"), "last_name": x.get("last_name"), "title": x.get("title"),
                         "company": company, "website": lead.get("website"), "linkedin": x.get("linkedin"), "city": x.get("city"), "country": x.get("country")},
                "reply": body.strip()[:4000], "intro": intro_text, "thread": thread, "from_inbox": sender["email"], "from_name": sender["name"]}

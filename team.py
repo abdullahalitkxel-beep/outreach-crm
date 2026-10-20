@@ -11,9 +11,12 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import secrets
 import socket
 import sys
+import time
+import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -33,6 +36,7 @@ DISCLOSURE = [
     "Your manager can see the label of each reply (for example “interested”). When a prospect replies with interest, a meeting request or a question, they are handed to a lead gen supervisor, who receives the prospect’s details, their reply and the emails you sent them.",
     "If your manager requires approval, they can read, edit and approve or reject your drafts before they send.",
     "Your manager can pause your account, set a daily send cap and a weekly target, and see when this laptop last connected.",
+    "If you leave the team, your manager can have your BSO hand its leads over to your colleagues.",
     "Never shared: your email passwords, API keys, inbox logins, your lead list, your notes, or the text of replies.",
     "Your data stays on this laptop; your manager keeps the activity log already sent. If you stop working with the team, your admin removes your account.",
 ]
@@ -47,10 +51,21 @@ def state():
         return {}
 
 
+_state_lock = threading.RLock()
+_sync_lock = threading.Lock()
+
+
 def save_state(s):
-    tmp = STATE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(s), encoding="utf-8")
-    os.replace(tmp, STATE)
+    with _state_lock:                 # background check-ins and the window can save at the same time
+        tmp = STATE.with_name(f"team.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(s), encoding="utf-8")
+        for attempt in range(5):
+            try:
+                os.replace(tmp, STATE)
+                return
+            except PermissionError:    # Windows: another process is reading it this instant
+                time.sleep(0.1 * (attempt + 1))
+        os.replace(tmp, STATE)
 
 
 def joined():
@@ -332,6 +347,56 @@ def _collect_drafts(con, sent_ids):
              "subject": r["subject"], "body": r["body"]} for r in con.execute(q) if r["id"] not in sent_ids]
 
 
+def relay_key(ident):
+    return str(ident or "").lower().replace(".", "~")
+
+
+def me():
+    return relay_key(state().get("username"))
+
+
+def people():
+    """Everyone on the team who can be @mentioned: [{key, name, role}] (published by the master console)."""
+    return [p for p in (state().get("people") or []) if p.get("key")]
+
+
+def mentions(text):
+    """Team members @mentioned in a comment, matched by first name, full name or ID."""
+    low = " " + (text or "").lower()
+    out = []
+    for p in people():
+        names = {p["name"].lower(), p["name"].split()[0].lower() if p.get("name") else "", p["key"].replace("~", ".")}
+        if any(n and re.search(r"@" + re.escape(n) + r"(?![\w.])", low) for n in names):
+            out.append(p["key"])
+    return out
+
+
+def add_comment(con, lead_email, text, lead_name="", company=""):
+    """Write a comment on a prospect. It goes to everyone @mentioned, everyone already in this prospect's
+    comment thread, and the master console."""
+    text = (text or "").strip()[:4000]
+    if not text:
+        return None
+    mine = me()
+    to = set(mentions(text))
+    for r in con.execute("SELECT DISTINCT author FROM comments WHERE lead_email=?", (lead_email.lower(),)):
+        if r["author"]:
+            to.add(r["author"])
+    to.discard(mine)
+    uid = f"{mine}-{secrets.token_hex(8)}"
+    con.execute("INSERT INTO comments(uid, lead_email, lead_name, company, author, author_name, text, at, to_, mine, synced, seen) VALUES (?,?,?,?,?,?,?,?,?,1,0,1)",
+                (uid, lead_email.lower(), lead_name, company, mine, (policy() or {}).get("name") or mine, text, iso(now_utc()), json.dumps(sorted(to))))
+    con.commit()
+    return uid
+
+
+def set_away(until):
+    s = state()
+    s["away_until"] = until or ""
+    s["away_pending"] = True
+    save_state(s)
+
+
 def supervisors():
     """Lead gen supervisors published by the master console: [{id, name, email, count}]."""
     return [sv for sv in (state().get("supervisors") or []) if sv.get("email")]
@@ -364,7 +429,8 @@ def _receive_handover(con, d, restoring=False):
                     (email, L.get("first_name") or "", L.get("company") or "", L.get("website") or "", json.dumps(extra), at, who_from,
                      d.get("stage") or "new"))
         lid = con.execute("SELECT id FROM leads WHERE email=?", (email,)).fetchone()["id"]
-    text = [f"Handed over by {who_from} ({str(d.get('label', '')).replace('_', ' ')} reply) on {str(d.get('at', at))[:16].replace('T', ' ')}.",
+    text = ([f"Reassigned to you from {d['reassigned_from']}."] if d.get("reassigned_from") else []) + \
+           [f"Handed over by {who_from} ({str(d.get('label', '')).replace('_', ' ')} reply) on {str(d.get('at', at))[:16].replace('T', ' ')}."
             "", "--- Their reply ---", d.get("reply") or "(not available)"]
     if d.get("intro"):
         text += ["", "--- Introduction sent (you were in CC) ---", d["intro"]]
@@ -417,6 +483,77 @@ def restore(con):
     return n
 
 
+def _receive_comment(con, d):
+    con.execute("INSERT OR IGNORE INTO comments(uid, lead_email, lead_name, company, author, author_name, text, at, to_, mine, synced, seen) "
+                "VALUES (?,?,?,?,?,?,?,?,?,0,1,0)",
+                (d.get("uid"), str(d.get("lead_email") or "").lower(), d.get("lead_name") or "", d.get("company") or "", d.get("author") or "",
+                 d.get("author_name") or "", d.get("text") or "", d.get("at") or iso(now_utc()), "[]"))
+
+
+def _receive_removed(con, d):
+    """The master moved one of my prospects to another supervisor."""
+    email = str(d.get("lead_email") or "").lower()
+    row = con.execute("SELECT id FROM leads WHERE email=? AND handed_from IS NOT NULL", (email,)).fetchone()
+    if row:
+        con.execute("UPDATE leads SET handed_from=NULL WHERE id=?", (row["id"],))
+        con.execute("UPDATE tasks SET status='done', done_at=? WHERE lead_id=? AND status='open'", (iso(now_utc())[:10], row["id"]))
+        con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",
+                    (row["id"], f"Your manager moved this prospect to {d.get('to_name') or 'another supervisor'}.", iso(now_utc())))
+        log_event(con, row["id"], "reassigned", d.get("to_name") or "")
+
+
+def _transfer_out(con):
+    """I'm being removed from the team: pack up my leads so the console can share them with the others."""
+    rows = []
+    for l in con.execute("SELECT l.*, c.name cname, (SELECT MAX(at) FROM events e WHERE e.lead_id=l.id AND e.type='sent') last_sent "
+                         "FROM leads l LEFT JOIN campaigns c ON c.id=COALESCE(l.campaign_id,1) "
+                         "WHERE l.status NOT IN ('unsubscribed','bounced') AND l.handed_from IS NULL ORDER BY l.id"):
+        x = json.loads(l["extra"] or "{}")
+        notes = [r[0][:500] for r in con.execute("SELECT body FROM notes WHERE lead_id=? ORDER BY at DESC LIMIT 3", (l["id"],))]
+        rows.append({"email": l["email"], "first_name": l["first_name"], "company": l["company"], "website": l["website"], "extra": x,
+                     "status": l["status"], "step": l["step"], "first_subject": l["first_subject"], "campaign": l["cname"],
+                     "last_sent": l["last_sent"], "stage": l["stage"], "notes": notes})
+    supp = [r[0] for r in con.execute("SELECT email FROM suppression")]
+    parts = [rows[i:i + 300] for i in range(0, len(rows), 300)] or [[]]
+    s = state()
+    s["transfer_queue"] = [{"part": i, "leads": p, "last": i == len(parts) - 1, "suppress": supp if i == 0 else []} for i, p in enumerate(parts)]
+    save_state(s)
+    con.execute("UPDATE leads SET status='paused' WHERE status='active'")      # nothing more goes out from this BSO
+    con.execute("UPDATE outbox SET status='cancelled' WHERE status IN ('pending','approved')")
+    con.commit()
+
+
+def _leads_in(con, d):
+    """Leads shared with me from someone who left the team."""
+    import bot as _bot
+    who = d.get("from_name") or "a colleague"
+    for r in d.get("leads") or []:
+        email = str(r.get("email") or "").lower()
+        if not email or con.execute("SELECT 1 FROM leads WHERE email=?", (email,)).fetchone():
+            continue
+        cid = 1
+        if r.get("campaign"):
+            hit = con.execute("SELECT id FROM campaigns WHERE name=?", (r["campaign"],)).fetchone()
+            cid = hit["id"] if hit else 1
+        row = dict(r.get("extra") or {}, email=email, first_name=r.get("first_name") or "", company=r.get("company") or "",
+                   website=r.get("website") or "", campaign_id=cid, moved_from=who)
+        st = r.get("status") or "active"
+        step = int(r.get("step") or 0)
+        mid = st == "active" and step > 0
+        lid = _bot.add_lead(con, row, "paused" if mid else st)
+        if not lid:
+            continue
+        con.execute("UPDATE leads SET step=?, first_subject=?, stage=COALESCE(?, stage) WHERE id=?", (step, r.get("first_subject"), r.get("stage"), lid))
+        con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",
+                    (lid, f"Moved to you from {who}" + (f" (last emailed {str(r['last_sent'])[:10]})." if r.get("last_sent") else ".") +
+                     ("\n" + "\n---\n".join(r["notes"]) if r.get("notes") else ""), iso(now_utc())))
+        if mid:
+            add_task(con, f"Continue or restart the sequence for {r.get('first_name') or email} (moved from {who}, {step} email(s) already sent)", lead_id=lid)
+    for e in d.get("suppress") or []:
+        con.execute("INSERT OR IGNORE INTO suppression(email, reason, at) VALUES (?,?,?)", (e, f"do-not-contact from {who}", iso(now_utc())))
+    con.commit()
+
+
 def _apply_decisions(con, decisions):
     """Apply what the master console sent. Returns (draft ids done, handover ids received)."""
     done, ho_done = [], []
@@ -425,8 +562,33 @@ def _apply_decisions(con, decisions):
         if action == "config":
             s = state()
             s["supervisors"] = d.get("supervisors") or []
+            s["people"] = d.get("people") or s.get("people") or []
             s["sup_as_of"] = d.get("as_of", "")
             save_state(s)
+            continue
+        if action == "transfer_out":
+            if not state().get("transfer_queue") and not state().get("transfer_done"):
+                _transfer_out(con)
+            if d.get("handover_id"):
+                ho_done.append(d["handover_id"])
+            continue
+        if action == "leads_in":
+            hid = d.get("handover_id")
+            if hid not in state().get("ho_seen", []):
+                _leads_in(con, d)
+                s2 = state()
+                s2["ho_seen"] = (s2.get("ho_seen", []) + [hid])[-1000:]
+                save_state(s2)
+            if hid:
+                ho_done.append(hid)
+            continue
+        if action in ("comment", "removed"):
+            try:
+                (_receive_comment if action == "comment" else _receive_removed)(con, d)
+            except Exception as e:
+                print(action + ":", e)
+            if d.get("handover_id"):
+                ho_done.append(d["handover_id"])
             continue
         if action == "handover":
             s = state()
@@ -492,7 +654,12 @@ def status(con):
 
 
 def sync(con, version=""):
-    """One round trip. Returns (ok, message). Never raises."""
+    """One round trip. Returns (ok, message). Never raises. One at a time per app."""
+    with _sync_lock:
+        return _sync(con, version)
+
+
+def _sync(con, version=""):
     s = state()
     if not joined():
         return False, "Not in a team."
@@ -516,6 +683,13 @@ def sync(con, version=""):
         except Exception as e:
             print("status:", e)
         packed += st_extra
+        cms = con.execute("SELECT * FROM comments WHERE mine=1 AND synced=0 ORDER BY id LIMIT 50").fetchall()
+        packed += [{"id": f"c{c['id']}", "type": "__comment", "data": {"uid": c["uid"], "lead_email": c["lead_email"], "lead_name": c["lead_name"],
+                                                                       "company": c["company"], "text": c["text"], "at": c["at"], "to": json.loads(c["to_"] or "[]")}} for c in cms]
+        tq = (s.get("transfer_queue") or [])[:2]
+        packed += [{"id": f"t{t['part']}", "type": "__transfer", "data": t} for t in tq]
+        if s.get("away_pending"):
+            packed.append({"id": "away", "type": "__away", "data": {"until": s.get("away_until", "")}})
         acked = list(s.get("ack", [])) + [f"ho:{x}" for x in s.get("ho_ack", []) if x is not None]
         status, j = _post(s["hub"], "/api/v1/sync", {"events": packed, "drafts": drafts, "acked": acked, "version": version},
                           token=env(TOKEN_KEY))
@@ -537,6 +711,15 @@ def sync(con, version=""):
     s["last_ok"] = iso(now_utc())
     if st_now:
         s["status_key"], s["status_at"] = st_now
+    if cms:
+        con.execute(f"UPDATE comments SET synced=1 WHERE id IN ({','.join('?' * len(cms))})", [c["id"] for c in cms])
+        con.commit()
+    s.pop("away_pending", None)
+    if tq:
+        rest = (s.get("transfer_queue") or [])[len(tq):]
+        s["transfer_queue"] = rest
+        if not rest:
+            s["transfer_done"] = True
     if handovers:
         con.execute(f"UPDATE handover_out SET synced=1 WHERE id IN ({','.join('?' * len(handovers))})", [h["out_id"] for h in handovers])
         con.commit()

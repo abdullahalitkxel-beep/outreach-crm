@@ -97,6 +97,16 @@ CREATE TABLE IF NOT EXISTS handovers (
     delivered INTEGER DEFAULT 0, status TEXT DEFAULT 'new', status_at TEXT,
     UNIQUE(from_user_id, lead_local_id)
 );
+CREATE TABLE IF NOT EXISTS comments (
+    id INTEGER PRIMARY KEY, uid TEXT UNIQUE, user_id INTEGER, author_name TEXT, lead_email TEXT, lead_name TEXT, company TEXT,
+    text TEXT, at TEXT, to_ TEXT
+);
+CREATE TABLE IF NOT EXISTS notices (                      -- items for one person, when there is no Google relay to carry them
+    id INTEGER PRIMARY KEY, user_id INTEGER, item TEXT, delivered INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS transfers (                    -- a removed person's leads, uploaded by their laptop, waiting to be shared out
+    id INTEGER PRIMARY KEY, user_id INTEGER, part INTEGER, leads TEXT, at TEXT, UNIQUE(user_id, part)
+);
 CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, at TEXT, actor TEXT, action TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS reset_tokens (id INTEGER PRIMARY KEY, user_id INTEGER, token_hash TEXT UNIQUE, expires_at TEXT, used_at TEXT);
 CREATE TABLE IF NOT EXISTS throttle (key TEXT PRIMARY KEY, n INTEGER, first_at REAL);
@@ -136,7 +146,7 @@ def init_db():
         con.execute("ALTER TABLE users ADD COLUMN username TEXT")
         con.execute("UPDATE users SET username=lower(email) WHERE username IS NULL")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username)")
-    for col, decl in (("relay_pw", "TEXT"), ("tv", "INTEGER DEFAULT 1"), ("bot_status", "TEXT")):
+    for col, decl in (("relay_pw", "TEXT"), ("tv", "INTEGER DEFAULT 1"), ("bot_status", "TEXT"), ("away_until", "TEXT")):
         if col not in {r[1] for r in con.execute("PRAGMA table_info(users)")}:
             con.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
     con.commit()
@@ -220,7 +230,7 @@ def _load():
     g.me = None
     uid = session.get("uid")
     if uid:
-        u = db().execute("SELECT * FROM users WHERE id=? AND status!='disabled' AND role IN ('owner','manager')", (uid,)).fetchone()
+        u = db().execute("SELECT * FROM users WHERE id=? AND status NOT IN ('disabled','removed','removing') AND role IN ('owner','manager')", (uid,)).fetchone()
         g.me = dict(u) if u else None
         if not g.me:
             session.clear()
@@ -372,7 +382,7 @@ def login():
         if throttled(k1, 5, 900) or throttled(k2, 30, 900):
             err = "Too many failed attempts. Wait 15 minutes and try again."
         else:
-            u = db().execute("SELECT * FROM users WHERE (username=? OR email=?) AND status!='disabled' AND role IN ('owner','manager')", (email, email)).fetchone()
+            u = db().execute("SELECT * FROM users WHERE (username=? OR email=?) AND status NOT IN ('disabled','removed','removing') AND role IN ('owner','manager')", (email, email)).fetchone()
             if u and u["pw_hash"] and check_password_hash(u["pw_hash"], request.form.get("password", "")):
                 throttle_clear(k1)
                 session.clear()
@@ -441,7 +451,7 @@ def forgot():
         if not throttled(k1, 6, 3600) and not throttled(k2, 3, 3600):
             throttle_hit(k1, 3600)
             throttle_hit(k2, 3600)
-            u = db().execute("SELECT * FROM users WHERE (email=? OR username=?) AND status!='disabled' AND role IN ('owner','manager')", (email, email)).fetchone()
+            u = db().execute("SELECT * FROM users WHERE (email=? OR username=?) AND status NOT IN ('disabled','removed','removing') AND role IN ('owner','manager')", (email, email)).fetchone()
             if u:
                 token = secrets.token_urlsafe(32)
                 db().execute("INSERT INTO reset_tokens(user_id, token_hash, expires_at) VALUES (?,?,?)",
@@ -496,7 +506,7 @@ def user_stats(days=7):
     since = iso(now() - timedelta(days=days))
     wk = iso(now() - timedelta(days=7))
     out = []
-    for u in db().execute("SELECT * FROM users WHERE role IN ('member','manager','owner','supervisor','bot') ORDER BY name").fetchall():
+    for u in db().execute("SELECT * FROM users WHERE role IN ('member','manager','owner','supervisor','bot') AND status!='removed' ORDER BY name").fetchall():
         c = lambda t, s=since: db().execute("SELECT COUNT(*) FROM events WHERE user_id=? AND type=? AND at>=?", (u["id"], t, s)).fetchone()[0]
         sent, replies, bounces = c("sent"), c("reply"), c("bounce")
         interested = db().execute("SELECT COUNT(*) FROM events WHERE user_id=? AND type='reply' AND at>=? AND detail IN ('interested','question','meeting_request')",
@@ -626,9 +636,10 @@ def user_save(uid):
         role = f.get("role", u["role"]) if u["role"] != "owner" else "owner"
         if role not in ROLES:
             role = u["role"]
-        db().execute("UPDATE users SET name=?, role=?, daily_cap=?, weekly_target=?, approval=?, note=? WHERE id=?",
+        db().execute("UPDATE users SET name=?, role=?, daily_cap=?, weekly_target=?, approval=?, note=?, away_until=? WHERE id=?",
                      (f.get("name", u["name"]).strip() or u["name"], role, _valid_int(f.get("daily_cap")), _valid_int(f.get("weekly_target")),
-                      "master" if f.get("approval") == "master" else "member", f.get("note", "")[:300], uid))
+                      "master" if f.get("approval") == "master" else "member", f.get("note", "")[:300],
+                      (f.get("away_until") or "").strip()[:10] or None, uid))
         audit("user_changed", f"{u['email']}: role={role} cap={f.get('daily_cap')} target={f.get('weekly_target')} approval={f.get('approval')}")
     elif action in ("disable", "enable"):
         if u["role"] == "owner":
@@ -636,6 +647,19 @@ def user_save(uid):
         new = "disabled" if action == "disable" else ("active" if db().execute("SELECT 1 FROM devices WHERE user_id=?", (uid,)).fetchone() or u["role"] != "member" else "invited")
         db().execute("UPDATE users SET status=? WHERE id=?", (new, uid))
         audit("user_" + action + "d", u["email"])
+    elif action in ("remove", "remove_now"):
+        if u["role"] == "owner" or u["id"] == g.me["id"]:
+            abort(400, "The owner can't be removed.")
+        try:
+            moved, waiting = remove_user(db(), u, wait_for_leads=action == "remove")
+        except relay.RelayError as e:
+            return redirect(url_for("user_detail", uid=uid, err=f"Couldn't move their prospects: {e}"))
+        audit("user_remove_started" if waiting else "user_removed", f"{u['email']}: {moved} prospect(s) shared out")
+        threading.Thread(target=relay_cycle, daemon=True).start()
+        msg = (f"{moved} open prospect(s) shared equally among the other supervisors. " if moved else "") + \
+              ("Their BSO has stopped sending; at its next check-in it hands over its leads, which are then shared equally among the remaining senders, and the account is removed." if waiting
+               else "The account is removed.")
+        return redirect(url_for("users", err=None, ok=msg))
     elif action == "resetpw":
         pw = f.get("password", "") or gen_password()
         if not strong(pw):
@@ -681,6 +705,119 @@ def approval_action(did):
     return redirect(url_for("approvals") + f"#d{did}" if action == "save" else url_for("approvals"))
 
 
+STAGES_BOARD = [("new", "New"), ("contacted", "Contacted"), ("meeting", "Meeting booked"), ("proposal", "Proposal sent"), ("won", "Won"), ("lost", "Lost")]
+
+
+def _ho_rows(where="", args=()):
+    rows_ = db().execute("SELECT h.*, f.name fromname, s.name supname, s.away_until sup_away, "
+                         "(SELECT COUNT(*) FROM comments c WHERE c.lead_email=h.lead_email) ncomments "
+                         "FROM handovers h LEFT JOIN users f ON f.id=h.from_user_id LEFT JOIN users s ON s.id=h.supervisor_id " + where +
+                         " ORDER BY h.at DESC LIMIT 500", args).fetchall()
+    out = []
+    for r in rows_:
+        d = dict(r)
+        p = json.loads(d.get("payload") or "{}")
+        d["campaign"] = p.get("campaign", "")
+        at = parse(d["at"])
+        d["age"] = (now() - at).days if at else 0
+        d["stale"] = d["status"] == "new" and at and now() - at > timedelta(hours=48)
+        out.append(d)
+    return out
+
+
+@app.route("/board")
+@need()
+def board():
+    sid = request.args.get("sup", type=int)
+    camp = request.args.get("campaign", "")
+    items = _ho_rows("WHERE h.supervisor_id=?" if sid else "", (sid,) if sid else ())
+    if camp:
+        items = [i for i in items if i["campaign"] == camp]
+    cols = [(k, l, [i for i in items if (i["status"] or "new") == k]) for k, l in STAGES_BOARD]
+    sups = db().execute("SELECT id, name FROM users WHERE role='supervisor' ORDER BY name").fetchall()
+    camps = sorted({i["campaign"] for i in _ho_rows() if i["campaign"]})
+    return render("board.html", cols=cols, sups=sups, sid=sid, camps=camps, camp=camp, tab="board")
+
+
+def _mentioned_users(text):
+    low = " " + (text or "").lower()
+    out = []
+    for u in db().execute("SELECT * FROM users WHERE status NOT IN ('disabled','removed','removing') AND role!='bot'").fetchall():
+        names = {u["name"].lower(), u["name"].split()[0].lower(), (u["username"] or "").lower()}
+        if any(n and re.search(r"@" + re.escape(n) + r"(?![\w.])", low) for n in names):
+            out.append(u)
+    return out
+
+
+@app.route("/handovers/<int:hid>")
+@need()
+def handover_detail(hid):
+    h = (_ho_rows("WHERE h.id=?", (hid,)) or [None])[0] or abort(404)
+    p = json.loads(h["payload"] or "{}")
+    comments = db().execute("SELECT * FROM comments WHERE lead_email=? ORDER BY at, id", (h["lead_email"],)).fetchall()
+    sups = db().execute("SELECT id, name, away_until FROM users WHERE role='supervisor' AND status NOT IN ('disabled','removed','removing') ORDER BY name").fetchall()
+    people = db().execute("SELECT name FROM users WHERE status NOT IN ('disabled','removed','removing') AND role!='bot' ORDER BY name").fetchall()
+    return render("handover.html", h=h, p=p, comments=comments, sups=sups, people=people, tab="board")
+
+
+@app.post("/handovers/<int:hid>/comment")
+@need()
+def handover_comment(hid):
+    h = db().execute("SELECT * FROM handovers WHERE id=?", (hid,)).fetchone() or abort(404)
+    text = request.form.get("text", "").strip()[:4000]
+    if not text:
+        return redirect(url_for("handover_detail", hid=hid))
+    lead = json.loads(h["payload"] or "{}").get("lead") or {}
+    to = {u["id"]: u for u in _mentioned_users(text)}
+    if h["supervisor_id"]:
+        to.setdefault(h["supervisor_id"], None)
+    for r in db().execute("SELECT DISTINCT user_id FROM comments WHERE lead_email=?", (h["lead_email"],)):
+        to.setdefault(r["user_id"], None)
+    to.pop(g.me["id"], None)
+    uid_ = "hub-" + secrets.token_hex(8)
+    me_key = relay_key_for(g.me["username"] or g.me["email"])
+    db().execute("INSERT INTO comments(uid, user_id, author_name, lead_email, lead_name, company, text, at, to_) VALUES (?,?,?,?,?,?,?,?,?)",
+                 (uid_, g.me["id"], g.me["name"], h["lead_email"], h["lead_name"], h["company"], text, iso(), json.dumps(sorted(to))))
+    item = {"action": "comment", "uid": uid_, "lead_email": h["lead_email"], "lead_name": h["lead_name"], "company": h["company"],
+            "text": text, "author": me_key, "author_name": g.me["name"], "at": iso()}
+    for user_id in to:
+        db().execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (user_id, json.dumps(item)))
+    db().commit()
+    threading.Thread(target=relay_cycle, daemon=True).start()        # publish now rather than in a minute
+    return redirect(url_for("handover_detail", hid=hid, _anchor="comments"))
+
+
+@app.post("/handovers/<int:hid>/reassign")
+@need()
+def handover_reassign(hid):
+    h = db().execute("SELECT * FROM handovers WHERE id=?", (hid,)).fetchone() or abort(404)
+    new = db().execute("SELECT * FROM users WHERE id=? AND role='supervisor'", (request.form.get("to", type=int),)).fetchone()
+    if not new or new["id"] == h["supervisor_id"]:
+        return redirect(url_for("handover_detail", hid=hid))
+    old = db().execute("SELECT * FROM users WHERE id=?", (h["supervisor_id"],)).fetchone()
+    p = json.loads(h["payload"] or "{}")
+    item = {"action": "handover", "lead": p.get("lead") or {}, "label": h["label"], "reply": p.get("reply", ""), "intro": p.get("intro", ""),
+            "thread": (p.get("thread") or [])[:6], "from": db().execute("SELECT name FROM users WHERE id=?", (h["from_user_id"],)).fetchone()[0] if h["from_user_id"] else "",
+            "at": h["at"], "stage": h["status"] or "new", "campaign": p.get("campaign", ""), "reassigned_from": old["name"] if old else ""}
+    url, key = _m_get(db(), "relay_url", ""), relay_key()
+    try:
+        if url and key and relay_v3(db()) and old:
+            relay.call(url, {"action": "admin_reassign", "admin_key": key, "from": relay_key_for(old["username"] or old["email"]),
+                             "to": relay_key_for(new["username"] or new["email"]), "lead_email": h["lead_email"], "item": item})
+        else:
+            db().execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (new["id"], json.dumps(item)))
+            if old:
+                db().execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (old["id"], json.dumps(
+                    {"action": "removed", "lead_email": h["lead_email"], "to_name": new["name"], "at": iso()})))
+    except relay.RelayError as e:
+        return redirect(url_for("handover_detail", hid=hid, err=f"Couldn't move it: {e}"))
+    db().execute("UPDATE handovers SET supervisor_id=?, delivered=0 WHERE id=?", (new["id"], hid))
+    db().commit()
+    audit("prospect_reassigned", f"{h['lead_email']}: {old['name'] if old else '-'} -> {new['name']}")
+    threading.Thread(target=relay_cycle, daemon=True).start()
+    return redirect(url_for("handover_detail", hid=hid, err=None))
+
+
 @app.route("/handovers")
 @need()
 def handovers_page():
@@ -692,11 +829,11 @@ def handovers_page():
         da, db_ = parse(a), parse(b)
         return round((db_ - da).total_seconds() / 3600, 1) if da and db_ else None
     items = [dict(r, wait=hours(r["at"], r["status_at"]) if r["status"] != "new" else None) for r in rows]
-    sups = db().execute("SELECT u.id, u.name, u.status, (SELECT COUNT(*) FROM handovers h WHERE h.supervisor_id=u.id) n, "
+    sups = db().execute("SELECT u.id, u.name, u.status, u.away_until, (SELECT COUNT(*) FROM handovers h WHERE h.supervisor_id=u.id) n, "
                         "(SELECT COUNT(*) FROM handovers h WHERE h.supervisor_id=u.id AND h.status='new') open_n, "
                         "(SELECT COUNT(*) FROM handovers h WHERE h.supervisor_id=u.id AND h.status IN ('meeting','proposal','won')) good "
                         "FROM users u WHERE u.role='supervisor' ORDER BY u.name").fetchall()
-    return render("handovers.html", items=items, sups=sups, sid=sid, tab="handovers")
+    return render("handovers.html", items=items, sups=sups, sid=sid, tab="handovers", today=now().strftime("%Y-%m-%d"))
 
 
 @app.route("/activity")
@@ -832,7 +969,7 @@ def api_login():
         throttle_hit(k1, 900)
         throttle_hit(k2, 900)
         return jsonify(error="ID or password is wrong."), 401
-    if u["status"] == "disabled":
+    if u["status"] in ("disabled", "removing", "removed"):
         return jsonify(error="This account is paused. Contact your manager."), 403
     throttle_clear(k1)
     token = secrets.token_urlsafe(32)
@@ -855,6 +992,32 @@ def ingest(con, uid, j):
     for e in (j.get("events") or [])[:600]:
         if isinstance(e, dict) and e.get("type") == "__handover":
             store_handover(con, uid, e.get("data") or {})
+            continue
+        if isinstance(e, dict) and e.get("type") == "__comment":
+            c = e.get("data") or {}
+            if c.get("uid"):
+                con.execute("INSERT OR IGNORE INTO comments(uid, user_id, author_name, lead_email, lead_name, company, text, at, to_) "
+                            "VALUES (?,?,(SELECT name FROM users WHERE id=?),?,?,?,?,?,?)",
+                            (str(c["uid"])[:80], uid, uid, str(c.get("lead_email") or "").lower()[:200], str(c.get("lead_name") or "")[:200],
+                             str(c.get("company") or "")[:200], str(c.get("text") or "")[:4000], str(c.get("at") or iso())[:25], json.dumps(c.get("to") or [])))
+                if not relay_v3(con):            # no Google relay v3: this console passes the comment on
+                    for k in c.get("to") or []:
+                        tu = con.execute("SELECT id FROM users WHERE username=? OR email=?", (ident_from_relay(k), ident_from_relay(k))).fetchone()
+                        if tu and tu["id"] != uid:
+                            con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (tu["id"], json.dumps(dict(
+                                action="comment", uid=c["uid"], lead_email=c.get("lead_email"), lead_name=c.get("lead_name"), company=c.get("company"),
+                                text=c.get("text"), author=relay_key_for(con.execute("SELECT COALESCE(username,email) FROM users WHERE id=?", (uid,)).fetchone()[0]),
+                                author_name=con.execute("SELECT name FROM users WHERE id=?", (uid,)).fetchone()[0], at=c.get("at")))))
+            continue
+        if isinstance(e, dict) and e.get("type") == "__transfer":
+            d = e.get("data") or {}
+            con.execute("INSERT OR IGNORE INTO transfers(user_id, part, leads, at) VALUES (?,?,?,?)",
+                        (uid, int(d.get("part") or 0), json.dumps({"leads": d.get("leads") or [], "suppress": d.get("suppress") or []}), iso()))
+            if d.get("last"):
+                finish_removal(con, uid)
+            continue
+        if isinstance(e, dict) and e.get("type") == "__away":
+            con.execute("UPDATE users SET away_until=? WHERE id=?", (str((e.get("data") or {}).get("until") or "")[:10] or None, uid))
             continue
         if isinstance(e, dict) and e.get("type") == "__status":
             con.execute("UPDATE users SET bot_status=? WHERE id=?", (json.dumps(e.get("data") or {})[:5000], uid))
@@ -886,6 +1049,12 @@ def ingest(con, uid, j):
         elif cur["status"] == "pending":  # the member may still be editing; the manager has not decided
             con.execute("UPDATE drafts SET subject=?, body=? WHERE id=?", (vals[4], vals[5], cur["id"]))
     for lid in (j.get("acked") or [])[:600]:
+        if isinstance(lid, str) and lid.startswith("ho:nt:"):
+            try:
+                con.execute("UPDATE notices SET delivered=1 WHERE id=? AND user_id=?", (int(lid[6:]), uid))
+            except ValueError:
+                pass
+            continue
         if isinstance(lid, str) and lid.startswith("ho:"):
             try:
                 con.execute("UPDATE handovers SET delivered=1 WHERE id=? AND supervisor_id=?", (int(lid[3:]), uid))
@@ -904,7 +1073,7 @@ def store_handover(con, uid, h):
     lead = h.get("lead") or {}
     sid = str(h.get("supervisor") or "")
     sup = con.execute("SELECT id FROM users WHERE role='supervisor' AND (username=? OR email=?)", (sid, sid)).fetchone() \
-        or con.execute("SELECT id FROM users WHERE role='supervisor' AND status!='disabled' ORDER BY id LIMIT 1").fetchone()
+        or con.execute("SELECT id FROM users WHERE role='supervisor' AND status NOT IN ('disabled','removed','removing') ORDER BY id LIMIT 1").fetchone()
     try:
         lid = int(h.get("lead_local_id"))
     except (TypeError, ValueError):
@@ -927,13 +1096,112 @@ def store_handover(con, uid, h):
             con.execute("UPDATE handovers SET status=?, status_at=? WHERE supervisor_id=? AND lead_email=?", (last["detail"], last["at"], sup["id"], email))
 
 
+def relay_v3(con):
+    return bool(_m_get(con, "relay_url", "")) and int(_m_get(con, "relay_version", "1") or 1) >= 3
+
+
+def is_away(u):
+    return bool(u["away_until"] and u["away_until"] >= now().strftime("%Y-%m-%d"))
+
+
+def share_out(people, items, load=None):
+    """Spread items equally: each goes to whoever has the fewest so far (counting what they already have)."""
+    load = dict(load or {p: 0 for p in people})
+    out = {p: [] for p in people}
+    for it in items:
+        p = min(people, key=lambda x: (load.get(x, 0), x))
+        out[p].append(it)
+        load[p] = load.get(p, 0) + 1
+    return out
+
+
+def reassign_prospect(con, h, new, old):
+    """Move one handed-over prospect to another supervisor (through Google when the relay is version 3)."""
+    p = json.loads(h["payload"] or "{}")
+    frm = con.execute("SELECT name FROM users WHERE id=?", (h["from_user_id"],)).fetchone() if h["from_user_id"] else None
+    item = {"action": "handover", "lead": p.get("lead") or {}, "label": h["label"], "reply": p.get("reply", ""), "intro": p.get("intro", ""),
+            "thread": (p.get("thread") or [])[:6], "from": frm["name"] if frm else "", "at": h["at"], "stage": h["status"] or "new",
+            "campaign": p.get("campaign", ""), "reassigned_from": old["name"] if old else ""}
+    url, key = _m_get(con, "relay_url", ""), relay_key()
+    if url and key and relay_v3(con) and old:
+        relay.call(url, {"action": "admin_reassign", "admin_key": key, "from": relay_key_for(old["username"] or old["email"]),
+                         "to": relay_key_for(new["username"] or new["email"]), "lead_email": h["lead_email"], "item": item})
+    else:
+        con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (new["id"], json.dumps(item)))
+        if old and old["status"] not in ("removed",):
+            con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (old["id"], json.dumps(
+                {"action": "removed", "lead_email": h["lead_email"], "to_name": new["name"], "at": iso()})))
+    con.execute("UPDATE handovers SET supervisor_id=?, delivered=0 WHERE id=?", (new["id"], h["id"]))
+
+
+def finish_removal(con, uid):
+    """The person's leads (if any) have arrived: share them out equally, then remove the account for good."""
+    u = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not u or u["status"] == "removed":
+        return 0
+    leads, supp = [], []
+    for t in con.execute("SELECT leads FROM transfers WHERE user_id=? ORDER BY part", (uid,)).fetchall():
+        data = json.loads(t["leads"] or "{}")
+        leads += data.get("leads") or [] if isinstance(data, dict) else data
+        supp += data.get("suppress") or [] if isinstance(data, dict) else []
+    takers = con.execute("SELECT * FROM users WHERE id!=? AND role IN ('member','manager','bot','owner') AND status NOT IN ('disabled','removed','removing') "
+                         "AND relay_pw IS NOT NULL ORDER BY role='owner', id", (uid,)).fetchall()
+    senders = [t for t in takers if t["role"] != "owner"] or takers
+    if (leads or supp) and senders:
+        shares = share_out([t["id"] for t in senders], leads)
+        for tid, chunk in shares.items():
+            parts = [chunk[i:i + 300] for i in range(0, len(chunk), 300)] or [[]]
+            for i, part in enumerate(parts):           # everyone gets the do-not-contact list
+                con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)",
+                            (tid, json.dumps({"action": "leads_in", "from_name": u["name"], "leads": part, "suppress": supp if i == 0 else []})))
+    con.execute("UPDATE users SET status='removed', name=?, username=?, pw_hash=NULL, relay_pw=NULL, tv=COALESCE(tv,1)+1 WHERE id=?",
+                (u["name"] + " (removed)", f"removed-{uid}-{u['username'] or u['email']}", uid))
+    con.execute("UPDATE devices SET revoked=1 WHERE user_id=?", (uid,))
+    con.execute("DELETE FROM transfers WHERE user_id=?", (uid,))
+    con.execute("UPDATE users SET email=? WHERE id=?", (f"removed-{uid}-{u['email']}", uid))
+    con.execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)",
+                (iso(), "system", "user_removed", f"{u['email']}: {len(leads)} lead(s) shared among {len(senders)} person(s)"))
+    con.commit()
+    return len(leads)
+
+
+def remove_user(con, u, wait_for_leads=True):
+    """Start removing someone: stop them sending, share their prospects out now, collect their leads at their next check-in."""
+    moved = 0
+    if u["role"] == "supervisor":
+        others = [x for x in con.execute("SELECT * FROM users WHERE role='supervisor' AND id!=? AND status NOT IN ('disabled','removed','removing') "
+                                         "ORDER BY id", (u["id"],)).fetchall()]
+        others = [x for x in others if not is_away(x)] or others          # people on leave only if nobody else is there
+        open_h = con.execute("SELECT * FROM handovers WHERE supervisor_id=? AND COALESCE(status,'new') NOT IN ('won','lost') ORDER BY at", (u["id"],)).fetchall()
+        if others and open_h:
+            load = {o["id"]: con.execute("SELECT COUNT(*) FROM handovers WHERE supervisor_id=? AND COALESCE(status,'new') NOT IN ('won','lost')",
+                                         (o["id"],)).fetchone()[0] for o in others}
+            by_id = {o["id"]: o for o in others}
+            for oid, hs in share_out(list(by_id), open_h, load).items():
+                for h in hs:
+                    reassign_prospect(con, h, by_id[oid], u)
+                    moved += 1
+    has_laptop = con.execute("SELECT 1 FROM devices WHERE user_id=? AND revoked=0", (u["id"],)).fetchone() or u["last_seen"]
+    if wait_for_leads and u["role"] in ("member", "manager", "bot") and has_laptop:
+        con.execute("UPDATE users SET status='removing' WHERE id=?", (u["id"],))
+        con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (u["id"], json.dumps({"action": "transfer_out"})))
+        con.commit()
+        return moved, True
+    finish_removal(con, u["id"])
+    return moved, False
+
+
 def supervisor_config(con):
     sups = []
-    for u in con.execute("SELECT * FROM users WHERE role='supervisor' AND status!='disabled' ORDER BY id").fetchall():
+    for u in con.execute("SELECT * FROM users WHERE role='supervisor' AND status NOT IN ('disabled','removed','removing') ORDER BY id").fetchall():
+        if is_away(u):
+            continue
         n = con.execute("SELECT COUNT(*) FROM handovers WHERE supervisor_id=? AND at>=?", (u["id"], iso(now() - timedelta(days=30)))).fetchone()[0]
         sups.append({"id": u["username"] or u["email"], "name": u["name"], "email": u["email"], "count": n})
     last = con.execute("SELECT MAX(at) FROM handovers").fetchone()[0] or ""
-    return {"action": "config", "local_id": None, "supervisors": sups, "as_of": last}
+    ppl = [{"key": relay_key_for(u["username"] or u["email"]), "name": u["name"], "role": u["role"]}
+           for u in con.execute("SELECT * FROM users WHERE status NOT IN ('disabled','removed','removing') AND role!='bot' ORDER BY name").fetchall()]
+    return {"action": "config", "local_id": None, "supervisors": sups, "people": ppl, "as_of": last}
 
 
 def decisions_for(con, uid, handovers=True):
@@ -941,6 +1209,8 @@ def decisions_for(con, uid, handovers=True):
             "subject": d["subject"], "body": d["body"], "by": d["decided_by"]}
            for d in con.execute("SELECT * FROM drafts WHERE user_id=? AND status!='pending' AND delivered=0", (uid,)).fetchall()]
     out.append(supervisor_config(con))
+    for nt in con.execute("SELECT * FROM notices WHERE user_id=? AND delivered=0 ORDER BY id LIMIT 50", (uid,)).fetchall():
+        out.append(dict(json.loads(nt["item"]), local_id=None, handover_id=f"nt:{nt['id']}"))
     if not handovers:          # the Google relay (version 2+) delivers handovers to the supervisor itself
         return out
     for h in con.execute("SELECT h.*, u.name fromname FROM handovers h LEFT JOIN users u ON u.id=h.from_user_id "
@@ -971,7 +1241,7 @@ def api_sync():
 # this console publishes users, limits and decisions to it and collects the reports, about once a minute.
 
 RELAY_EVERY = 60
-RELAY_LATEST = 2          # version of relay/Code.gs shipped with this BSO
+RELAY_LATEST = 3          # version of relay/Code.gs shipped with this BSO
 _relay_lock = threading.Lock()
 
 
@@ -1004,15 +1274,15 @@ def ident_from_relay(key):
 
 def relay_doc(con):
     users = {}
-    for u in con.execute("SELECT * FROM users").fetchall():
+    for u in con.execute("SELECT * FROM users WHERE status!='removed'").fetchall():
         if not u["relay_pw"]:
             continue
         rec = json.loads(u["relay_pw"])
         ident = u["username"] or u["email"]
         # relay keys can't contain dots (they're part of the sign-in token); the ID itself is matched via "email"
         users[relay_key_for(ident)] = dict(
-            rec, name=u["name"], email=ident, mail=u["email"], role=u["role"], status="disabled" if u["status"] == "disabled" else "active",
-            tv=u["tv"] or 1, daily_cap=u["daily_cap"] or 0, weekly_target=u["weekly_target"] or 0, approval=u["approval"] or "member",
+            rec, name=u["name"], email=ident, mail=u["email"], role=u["role"], status="disabled" if u["status"] in ("disabled", "removing") else "active",
+            tv=u["tv"] or 1, away_until=u["away_until"] or "", daily_cap=u["daily_cap"] or 0, weekly_target=u["weekly_target"] or 0, approval=u["approval"] or "member",
             decisions=decisions_for(con, u["id"], handovers=int(_m_get(con, "relay_version", "1") or 1) < 2))
     return {"org": _m_get(con, "org_name", "Your team"), "grace_hours": int(_m_get(con, "grace_hours", str(GRACE_HOURS)) or 0), "users": users}
 
@@ -1132,8 +1402,8 @@ BASE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name=
 <title>{% block title %}Master console{% endblock %} · BSO</title><style>""" + CSS + """{{ logo_css|safe }}</style></head><body>
 {% if me %}<div class="top">{{ logo(30, tile=True, uid='tp', weight='b', label='BSO')|safe }}<b>BSO Master console</b><small>{{ org }}</small><span class="sp"></span>
 <small>{{ me.name }} · {{ me.role }}</small><form method="post" action="{{ url_for('logout') }}" style="margin:0"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" style="padding:4px 10px">Sign out</button></form></div>
-<div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('users','Users','users'),('approvals','Approvals','approvals'),('handovers','Handovers','handovers_page'),('activity','Activity','activity')] + ([('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
-<div class="wrap">{% if request.args.get('err') %}<div class="err">{{ request.args.get('err') }}</div>{% endif %}{% block body %}{% endblock %}</div><script src="/hub.js"></script></body></html>"""
+<div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('users','Users','users'),('approvals','Approvals','approvals'),('board','Prospect board','board'),('handovers','Handovers','handovers_page'),('activity','Activity','activity')] + ([('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
+<div class="wrap">{% if request.args.get('err') %}<div class="err">{{ request.args.get('err') }}</div>{% endif %}{% if request.args.get('ok') %}<div class="note">{{ request.args.get('ok') }}</div>{% endif %}{% block body %}{% endblock %}</div><script src="/hub.js"></script></body></html>"""
 
 T = {}
 T["base.html"] = BASE
@@ -1208,12 +1478,16 @@ T["user.html"] = """{% extends 'base.html' %}{% block title %}{{ u.name }}{% end
 <div><label>Name</label><input name="name" value="{{ u.name }}"></div><div><label>Email</label><input value="{{ u.email }}" disabled></div><div><label>Sign-in ID</label><input value="{{ u.username or u.email }}" disabled></div>
 <div><label>Role</label><select name="role" {{ 'disabled' if u.role == 'owner' }}>{% for r in ['member','manager','supervisor','bot'] %}<option {{ 'selected' if u.role == r }}>{{ r }}</option>{% endfor %}{% if u.role == 'owner' %}<option selected>owner</option>{% endif %}</select></div>
 <div><label>Daily send cap (0 = no cap)</label><input name="daily_cap" type="number" min="0" value="{{ u.daily_cap or 0 }}"></div><div><label>Weekly target</label><input name="weekly_target" type="number" min="0" value="{{ u.weekly_target or 0 }}"></div>
+{% if u.role == 'supervisor' %}<div><label>Away until (skipped for new prospects; empty = available)</label><input name="away_until" type="date" value="{{ u.away_until or '' }}"></div>{% endif %}
 <div><label>Who approves their emails</label><select name="approval"><option value="member" {{ 'selected' if u.approval != 'master' }}>They approve their own</option><option value="master" {{ 'selected' if u.approval == 'master' }}>The master approves every email</option></select></div>
 </div>
 <label>Private note</label><input name="note" value="{{ u.note or '' }}"><p><button class="btn brand">Save</button></p></form>
 <form method="post" style="display:inline-flex;gap:6px;align-items:center" onsubmit="return confirm('Set a new password? Their laptops are signed out and must sign in again.')"><input type="hidden" name="_csrf" value="{{ csrf }}"><input name="password" placeholder="new password (blank = generate)" autocomplete="off" style="width:240px"><button class="btn" name="action" value="resetpw">Reset password</button></form>
 <form method="post" style="display:inline" onsubmit="return confirm('Disconnect all of this user\\'s laptops? They must sign in again.')"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn danger" name="action" value="revoke">Disconnect laptops</button></form>
-{% if u.role != 'owner' %}<form method="post" style="display:inline"><input type="hidden" name="_csrf" value="{{ csrf }}">{% if u.status == 'disabled' %}<button class="btn" name="action" value="enable">Resume account</button>{% else %}<button class="btn danger" name="action" value="disable" onclick="return confirm('Pause this account? Their BSO stops sending at the next check-in.')">Pause account</button>{% endif %}</form>{% endif %}</div></div>{% endif %}
+{% if u.role != 'owner' %}<form method="post" style="display:inline" onsubmit="return confirm('Remove {{ u.name }} from the team? Their sign-in stops now; their prospects and leads are shared equally among the people who remain. This can\'t be undone.')"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn danger" name="action" value="remove">Remove user…</button></form>
+{% if u.status == 'removing' %}<div class="note" style="margin-top:10px">Being removed: waiting for their BSO to check in and hand over its leads. If that laptop won't come back online:
+<form method="post" style="display:inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn danger" name="action" value="remove_now" onclick="return confirm('Remove now, without the leads on their laptop?')">Remove now without their leads</button></form></div>{% endif %}
+<form method="post" style="display:inline"><input type="hidden" name="_csrf" value="{{ csrf }}">{% if u.status == 'disabled' %}<button class="btn" name="action" value="enable">Resume account</button>{% else %}<button class="btn danger" name="action" value="disable" onclick="return confirm('Pause this account? Their BSO stops sending at the next check-in.')">Pause account</button>{% endif %}</form>{% endif %}</div></div>{% endif %}
 <div class="card"><div class="card-h"><h2>Laptops</h2></div><table><tr><th>Name</th><th>Joined</th><th>Last seen</th><th></th></tr>{% for d in devices %}<tr><td>{{ d.name }}</td><td>{{ d.created_at|dt }}</td><td>{{ d.last_seen|ago }}</td><td>{{ 'disconnected' if d.revoked }}</td></tr>{% else %}<tr><td colspan="4" class="muted">No laptop has joined yet.</td></tr>{% endfor %}</table></div>
 <div class="card"><div class="card-h"><h2>Recent activity</h2></div><table><tr><th>When</th><th>Event</th><th>Lead</th><th>Detail</th></tr>{% for e in events %}<tr><td class="muted">{{ e.at|dt }}</td><td>{{ e.type }}</td><td>{{ e.lead_email }}{% if e.company %}<br><span class="muted">{{ e.company }}</span>{% endif %}</td><td>{{ e.detail }}</td></tr>{% else %}<tr><td colspan="4" class="muted">Nothing reported yet.</td></tr>{% endfor %}</table></div>{% endblock %}"""
 T["approvals.html"] = """{% extends 'base.html' %}{% block title %}Approvals{% endblock %}{% block body %}
@@ -1226,14 +1500,40 @@ T["approvals.html"] = """{% extends 'base.html' %}{% block title %}Approvals{% e
 T["handovers.html"] = """{% extends 'base.html' %}{% block title %}Handovers{% endblock %}{% block body %}
 <div class="note">Interested, meeting-request and question replies are handed to the <b>Lead Gen Supervisors</b> in turn (add one under Users with the role <i>Lead Gen Supervisor</i>). The original inbox sends a short introduction with the supervisor in CC, the supervisor gets a briefing email, and the prospect appears in their BSO under <b>My prospects</b>.</div>
 <div class="card"><div class="card-h"><h2>Supervisors</h2></div><table><tr><th>Supervisor</th><th class="r">Handed over</th><th class="r">Not yet contacted</th><th class="r">Meeting / proposal / won</th><th></th></tr>
-{% for s in sups %}<tr><td><b>{{ s.name }}</b>{% if s.status == 'disabled' %} <span class="badge b-bad">paused: gets no new prospects</span>{% endif %}</td><td class="r">{{ s.n }}</td><td class="r">{{ s.open_n }}</td><td class="r">{{ s.good }}</td><td><a href="{{ url_for('handovers_page', sup=s.id) }}">show</a></td></tr>
+{% for s in sups %}<tr><td><b>{{ s.name }}</b>{% if s.away_until and s.away_until >= today %} <span class="badge b-warn">away until {{ s.away_until }}</span>{% endif %}{% if s.status == 'disabled' %} <span class="badge b-bad">paused: gets no new prospects</span>{% endif %}</td><td class="r">{{ s.n }}</td><td class="r">{{ s.open_n }}</td><td class="r">{{ s.good }}</td><td><a href="{{ url_for('handovers_page', sup=s.id) }}">show</a></td></tr>
 {% else %}<tr><td colspan="5" class="muted">No supervisors yet. Add a user with the role <b>Lead Gen Supervisor</b>. Until then, interested replies stay with the person who received them.</td></tr>{% endfor %}</table></div>
 <div class="card"><div class="card-h"><h2>Handed-over prospects{% if sid %} <a href="{{ url_for('handovers_page') }}" style="font-weight:400;font-size:13px">show all</a>{% endif %}</h2></div>
 <table><tr><th>When</th><th>Prospect</th><th>Reply</th><th>From</th><th>Supervisor</th><th>Stage</th><th class="r">Hours to first update</th></tr>
-{% for h in items %}<tr><td class="muted">{{ h.at|dt }}</td><td><b>{{ h.lead_name }}</b><br><span class="muted">{{ h.title }}{{ ', ' if h.title and h.company }}{{ h.company }}<br>{{ h.lead_email }}</span></td>
+{% for h in items %}<tr><td class="muted">{{ h.at|dt }}</td><td><a href="{{ url_for('handover_detail', hid=h.id) }}"><b>{{ h.lead_name }}</b></a><br><span class="muted">{{ h.title }}{{ ', ' if h.title and h.company }}{{ h.company }}<br>{{ h.lead_email }}</span></td>
 <td>{{ (h.label or '').replace('_', ' ') }}</td><td>{{ h.fromname or '–' }}</td><td>{{ h.supname or '–' }}{% if not h.delivered %}<br><span class="muted">waiting for their BSO</span>{% endif %}</td>
 <td><span class="badge {{ 'b-ok' if h.status in ('meeting','proposal','won') else 'b-bad' if h.status == 'lost' else 'b-warn' if h.status == 'new' else '' }}">{{ h.status }}</span></td><td class="r">{{ h.wait if h.wait is not none else '–' }}</td></tr>
 {% else %}<tr><td colspan="7" class="muted">No prospects handed over yet.</td></tr>{% endfor %}</table></div>{% endblock %}"""
+T["board.html"] = """{% extends 'base.html' %}{% block title %}Prospect board{% endblock %}{% block body %}
+<form method="get" class="card"><div class="card-b" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end">
+<div><label>Supervisor</label><select name="sup"><option value="">Everyone</option>{% for s in sups %}<option value="{{ s.id }}" {{ 'selected' if sid == s.id }}>{{ s.name }}</option>{% endfor %}</select></div>
+<div><label>Campaign</label><select name="campaign"><option value="">All campaigns</option>{% for c in camps %}<option {{ 'selected' if camp == c }}>{{ c }}</option>{% endfor %}</select></div>
+<button class="btn brand">Show</button><span class="muted">Each card is a handed-over prospect. Supervisors move them in their BSO; open a card to comment or move it to another supervisor.</span></div></form>
+<div style="display:grid;grid-template-columns:repeat(6,minmax(170px,1fr));gap:10px;overflow-x:auto">
+{% for key, label, items in cols %}<div style="background:#eef1f4;border-radius:8px;padding:8px;min-height:200px"><div style="font-weight:600;margin:2px 4px 8px">{{ label }} <span class="muted">{{ items|length }}</span></div>
+{% for h in items %}<a href="{{ url_for('handover_detail', hid=h.id) }}" style="display:block;background:#fff;border:1px solid var(--line);{{ 'border-left:4px solid #ba0517;' if h.stale }}border-radius:6px;padding:8px 10px;margin-bottom:8px;color:var(--ink);text-decoration:none">
+<b>{{ h.lead_name }}</b><br><small class="muted">{{ h.company }}</small><br><small>{{ h.supname or '–' }} · {{ h.age }}d{% if h.ncomments %} · 💬 {{ h.ncomments }}{% endif %}</small>
+{% if h.stale %}<br><small style="color:#ba0517">no update for 2+ days</small>{% endif %}{% if h.campaign %}<br><small class="muted">{{ h.campaign }}</small>{% endif %}</a>{% endfor %}</div>{% endfor %}</div>{% endblock %}"""
+T["handover.html"] = """{% extends 'base.html' %}{% block title %}{{ h.lead_name }}{% endblock %}{% block body %}
+<p><a href="{{ url_for('board') }}">← Prospect board</a></p>
+<div class="card"><div class="card-h"><h2>{{ h.lead_name }}</h2><span class="muted">{{ h.title }}{{ ', ' if h.title and h.company }}{{ h.company }} · {{ h.lead_email }}</span><span style="flex:1"></span><span class="badge">{{ h.status }}</span></div>
+<div class="card-b"><div class="grid"><div><small class="muted">Supervisor</small><div><b>{{ h.supname or '–' }}</b>{% if not h.delivered %} <span class="muted">(waiting for their BSO)</span>{% endif %}</div></div>
+<div><small class="muted">Handed over by</small><div>{{ h.fromname or '–' }} · {{ h.at|dt }}</div></div><div><small class="muted">Reply type</small><div>{{ (h.label or '').replace('_', ' ') }}</div></div>
+<div><small class="muted">Campaign</small><div>{{ h.campaign or '–' }}</div></div></div>
+<form method="post" action="{{ url_for('handover_reassign', hid=h.id) }}" style="display:flex;gap:8px;align-items:end;margin-top:12px"><input type="hidden" name="_csrf" value="{{ csrf }}">
+<div><label>Move to another supervisor</label><select name="to">{% for s in sups %}<option value="{{ s.id }}" {{ 'selected' if s.name == h.supname }}>{{ s.name }}{{ ' (away until ' ~ s.away_until ~ ')' if s.away_until }}</option>{% endfor %}</select></div>
+<button class="btn" onclick="return confirm('Move this prospect? It leaves the current supervisor\'s list and appears in the new one\'s.')">Move</button></form></div></div>
+<div class="card" id="comments"><div class="card-h"><h2>Comments</h2><span class="muted">Mention someone with @ and their first name: they see it in their BSO.</span></div><div class="card-b">
+{% for c in comments %}<div style="border-left:3px solid #0176d3;padding:6px 10px;margin-bottom:8px;background:#f8fafc"><b>{{ c.author_name }}</b> <span class="muted">{{ c.at|dt }}</span><div style="white-space:pre-wrap">{{ c.text }}</div></div>{% else %}<p class="muted">No comments yet.</p>{% endfor %}
+<form method="post" action="{{ url_for('handover_comment', hid=h.id) }}"><input type="hidden" name="_csrf" value="{{ csrf }}"><textarea name="text" style="min-height:80px" placeholder="e.g. @{{ (h.supname or 'Ali').split()[0] }} they asked for a discount, OK up to 10%" required></textarea>
+<p class="muted" style="margin:4px 0">People: {% for p in people %}@{{ p.name.split()[0] }}{{ ', ' if not loop.last }}{% endfor %}</p><button class="btn brand">Add comment</button></form></div></div>
+<div class="card"><div class="card-h"><h2>Their reply</h2></div><div class="card-b" style="white-space:pre-wrap">{{ p.reply }}</div></div>
+{% if p.intro %}<div class="card"><div class="card-h"><h2>Introduction sent</h2></div><div class="card-b" style="white-space:pre-wrap">{{ p.intro }}</div></div>{% endif %}
+{% for t in p.thread or [] %}<div class="card"><div class="card-h"><h2>Our email {{ loop.index }}</h2><span class="muted">{{ (t.at or '')[:10] }} · {{ t.subject }}</span></div><div class="card-b" style="white-space:pre-wrap">{{ t.body }}</div></div>{% endfor %}{% endblock %}"""
 T["activity.html"] = """{% extends 'base.html' %}{% block title %}Activity{% endblock %}{% block body %}
 <form method="get" class="card"><div class="card-b grid"><div><label>User</label><select name="user"><option value="">Everyone</option>{% for u in ulist %}<option value="{{ u.id }}" {{ 'selected' if uid == u.id }}>{{ u.name }}</option>{% endfor %}</select></div>
 <div><label>Event</label><select name="type"><option value="">All</option>{% for t in types %}<option {{ 'selected' if typ == t }}>{{ t }}</option>{% endfor %}</select></div><div style="align-self:end"><button class="btn brand">Filter</button></div></div></form>
@@ -1241,7 +1541,7 @@ T["activity.html"] = """{% extends 'base.html' %}{% block title %}Activity{% end
 T["audit.html"] = """{% extends 'base.html' %}{% block title %}Audit log{% endblock %}{% block body %}<div class="card"><div class="card-h"><h2>Who changed what in this console</h2></div><table><tr><th>When</th><th>Who</th><th>Action</th><th>Detail</th></tr>{% for r in rows %}<tr><td class="muted">{{ r.at|dt }}</td><td>{{ r.actor }}</td><td>{{ r.action }}</td><td>{{ r.detail }}</td></tr>{% endfor %}</table></div>{% endblock %}"""
 T["settings.html"] = """{% extends 'base.html' %}{% block title %}Settings{% endblock %}{% block body %}{% if msg %}<div class="note">{{ msg }}</div>{% endif %}
 <div class="card"><div class="card-h"><h2>Team connection through your Google Drive</h2>{% if relay_url and relay_ok and not relay_err %}<span class="badge b-ok">Connected</span>{% elif relay_url %}<span class="badge b-bad">Problem</span>{% else %}<span class="badge b-warn">Not set up</span>{% endif %}</div><div class="card-b">
-{% if relay_url and relay_version < relay_latest %}<div class="err"><b>Update your Google script (one time, the address stays the same).</b> With the new version, handovers, queues and supervisors' prospects are handled by Google itself, so nobody ever needs this console to be open.
+{% if relay_url and relay_version < relay_latest %}<div class="err"><b>Update your Google script (one time, the address stays the same).</b> With the new version, handovers, comments, away dates and moving prospects between supervisors are handled by Google itself, so nobody needs this console to be open for them.
 <ol style="margin:6px 0 0"><li>Click <b>Copy script</b> below.</li><li>In script.google.com, open your BSO project, select all the code, paste over it and <b>Save</b>.</li><li><b>Deploy → Manage deployments →</b> pencil (Edit) <b>→ Version: New version → Deploy</b>.</li><li>Back here, click <b>Sync now</b>. This message disappears when the update is detected.</li></ol></div>{% endif %}
 {% if relay_url %}<p style="margin-top:0">Team laptops sign in and report through <b>{{ relay_url }}</b>. Last sync: {{ relay_ok|dt if relay_ok else 'never' }}.{% if relay_err %}<br><span style="color:#ba0517">{{ relay_err }}</span>{% endif %}</p>
 <form method="post" style="display:inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" name="action" value="relay_sync">Sync now</button></form>

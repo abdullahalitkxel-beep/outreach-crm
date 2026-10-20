@@ -212,9 +212,10 @@ def render(name, **ctx):
     nav = [("home", "Home", None), ("campaigns", "Campaigns", None), ("leads", "Leads", None), ("review", "Review", review_count or None),
            ("accounts", "Accounts", None), ("opportunities", "Opportunities", None),
            ("tasks", "Tasks", overdue or None), ("reports", "Reports", None), ("setup", "Getting Started", None), ("settings", "Settings", None)]
-    if (team.policy() or {}).get("role") == "supervisor" or one("SELECT COUNT(*) FROM leads WHERE handed_from IS NOT NULL"):
+    if (team.policy() or {}).get("role") == "supervisor" or one("SELECT COUNT(*) FROM leads WHERE handed_from IS NOT NULL") or one("SELECT COUNT(*) FROM comments"):
         fresh = one("SELECT COUNT(*) FROM leads WHERE handed_from IS NOT NULL AND (COALESCE(prospect_stage,'new')='new' "
-                    "OR id IN (SELECT lead_id FROM messages WHERE direction='in' AND seen=0))")
+                    "OR id IN (SELECT lead_id FROM messages WHERE direction='in' AND seen=0))") + \
+            one("SELECT COUNT(DISTINCT lead_email) FROM comments WHERE seen=0 AND mine=0")
         nav.insert(1, ("prospects", "My prospects", fresh or None))
     active = {"lead": "leads", "new_lead": "leads", "import_page": "leads", "account": "accounts",
               "opp": "opportunities", "job": "setup", "jobs": "setup"}.get(request.endpoint, request.endpoint)
@@ -428,7 +429,13 @@ def prospect_ctx(lead_id, l):
     if unseen:
         db().execute(f"UPDATE messages SET seen=1 WHERE id IN ({','.join('?' * len(unseen))})", unseen)
         db().commit()
-    return {"convo": msgs, "unseen_ids": unseen, "mailbox_ok": bool(mailbox.conf(cfg())), "prospect_labels": PROSPECT_LABELS}
+    cms = rows("SELECT * FROM comments WHERE lead_email=? ORDER BY at, id", l["email"].lower())
+    new_c = [c["id"] for c in cms if not c["seen"]]
+    if new_c:
+        db().execute(f"UPDATE comments SET seen=1 WHERE id IN ({','.join('?' * len(new_c))})", new_c)
+        db().commit()
+    return {"convo": msgs, "unseen_ids": unseen, "mailbox_ok": bool(mailbox.conf(cfg())), "prospect_labels": PROSPECT_LABELS,
+            "comments": cms, "new_comment_ids": new_c, "people": team.people(), "on_team": team.joined()}
 
 
 @app.post("/lead/<int:lead_id>/reply")
@@ -961,8 +968,47 @@ def prospects():
         r["name"] = " ".join(p for p in (r["first_name"], r["x"].get("last_name")) if p) or r["email"]
         data.append(r)
     counts = {k: sum(1 for d in data if (d["prospect_stage"] or "new") == k) for k in PROSPECT_LABELS}
+    for d in data:
+        d["ncomments"] = one("SELECT COUNT(*) FROM comments WHERE lead_email=?", d["email"])
+        d["new_comments"] = one("SELECT COUNT(*) FROM comments WHERE lead_email=? AND seen=0", d["email"])
+        try:
+            d["age"] = (date.today() - date.fromisoformat((d["handed_at_in"] or d["created_at"] or "")[:10])).days
+        except ValueError:
+            d["age"] = 0
+    owned = {d["email"] for d in data}
+    mentions = [m for m in rows("SELECT * FROM comments WHERE seen=0 AND mine=0 ORDER BY at DESC") if m["lead_email"] not in owned]
+    view = request.args.get("view") or "board"
     return render("prospects.html", items=data, labels=PROSPECT_LABELS, counts=counts, mailbox_ok=bool(mailbox.conf(cfg())),
-                  unseen_total=sum(d["unseen"] for d in data))
+                  unseen_total=sum(d["unseen"] for d in data), view=view, mentions=mentions, away=team.state().get("away_until", ""))
+
+
+@app.post("/comments/seen")
+def comments_seen():
+    db().execute("UPDATE comments SET seen=1 WHERE lead_email=? AND seen=0", (request.form.get("lead_email", "").lower(),))
+    db().commit()
+    return redirect(request.form.get("back") or url_for("prospects"))
+
+
+@app.post("/comments/add")
+def comment_add():
+    f = request.form
+    lid = f.get("lead_id", type=int)
+    l = (rows("SELECT * FROM leads WHERE id=?", lid) or [None])[0] if lid else None
+    email = (l["email"] if l else f.get("lead_email", "")).lower()
+    name = (" ".join(p for p in ((l or {}).get("first_name"), json.loads((l or {}).get("extra") or "{}").get("last_name")) if p)) if l else f.get("lead_name", "")
+    if not team.joined():
+        return redirect((f.get("back") or url_for("prospects")) + "?msg=Comments+need+a+team+sign-in.")
+    team.add_comment(db(), email, f.get("text", ""), name, (l or {}).get("company") or f.get("company", ""))
+    threading.Thread(target=lambda: team.sync(db_connect(load_config(CONFIG_PATH).get("database", "outreach.db"))), daemon=True).start()
+    return redirect(f.get("back") or url_for("prospects"))
+
+
+@app.post("/settings/away")
+def save_away():
+    until = (request.form.get("until") or "").strip()[:10]
+    team.set_away(until if request.form.get("away") == "on" and until else "")
+    threading.Thread(target=lambda: team.sync(db_connect(load_config(CONFIG_PATH).get("database", "outreach.db"))), daemon=True).start()
+    return redirect(url_for("settings", tab="handover", result=(f"Marked away until {until}: no new prospects come to you until then." if request.form.get("away") == "on" and until else "You're available for new prospects."), ok=1))
 
 
 @app.post("/prospects/<int:lead_id>/stage")
@@ -1151,8 +1197,29 @@ def search():
             for a in rows("SELECT * FROM accounts WHERE name LIKE ? OR domain LIKE ? LIMIT 50", like, like)] if q else []
     opps = [{"id": o["id"], "label": o["name"], "sub": f"{o['stage']} · {money(o['amount'])}"}
             for o in rows("SELECT * FROM opportunities WHERE name LIKE ? LIMIT 50", like)] if q else []
-    groups = [("Leads", "t-lead", "L", leads_, "lead", "lead_id"), ("Accounts", "t-acc", "A", accs, "account", "account_id"),
-              ("Opportunities", "t-opp", "O", opps, "opp", "opp_id")]
+    pros = [{"id": l["id"], "label": l["name"], "sub": " · ".join(p for p in (l["company"], l["email"], PROSPECT_LABELS.get(l.get("prospect_stage") or "new", "")) if p)}
+            for l in map(lead_view, rows("SELECT * FROM leads WHERE handed_from IS NOT NULL AND (email LIKE ? OR first_name LIKE ? OR company LIKE ? OR extra LIKE ?) LIMIT 50",
+                                         like, like, like, like))] if q else []
+    def snippet(text):
+        t = " ".join((text or "").split())
+        i = t.lower().find(q.lower())
+        return ("…" if i > 40 else "") + t[max(0, i - 40):i + len(q) + 80] + "…" if i >= 0 else t[:120]
+    convo = [{"id": m["lead_id"], "label": f"{m['lead_name']}: {m['subject'] or '(no subject)'}", "sub": f"{m['at'][:10]} · {snippet(m['body'])}"}
+             for m in rows("SELECT m.*, COALESCE(l.first_name, l.email) lead_name FROM messages m JOIN leads l ON l.id=m.lead_id "
+                           "WHERE m.body LIKE ? OR m.subject LIKE ? ORDER BY m.at DESC LIMIT 50", like, like)] if q else []
+    notes = [{"id": n_["lead_id"], "label": n_["lead_name"], "sub": f"{n_['at'][:10]} · {snippet(n_['body'])}"}
+             for n_ in rows("SELECT n.*, COALESCE(l.first_name, l.email) lead_name FROM notes n JOIN leads l ON l.id=n.lead_id "
+                            "WHERE n.body LIKE ? ORDER BY n.at DESC LIMIT 50", like)] if q else []
+    cmts = [{"id": c["lid"], "label": f"{c['author_name']} on {c['lead_name'] or c['lead_email']}", "sub": f"{c['at'][:10]} · {snippet(c['text'])}"}
+            for c in rows("SELECT c.*, (SELECT id FROM leads WHERE email=c.lead_email) lid FROM comments c WHERE c.text LIKE ? OR c.lead_name LIKE ? ORDER BY c.at DESC LIMIT 50", like, like)
+            if c["lid"]] if q else []
+    camps = [{"id": c["id"], "label": c["name"], "sub": "Running" if c["status"] == "active" else "Paused"}
+             for c in rows("SELECT * FROM campaigns WHERE name LIKE ? LIMIT 20", like)] if q else []
+    groups = [("Leads", "t-lead", "L", leads_, "lead", "lead_id"), ("My prospects", "t-opp", "★", pros, "lead", "lead_id"),
+              ("Emails with prospects", "t-rev", "✉", convo, "lead", "lead_id"), ("Comments", "t-rev", "💬", cmts, "lead", "lead_id"),
+              ("Notes and replies", "t-lead", "N", notes, "lead", "lead_id"), ("Campaigns", "t-rev", "⚑", camps, "campaign", "cid"),
+              ("Accounts", "t-acc", "A", accs, "account", "account_id"), ("Opportunities", "t-opp", "O", opps, "opp", "opp_id")]
+    groups = [g_ for g_ in groups if g_[3] or g_[0] in ("Leads", "Accounts", "Opportunities")]
     return render("search.html", q=q, groups=groups)
 
 

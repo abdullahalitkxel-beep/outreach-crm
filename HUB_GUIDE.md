@@ -101,6 +101,17 @@ In test mode, the introduction and the briefing both go to the test address inst
 
 **Supervisors work in one window.** In BSO, Settings → Handover → *Your mailbox*, each supervisor connects the mailbox they're introduced to (Google Workspace: imap.gmail.com / smtp.gmail.com with an app password). Each prospect's page in **My prospects** then shows the whole conversation (including replies sent from their normal email app), has a reply box that sends from their mailbox in the same thread, and new replies are flagged and counted in the menu. If a handed-over prospect writes to the original sender's inbox again, that BSO forwards it to the supervisor straight away and it appears in the conversation, so nothing slips through.
 
+## Working together on prospects
+
+- **Prospect board.** Supervisors see *My prospects* as a board (New → Contacted → Meeting booked → Proposal sent → Won / Lost) and drag cards between columns; Won and Lost ask first. The console's **Prospect board** shows everyone's, filterable by supervisor and campaign; red-edged cards haven't been touched for 2+ days.
+- **Comments with @mentions.** On a prospect's page, in BSO or in the console, write a comment and mention people with @ and their first name. It reaches the people mentioned and everyone already in that prospect's comments, at their next sign-in. Mentions of you on someone else's prospect appear under *You were mentioned*.
+- **Away.** A supervisor marks themselves away (BSO → Settings → Handover → Away), or you set *Away until* on their user page. While away they get no new prospects.
+- **Moving a prospect.** Open it in the console (Prospect board → card) → *Move to another supervisor*. It leaves the old supervisor's list (with a note) and arrives in the new one's with its conversation and stage.
+- **Removing someone.** Users → the person → *Remove user*. Their sign-in stops at once. A supervisor's open prospects are shared equally among the other supervisors who aren't away. A sender's BSO stops sending and, at its next check-in, hands over its leads, which are shared equally among the remaining senders (not-yet-emailed leads carry on; leads part-way through a sequence arrive paused with a "continue or restart" task; the do-not-contact list goes to everyone). If that laptop won't come back online, use *Remove now without their leads*.
+- **Search** in BSO covers leads, prospects, emails with prospects, comments, notes and campaigns.
+
+These need the Google script version 3: the console shows the update steps (copy, paste over, Deploy → Manage deployments → Edit → New version).
+
 ## 4. What you control
 
 - **Pause / resume** an account: their BSO stops sending at its next check-in.

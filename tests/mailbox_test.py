@@ -59,12 +59,12 @@ check(rows[1]["body"] == "Thursday 3pm works.", "quoted history is trimmed from 
 check(mailbox.check(crm.cfg(), con)[0] == 0 and con.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3, "checking again adds nothing twice")
 
 w = crm.app.test_client()
-page = w.get("/prospects").get_data(as_text=True)
+page = w.get("/prospects?view=list").get_data(as_text=True)
 check("1 new reply" in page and "Check mailbox now" in page, "My prospects flags the new reply")
 check("My prospects <span class=\"pill\">1</span>" in w.get("/").get_data(as_text=True), "menu shows the count")
 lp = w.get(f"/lead/{lid}").get_data(as_text=True)
 check("Thursday 3pm works." in lp and "Great, invite sent." in lp and "Send reply" in lp, "prospect page shows the whole conversation and a reply box")
-check("new reply" not in w.get("/prospects").get_data(as_text=True), "opening the prospect marks the reply as read")
+check("new reply" not in w.get("/prospects?view=list").get_data(as_text=True), "opening the prospect marks the reply as read")
 
 sent = []
 bot.send_email = lambda s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None: sent.append(

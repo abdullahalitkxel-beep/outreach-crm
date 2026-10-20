@@ -173,7 +173,7 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
  <span style="flex:none;display:flex">{{ logo(32, tile=True, uid="hd", weight="b", label="BSO")|safe }}</span>
  {% if request.endpoint != 'welcome' %}<form class="gsearch" action="{{ url_for('search') }}" id="t-search">
   <svg width="14" height="14" viewBox="0 0 24 24"><path d="M15.5 14h-.8l-.3-.3A6.5 6.5 0 1 0 9.5 16a6.5 6.5 0 0 0 4.2-1.6l.3.3v.8l5 5 1.5-1.5-5-5zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></svg>
-  <input name="q" placeholder="Search leads, accounts, opportunities…" value="{{ request.args.get('q','') if request.endpoint=='search' else '' }}">
+  <input name="q" placeholder="Search leads, prospects, emails, comments, campaigns…" value="{{ request.args.get('q','') if request.endpoint=='search' else '' }}">
  </form>{% else %}<div style="flex:1"></div>{% endif %}
  <div class="tools">
   <div class="iconbtn" id="helpbtn" title="Help" onclick="this.classList.toggle('open')">?
@@ -445,7 +445,11 @@ LEAD = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block titl
   <div class="muted" style="font-size:12px">{{ msg.subject }}{% if msg.cc %} · CC {{ msg.cc }}{% endif %}</div>
   <div style="white-space:pre-wrap;margin-top:6px">{{ msg.body }}</div></div>
  {% else %}<p class="muted">{{ 'No emails with this prospect in your mailbox yet. The reply that led to the handover is in the timeline below.' if mailbox_ok else '' }}</p>{% endfor %}
- {% if mailbox_ok %}<form method="post" action="{{ url_for('prospect_reply', lead_id=l.id) }}" onsubmit="this.querySelector('button').disabled=true">
+<div id="comments" style="margin:6px 0 14px;padding:10px 12px;background:#f6f8fb;border-radius:6px"><b>Team comments</b> <span class="muted">(only your team sees these; mention someone with @ and their first name)</span>
+ {% for c in comments %}<div style="border-left:3px solid {{ '#2e844a' if c.id in new_comment_ids else '#0176d3' }};padding:4px 10px;margin-top:8px"><b>{{ c.author_name }}</b> <span class="muted">{{ c.at[:16].replace('T', ' ') }}</span>{% if c.id in new_comment_ids %} <span class="badge b-ok">new</span>{% endif %}<div style="white-space:pre-wrap">{{ c.text }}</div></div>{% endfor %}
+ {% if on_team %}<form method="post" action="{{ url_for('comment_add') }}" style="margin-top:8px"><input type="hidden" name="lead_id" value="{{ l.id }}"><input type="hidden" name="back" value="{{ url_for('lead', lead_id=l.id) }}#comments">
+ <textarea name="text" style="min-height:60px" placeholder="e.g. @Omar they asked for a 20% discount, OK?" required></textarea>{% if people %}<div class="muted" style="font-size:12px">{% for p in people %}@{{ p.name.split()[0] }}{{ ', ' if not loop.last }}{% endfor %}</div>{% endif %}<button class="btn sm" style="margin-top:4px">Add comment</button></form>{% endif %}</div>
+  {% if mailbox_ok %}<form method="post" action="{{ url_for('prospect_reply', lead_id=l.id) }}" onsubmit="this.querySelector('button').disabled=true">
   <label>Reply to {{ l.email }} <span class="muted">(from your mailbox, in the same thread)</span></label>
   <textarea name="body" style="min-height:140px" required placeholder="Hi {{ l.first_name or '' }},">{{ request.args.get('draft', '') }}</textarea>
   <div style="display:flex;gap:8px;align-items:end;margin-top:8px"><div style="flex:1"><label>CC (optional)</label><input name="cc" placeholder="colleague@company.com"></div><button class="btn brand">Send reply</button></div></form>{% endif %}
@@ -894,6 +898,10 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
 {% endfor %}</textarea>{% endif %}
  <p class="hint">Test mode: the introduction and the briefing both go to your test address instead.</p>
  <button class="btn brand" style="margin-top:12px">Save handover settings</button></form></div></div>
+{% if team.joined %}<div class="card" id="away"><div class="card-h"><h2>Away</h2>{% if team.away_until %}<span class="badge b-warn">away until {{ team.away_until }}</span>{% endif %}</div><div class="card-b"><form method="post" action="{{ url_for('save_away') }}" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap">
+ <label class="check" style="margin:0"><input type="checkbox" name="away" {{ 'checked' if team.away_until }}> I'm away (on leave): don't give me new prospects</label>
+ <div><label>Until (including)</label><input type="date" name="until" value="{{ team.away_until or '' }}"></div><button class="btn brand">Save</button></form>
+ <p class="hint">Your current prospects stay with you; ask your manager to move any that need attention while you're away.</p></div></div>{% endif %}
 <div class="card" id="mailbox"><div class="card-h"><h2>Your mailbox (supervisors)</h2>{% if pm.email and pm_pw %}<span class="badge b-ok">connected: {{ pm.email }}</span>{% endif %}</div><div class="card-b">
  <p class="muted" style="margin-top:0">If you receive handed-over prospects, connect the mailbox they're introduced to (the one in CC). BSO then shows every email with each prospect on their page in <b>My prospects</b>, including replies you send from your normal email app, lets you reply from BSO in the same thread, and flags new replies. It checks every few minutes while BSO is open.</p>
  <form method="post" action="{{ url_for('save_mailbox') }}"><div class="grid2">
@@ -1032,16 +1040,41 @@ CAMPAIGN = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
 {% endblock %}"""
 
 PROSPECTS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}My prospects{% endblock %}{% block body %}
-{% call m.header('t-opp', '★', 'My prospects', items|length ~ ' handed over to you · ' ~ counts['new'] ~ ' not contacted yet') %}{% endcall %}
-<div class="help" style="margin-bottom:12px"><b>Prospects handed over to you.</b> Each one replied with interest, a meeting request or a question. Reply from your own mailbox (you were in CC on the introduction), then keep the stage up to date here; your manager sees it in the Master Console. Open a prospect for their reply, the full conversation, notes and tasks.</div>
+{% call m.header('t-opp', '★', 'My prospects', items|length ~ ' handed over to you · ' ~ counts['new'] ~ ' not contacted yet') %}
+ <a class="btn {{ 'brand' if view == 'board' }}" href="{{ url_for('prospects', view='board') }}">Board</a><a class="btn {{ 'brand' if view == 'list' }}" href="{{ url_for('prospects', view='list') }}">List</a>
+{% endcall %}
+{% if away %}<div class="help" style="margin-bottom:12px;border-color:#dd7a01">You're marked <b>away until {{ away }}</b>: no new prospects come to you. <a href="{{ url_for('settings', tab='handover') }}#away">Change</a></div>{% endif %}
+{% if mentions %}<div class="card" style="border-left:4px solid #0176d3"><div class="card-h"><h2>You were mentioned</h2></div><div class="card-b">
+{% for c in mentions %}<div style="margin-bottom:10px"><b>{{ c.author_name }}</b> on <b>{{ c.lead_name or c.lead_email }}</b>{% if c.company %} ({{ c.company }}){% endif %} <span class="muted">{{ c.at[:16].replace('T', ' ') }}</span>
+<div style="white-space:pre-wrap">{{ c.text }}</div>
+<form method="post" action="{{ url_for('comment_add') }}" style="display:flex;gap:6px;margin-top:4px"><input type="hidden" name="lead_email" value="{{ c.lead_email }}"><input type="hidden" name="lead_name" value="{{ c.lead_name }}"><input type="hidden" name="company" value="{{ c.company }}"><input type="hidden" name="back" value="{{ url_for('prospects') }}">
+<input name="text" placeholder="Reply…" required style="flex:1"><button class="btn sm">Reply</button></form>
+<form method="post" action="{{ url_for('comments_seen') }}" style="margin-top:2px"><input type="hidden" name="lead_email" value="{{ c.lead_email }}"><button class="btn sm">Mark as read</button></form></div>{% endfor %}</div></div>{% endif %}
 {% if not mailbox_ok %}<div class="help" style="margin-bottom:12px;border-color:#dd7a01">⚠️ <b>Connect your mailbox</b> in <a href="{{ url_for('settings', tab='handover') }}#mailbox">Settings → Handover</a> so each prospect's emails appear here and you can reply from BSO.</div>
 {% else %}<form method="post" action="{{ url_for('mailbox_check') }}" style="margin:0 0 10px"><button class="btn">↻ Check mailbox now</button> <span class="muted">{{ unseen_total }} new repl{{ 'y' if unseen_total == 1 else 'ies' }}</span></form>{% endif %}
+{% if view == 'board' %}
+<div id="board" style="display:grid;grid-template-columns:repeat(6,minmax(160px,1fr));gap:10px;overflow-x:auto">
+{% for k, lbl in labels.items() %}<div class="col" data-stage="{{ k }}" style="background:#eef1f4;border-radius:8px;padding:8px;min-height:240px"><div style="font-weight:600;margin:2px 4px 8px">{{ lbl.split(':')[0] }} <span class="muted">{{ counts[k] }}</span></div>
+{% for p in items if (p.prospect_stage or 'new') == k %}<div class="kcard" draggable="true" data-id="{{ p.id }}" style="background:#fff;border:1px solid var(--line);{{ 'border-left:4px solid #2e844a;' if p.unseen or p.new_comments else ('border-left:4px solid #ba0517;' if k == 'new' and p.age >= 2 else '') }}border-radius:6px;padding:8px 10px;margin-bottom:8px;cursor:grab">
+<a href="{{ url_for('lead', lead_id=p.id) }}"><b>{{ p.name }}</b></a><br><small class="muted">{{ p.company or '' }}</small><br>
+<small>{{ p.age }}d{% if p.unseen %} · <b style="color:#2e844a">● {{ p.unseen }} new</b>{% endif %}{% if p.ncomments %} · 💬 {{ p.ncomments }}{% if p.new_comments %} <b style="color:#2e844a">new</b>{% endif %}{% endif %}</small></div>{% endfor %}</div>{% endfor %}</div>
+<form id="mv" method="post" style="display:none"><input type="hidden" name="stage"><input type="hidden" name="back" value="{{ url_for('prospects', view='board') }}"></form>
+<p class="muted">Drag a card to another column to change its stage. Red edge: not contacted for 2+ days. Green edge: new reply or comment.</p>
+<script>
+var drag=null;document.querySelectorAll('.kcard').forEach(function(c){c.addEventListener('dragstart',function(){drag=c;c.style.opacity=.5});c.addEventListener('dragend',function(){c.style.opacity=1})});
+document.querySelectorAll('#board .col').forEach(function(col){col.addEventListener('dragover',function(e){e.preventDefault();col.style.background='#dbe7f3'});
+col.addEventListener('dragleave',function(){col.style.background='#eef1f4'});
+col.addEventListener('drop',function(e){e.preventDefault();col.style.background='#eef1f4';if(!drag)return;var st=col.dataset.stage;
+if((st==='won'||st==='lost')&&!confirm('Move this prospect to '+(st==='won'?'Won':'Lost')+'?'))return;
+var f=document.getElementById('mv');f.action='/prospects/'+drag.dataset.id+'/stage';f.stage.value=st;f.submit()})});
+</script>
+{% else %}
 <div class="card">{% if items %}<table class="tbl"><thead><tr><th>Prospect</th><th>Company</th><th>Conversation</th><th>Handed over by</th><th>Stage</th></tr></thead>
 {% for p in items %}<tr><td><a href="{{ url_for('lead', lead_id=p.id) }}"><b>{{ p.name }}</b></a><br><small class="muted">{{ p.x.title or '' }}<br>{{ p.email }}</small></td>
 <td>{{ p.company or '' }}{% if p.website %}<br><a href="https://{{ p.website }}" target="_blank" rel="noopener"><small>{{ p.website }} ↗</small></a>{% endif %}{% if p.x.linkedin %} <a href="{{ p.x.linkedin }}" target="_blank" rel="noopener"><small>LinkedIn ↗</small></a>{% endif %}</td>
-<td>{% if p.unseen %}<span class="badge b-ok">● {{ p.unseen }} new repl{{ 'y' if p.unseen == 1 else 'ies' }}</span><br>{% endif %}<small class="muted">{{ (p.x.handover_label or '').replace('_', ' ') }}{% if p.last_msg %}<br>last email {{ p.last_msg[:10] }} ({{ 'from them' if p.last_dir == 'in' else 'from you' }}){% endif %}</small></td><td>{{ p.handed_from }}<br><small class="muted">{{ (p.handed_at_in or '')[:10] }}</small></td>
-<td><form method="post" action="{{ url_for('prospect_stage', lead_id=p.id) }}"><select name="stage" onchange="this.form.submit()">{% for k, l in labels.items() %}<option value="{{ k }}" {{ 'selected' if (p.prospect_stage or 'new') == k }}>{{ l }}</option>{% endfor %}</select><noscript><button class="btn sm">Save</button></noscript></form></td></tr>{% endfor %}</table>
-{% else %}<div class="empty"><b>No prospects yet</b>When a prospect replies with interest, they're handed over to you here, and you also get a briefing email.</div>{% endif %}</div>
+<td>{% if p.unseen %}<span class="badge b-ok">● {{ p.unseen }} new repl{{ 'y' if p.unseen == 1 else 'ies' }}</span><br>{% endif %}{% if p.new_comments %}<span class="badge b-info">💬 new comment</span><br>{% endif %}<small class="muted">{{ (p.x.handover_label or '').replace('_', ' ') }}{% if p.last_msg %}<br>last email {{ p.last_msg[:10] }} ({{ 'from them' if p.last_dir == 'in' else 'from you' }}){% endif %}</small></td><td>{{ p.handed_from }}<br><small class="muted">{{ (p.handed_at_in or '')[:10] }}</small></td>
+<td><form method="post" action="{{ url_for('prospect_stage', lead_id=p.id) }}"><input type="hidden" name="back" value="{{ url_for('prospects', view='list') }}"><select name="stage" onchange="if((this.value==='won'||this.value==='lost')&&!confirm('Move this prospect to '+this.options[this.selectedIndex].text+'?')){this.form.reset();return}this.form.submit()">{% for k, l in labels.items() %}<option value="{{ k }}" {{ 'selected' if (p.prospect_stage or 'new') == k }}>{{ l }}</option>{% endfor %}</select></form></td></tr>{% endfor %}</table>
+{% else %}<div class="empty"><b>No prospects yet</b>When a prospect replies with interest, they're handed over to you here, and you also get a briefing email.</div>{% endif %}</div>{% endif %}
 {% endblock %}"""
 
 SIGNIN = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">

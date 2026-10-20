@@ -6,6 +6,8 @@
  * The master console (BSO Master Console on the master's laptop) publishes the user list, limits and approval
  * decisions here, and collects the reported activity.
  *
+ * Version 3: comments with @mentions go straight to each person's queue; supervisors can mark themselves away
+ *   (skipped in the turns); the master can move a prospect from one supervisor to another.
  * Version 2: each person's items wait in their own queue here, so nobody needs anyone else to be online.
  * Supervisors are assigned in turn here, and each supervisor's prospects are kept so any sign-in restores them.
  *
@@ -13,7 +15,7 @@
  */
 var ADMIN_KEY_HASH = '__ADMIN_KEY_HASH__';
 var FOLDER_NAME = 'BSO Team Data';
-var RELAY_VERSION = 2;
+var RELAY_VERSION = 3;
 var MAX_PULL = 150;
 
 function doGet() {
@@ -36,6 +38,8 @@ function doPost(e) {
       case 'restore': return out_(restore_(req));
       case 'admin_publish': requireAdmin_(req); return out_(adminPublish_(req));
       case 'admin_pull': requireAdmin_(req); return out_(adminPull_(req));
+      case 'admin_post': requireAdmin_(req); return out_(adminPost_(req));
+      case 'admin_reassign': requireAdmin_(req); return out_(adminReassign_(req));
     }
     return out_({ error: 'Unknown action.', code: 400 });
   } catch (err) {
@@ -214,6 +218,8 @@ function sync_(req) {
     var e = events[i] || {};
     if (e.type === '__handover') deliverHandover_(doc, f.key, e.data || {});
     else if (e.type === 'prospect_stage' && e.lead_email) setStage_(f.key, e.lead_email, e.detail);
+    else if (e.type === '__comment') deliverComment_(doc, f.key, e.data || {});
+    else if (e.type === '__away') props_().setProperty('AWAY_' + f.key, String((e.data || {}).until || ''));
   }
   for (var j = 0; j < acked.length; j++) {
     var a = String(acked[j]);
@@ -238,11 +244,17 @@ function userFolder_(kind, key) {
   return it.hasNext() ? it.next() : parent.createFolder(key);
 }
 
-function supervisors_(doc) {
+function isAway_(key, u) {
+  var now = new Date().toISOString().substr(0, 10);
+  var mine = props_().getProperty('AWAY_' + key) || '';
+  return (mine && mine >= now) || (u.away_until && String(u.away_until) >= now);
+}
+
+function supervisors_(doc, includeAway) {
   var out = [];
   for (var k in doc.users) {
     var u = doc.users[k];
-    if (u.role === 'supervisor' && u.status !== 'disabled') out.push({ key: k, u: u });
+    if (u.role === 'supervisor' && u.status !== 'disabled' && (includeAway || !isAway_(k, u))) out.push({ key: k, u: u });
   }
   out.sort(function (a, b) { return String(a.u.name) < String(b.u.name) ? -1 : 1; });
   return out;
@@ -282,7 +294,7 @@ function deliverHandover_(doc, fromKey, h) {
   var p = props_();
   var dk = 'HO_' + sha256_(fromKey + '|' + h.lead_local_id).substr(0, 32);
   if (p.getProperty(dk)) return;                          // already delivered (the laptop may send it twice)
-  var target = null, sups = supervisors_(doc), want = String(h.supervisor || '').toLowerCase();
+  var target = null, sups = supervisors_(doc, true), want = String(h.supervisor || '').toLowerCase();
   for (var i = 0; i < sups.length; i++) {
     if (sups[i].key === want || String(sups[i].u.email).toLowerCase() === want || String(sups[i].u.mail || '').toLowerCase() === want) target = sups[i];
   }
@@ -291,7 +303,8 @@ function deliverHandover_(doc, fromKey, h) {
   var from = doc.users[fromKey] || {};
   var lead = h.lead || {};
   var item = { action: 'handover', lead: lead, label: h.label || '', reply: h.reply || '', intro: h.intro || '',
-               thread: (h.thread || []).slice(0, 6), from: from.name || h.from_name || '', from_name: h.from_name || '', at: h.at || new Date().toISOString() };
+               thread: (h.thread || []).slice(0, 6), from: from.name || h.from_name || '', from_name: h.from_name || '', at: h.at || new Date().toISOString(),
+               campaign: h.campaign || '' };
   var file = userFolder_('queues', target.key).createFile('h_' + new Date().getTime() + '_' + Math.floor(Math.random() * 1e6) + '.json',
                                                            JSON.stringify(item), 'application/json');
   var arch = 'p_' + sha256_(String(lead.email || '').toLowerCase()).substr(0, 32) + '.json';
@@ -330,6 +343,64 @@ function setStage_(key, email, stage) {
   item.stage = String(stage || '').substr(0, 30);
   item.stage_at = new Date().toISOString();
   file.setContent(JSON.stringify(item));
+}
+
+// ------------------------------------------------------------------ comments, reassigning (version 3)
+
+function queueFor_(key, item) {
+  userFolder_('queues', key).createFile('c_' + new Date().getTime() + '_' + Math.floor(Math.random() * 1e6) + '.json',
+                                        JSON.stringify(item), 'application/json');
+}
+
+function deliverComment_(doc, fromKey, c) {
+  var p = props_();
+  var ck = 'CM_' + sha256_(String(c.uid || '')).substr(0, 32);
+  if (!c.uid || p.getProperty(ck)) return;                // each comment once
+  var from = doc.users[fromKey] || {};
+  var item = { action: 'comment', uid: c.uid, lead_email: c.lead_email || '', lead_name: c.lead_name || '', company: c.company || '',
+               text: String(c.text || '').substr(0, 4000), author: fromKey, author_name: from.name || fromKey, at: c.at || new Date().toISOString() };
+  var to = c.to || [];
+  for (var i = 0; i < to.length; i++) {
+    var k = String(to[i]);
+    if (k !== fromKey && doc.users[k]) queueFor_(k, item);
+  }
+  p.setProperty(ck, '1');
+}
+
+function adminPost_(req) {
+  var doc = readDoc_(), items = req.items || [], n = 0;
+  for (var i = 0; i < items.length; i++) {
+    var it = items[i] || {};
+    if (it.to && doc.users[it.to] && it.item) { queueFor_(it.to, it.item); n++; }
+  }
+  return { ok: true, delivered: n };
+}
+
+function adminReassign_(req) {
+  var doc = readDoc_();
+  var fromKey = String(req.from || ''), toKey = String(req.to || ''), email = String(req.lead_email || '').toLowerCase();
+  if (!doc.users[toKey]) fail_(400, 'Unknown supervisor.');
+  var arch = 'p_' + sha256_(email).substr(0, 32) + '.json';
+  var item = req.item || null;
+  var it = sub_('archive').getFoldersByName(fromKey);
+  if (it.hasNext()) {
+    var fi = it.next().getFilesByName(arch);
+    if (fi.hasNext()) {
+      var f = fi.next();
+      if (!item) item = JSON.parse(f.getBlob().getDataAsString());
+      f.setTrashed(true);
+    }
+  }
+  if (!item) fail_(404, 'That prospect is not in the old supervisor\'s list.');
+  item.action = 'handover';
+  item.reassigned_from = (doc.users[fromKey] || {}).name || fromKey;
+  var folder = userFolder_('archive', toKey), ex = folder.getFilesByName(arch);
+  if (ex.hasNext()) ex.next().setContent(JSON.stringify(item)); else folder.createFile(arch, JSON.stringify(item), 'application/json');
+  queueFor_(toKey, item);
+  if (doc.users[fromKey]) queueFor_(fromKey, { action: 'removed', lead_email: email, to_name: (doc.users[toKey] || {}).name || toKey, at: new Date().toISOString() });
+  var p = props_();
+  p.setProperty('ASSIGN_' + sha256_(email).substr(0, 32), toKey);
+  return { ok: true };
 }
 
 function restore_(req) {
