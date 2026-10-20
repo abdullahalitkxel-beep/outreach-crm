@@ -68,7 +68,11 @@ Let one BSO run every campaign by itself and make every person a Lead Gen Superv
 1. **Users → Add a user**, role **BSO Bot**. Sign in to BSO with it on the computer that will run the campaigns. It stays signed in after restarts; people's accounts always need their password.
 2. On that computer, in BSO: connect all sending inboxes (Settings → Email inboxes), then Settings → Safety & automation → **Run automatically** and **Start BSO when Windows starts**. While automatic runs are on, BSO keeps Windows awake. On a laptop also set Windows → Settings → System → Power → *Lid close action: Do nothing* (plugged in), and keep it plugged in and online.
 3. **Leads by email**: Settings → Lead targeting → *Leads by email*: choose the intake inbox and who may send files (e.g. omar@blacswanken.com). Email a CSV/Excel file (an Instantly export works) to that inbox; the bot imports it on its next run and replies with what it added.
-4. Add the people as **Lead Gen Supervisors**. Interested prospects go to them in turn.
+4. **More leads without anyone importing them** (BSO → Settings → Lead targeting):
+   - *Referrals*: when a reply says "talk to Sarah, sarah@acme.com", Sarah is added automatically and her first email opens "John suggested I reach out".
+   - *New leads from Instantly*: with your Instantly API key and filters, the bot imports fresh SuperSearch leads whenever fewer than N days of leads are left.
+   - *Find more contacts on the web*: the AI looks for decision-makers whose work email is published online; BSO only adds addresses it can see on the page named, at the company's domain (and verified by Instantly when that key is set).
+5. Add the people as **Lead Gen Supervisors**. Interested prospects go to them in turn.
 
 The Master Console's Overview shows a **Bot** card: online, last run, sent and replies today, prospects handed over, leads not yet emailed and days of leads left, with warnings when it hasn't run, a run failed, test mode is still on or leads are running out.
 

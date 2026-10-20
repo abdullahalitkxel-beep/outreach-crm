@@ -62,6 +62,9 @@ jobs:
       - name: Test BSO Bot mode and leads by email
         run: python tests/bot_mode_test.py
 
+      - name: Test referrals, Instantly auto-pull and web contact search
+        run: python tests/lead_growth_test.py
+
       - name: Test the AI line with thinking models
         run: python tests/llm_test.py
 
@@ -94,6 +97,8 @@ jobs:
           --hidden-import team
           --hidden-import relay
           --hidden-import mailbox
+          --hidden-import instantly
+          --hidden-import discover
           --hidden-import waitress
           --hidden-import secretstore
           --hidden-import bs4

@@ -199,6 +199,13 @@ CREATE TABLE IF NOT EXISTS messages (                -- a supervisor's emails wi
     id INTEGER PRIMARY KEY, lead_id INTEGER, msg_id TEXT UNIQUE, direction TEXT, at TEXT, frm TEXT, to_ TEXT, cc TEXT,
     subject TEXT, body TEXT, seen INTEGER DEFAULT 0, via TEXT
 );
+CREATE TABLE IF NOT EXISTS instantly_pulls (            -- SuperSearch imports started by the bot
+    id INTEGER PRIMARY KEY, resource_id TEXT, started_at TEXT, finished_at TEXT, wanted INTEGER, status TEXT,
+    found INTEGER, imported INTEGER, skipped TEXT
+);
+CREATE TABLE IF NOT EXISTS discovered (                   -- companies already searched for published contacts
+    domain TEXT PRIMARY KEY, at TEXT, found INTEGER, added INTEGER, note TEXT
+);
 CREATE TABLE IF NOT EXISTS handover_out (                -- handovers waiting to reach the team hub
     id INTEGER PRIMARY KEY, lead_id INTEGER, supervisor TEXT, payload TEXT, at TEXT, synced INTEGER DEFAULT 0
 );
@@ -597,6 +604,14 @@ def compose(cfg, con, lead, sender, idx, fresh_opener=False, variant_name=None):
         subject = "Re: " + lead["first_subject"]  # keeps follow-ups in the same thread
     else:
         subject = render(v.get("subject") or "Quick question", lead, sender, cfg)
+    x = json.loads(lead.get("extra") or "{}") if isinstance(lead, dict) else json.loads(lead["extra"] or "{}")
+    if idx == 0 and x.get("referred_by"):
+        rc = cfg.get("referral") or {}
+        ref = SafeDict(referrer_name=x["referred_by"], referrer_first_name=x["referred_by"].split()[0])
+        subject = (rc.get("subject") or "{referrer_first_name} suggested I reach out").format_map(ref)
+        line = (rc.get("line") or "{referrer_name} suggested I get in touch with you.").format_map(ref)
+        head, _, rest = body.partition("\n")
+        body = head + "\n\n" + line + ("\n" + rest if rest else "")
     return subject, body, v.get("name", "")
 
 
@@ -628,6 +643,19 @@ def cmd_run(cfg, con, args):
         return
     if not args.dry_run and not args.no_check:
         cmd_check(cfg, con, args)
+
+    growth = []
+    if not args.dry_run:
+        for modname in ("instantly", "discover"):
+            try:
+                mod = __import__(modname)
+                note = mod.maybe_pull(cfg, con) if modname == "instantly" else mod.maybe_discover(cfg, con)
+                if note:
+                    growth.append(note)
+            except Exception as e:
+                growth.append(f"PROBLEM: {modname} step failed ({e}).")
+        for g in growth:
+            print(g)
 
     steps = cfg["sequence"]
     senders = [s for s in load_senders(cfg) if s["password"] or args.dry_run]
@@ -906,6 +934,57 @@ def intake_message(cfg, con, sender, msg):
     return True
 
 
+# ---------------------------------------------------------------- referrals: "talk to my colleague Sarah instead"
+
+def _without_quotes(body):
+    out = []
+    for line in body.replace("\r\n", "\n").split("\n"):
+        if re.match(r"^\s*On .{5,200} wrote:\s*$", line) or line.strip().startswith("-----Original Message-----"):
+            break
+        if not line.lstrip().startswith(">"):
+            out.append(line)
+    return "\n".join(out)
+
+
+def _name_near(text, addr):
+    m = re.search(r"([A-Z][a-z'’-]+(?:\s+[A-Z][a-z'’-]+)?)\s*(?:<|\(|\[|:|,|-|–|at|on)?\s*(?:mailto:)?" + re.escape(addr), text)
+    if m and m.group(1).lower() not in {"email", "contact", "reach", "at", "to", "on", "write", "ping"}:
+        return m.group(1).split()
+    local = addr.split("@")[0]
+    parts = [p for p in re.split(r"[._-]+", local) if p.isalpha() and len(p) > 1]
+    return [p.capitalize() for p in parts[:2]] if parts else []
+
+
+def capture_referral(cfg, con, lead, sender, body):
+    """Add the colleague(s) a prospect pointed us to as new leads. Returns the new lead ids."""
+    if not (cfg.get("referral") or {}).get("enabled", True):
+        return []
+    text = _without_quotes(body)
+    ours = {str(sv.get("email", "")).lower() for sv in cfg.get("senders") or []}
+    found = []
+    for addr in dict.fromkeys(a.lower().rstrip(".") for a in FIND_EMAILS_RE.findall(text)):
+        if addr == lead["email"] or addr in ours or not EMAIL_RE.match(addr) or addr.split("@")[0] in ROLE_INBOXES:
+            continue
+        found.append(addr)
+    referrer = " ".join(p for p in (lead.get("first_name"), json.loads(lead.get("extra") or "{}").get("last_name")) if p) or lead["email"]
+    new = []
+    for addr in found[:2]:
+        name = _name_near(text, addr)
+        row = {"email": addr, "first_name": name[0] if name else "", "last_name": " ".join(name[1:]) if len(name) > 1 else "",
+               "company": lead.get("company") or "", "website": lead.get("website") or "",
+               "source": f"referral from {lead['email']}", "referred_by": referrer, "referred_by_email": lead["email"]}
+        lid = add_lead(con, row, "active")
+        if lid:
+            new.append(lid)
+            con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",
+                        (lead["id"], f"Referred us to {' '.join(name) or addr} <{addr}>: added as a new lead.", iso(now_utc())))
+            con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",
+                        (lid, f"Referred by {referrer} <{lead['email']}>. Their reply:\n{text.strip()[:1500]}", iso(now_utc())))
+            log.info("Referral: %s suggested %s", lead["email"], addr)
+    con.commit()
+    return new
+
+
 def handle_message(cfg, con, sender, msg):
     if intake_message(cfg, con, sender, msg):
         return
@@ -933,6 +1012,11 @@ def handle_message(cfg, con, sender, msg):
 
     label = classify_reply(cfg, msg, body)
     log_event(con, lead["id"], "reply", label, sender["email"])
+    pointer = re.search(r"\b(reach out to|contact|speak (to|with)|talk to|get in touch with|right person|better person|best person|handles|responsible for|in charge of|"
+                        r"forward(ed|ing)? (this|you)|loop(ing|ed)? in|cc'?d|copying|introduc)", body.lower())
+    if label == "referral" or (label in ("not_interested", "other") and pointer):   # "not me, talk to sarah@…" often reads as not interested
+        if capture_referral(cfg, con, dict(lead), sender, body) and label != "referral":
+            label = "referral"
     if label == "out_of_office":
         return  # keep the sequence going
     cancel_drafts(con, lead["id"])

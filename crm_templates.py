@@ -800,7 +800,39 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px"><button class="btn brand">Save targeting</button>
  <button class="btn" formaction="{{ url_for('job_start') }}" name="cmd" value="apollo-preview">Preview Apollo searches (free)</button></div></form></div></div>
 
-{% if tab == 'targeting' %}<div class="card" id="intake"><div class="card-h"><h2>Leads by email</h2>{% if li.enabled %}<span class="badge b-ok">on: {{ li.inbox }}</span>{% endif %}</div><div class="card-b">
+{% if tab == 'targeting' %}
+<div class="card" id="instantly"><div class="card-h"><h2>New leads from Instantly (automatic)</h2>{% if ins.auto and ins_key %}<span class="badge b-ok">automatic</span>{% endif %}</div><div class="card-b">
+ <form method="post" action="{{ url_for('save_instantly') }}">
+ <p class="muted" style="margin-top:0">The bot asks Instantly SuperSearch for people matching these filters; Instantly finds their work emails (using your SuperSearch credits) and the bot imports them, skipping anyone already in BSO. Needs an Instantly plan with API access.</p>
+ <div class="grid2"><div><label>Instantly API key (v2) {% if ins_key %}<span class="badge b-ok">saved {{ ins_key }}</span>{% endif %}</label><input name="api_key" type="password" autocomplete="new-password" placeholder="{{ 'Leave blank to keep the saved one' if ins_key else 'Instantly → Settings → Integrations → API keys' }}"></div>
+ <div><label>Job titles (one per line; matches titles containing these words)</label><textarea name="titles" style="min-height:80px" placeholder="CTO&#10;VP Engineering&#10;Head of Engineering">{{ (ins.titles or [])|join('\n') }}</textarea></div>
+ <div><label>Countries (one per line)</label><textarea name="countries" style="min-height:60px" placeholder="United States&#10;United Kingdom">{{ (ins.countries or [])|join('\n') }}</textarea></div>
+ <div><label>Keywords (optional)</label><input name="keywords" value="{{ ins.keywords or '' }}" placeholder="e.g. SaaS"></div></div>
+ <label>Seniority</label><div class="checks">{% for v in ins_opts.LEVELS %}<label><input type="checkbox" name="levels" value="{{ v }}" {{ 'checked' if v in (ins.levels or []) }}> {{ v }}</label>{% endfor %}</div>
+ <label>Department</label><div class="checks">{% for v in ins_opts.DEPARTMENTS %}<label><input type="checkbox" name="departments" value="{{ v }}" {{ 'checked' if v in (ins.departments or []) }}> {{ v }}</label>{% endfor %}</div>
+ <label>Company size (employees)</label><div class="checks">{% for v in ins_opts.SIZES %}<label><input type="checkbox" name="sizes" value="{{ v }}" {{ 'checked' if v in (ins.sizes or []) }}> {{ v }}</label>{% endfor %}</div>
+ <label>Industries</label><div class="checks">{% for v in ins_opts.INDUSTRIES %}<label><input type="checkbox" name="industries" value="{{ v }}" {{ 'checked' if v in (ins.industries or []) }}> {{ v }}</label>{% endfor %}</div>
+ <label class="check"><input type="checkbox" name="one_per_company" {{ 'checked' if ins.get('one_per_company', True) }}> One person per company</label>
+ <div class="grid2"><div><label>Leads per import</label><input name="per_pull" type="number" min="1" max="1000" value="{{ ins.per_pull or 50 }}"></div>
+ <div><label>Import automatically when fewer than this many days of new leads are left</label><input name="auto_below_days" type="number" min="0" step="0.5" value="{{ ins.auto_below_days or 3 }}"></div></div>
+ <label class="check"><input type="checkbox" name="auto" {{ 'checked' if ins.auto }}> Import automatically (the bot checks on every run)</label>
+ <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px"><button class="btn brand" name="action" value="save">Save</button><button class="btn" name="action" value="count">Count matching people (free)</button><button class="btn" name="action" value="pull" onclick="return confirm('Start an import now? It uses Instantly SuperSearch credits.')">Import now</button></div></form>
+ {% if ins_pulls %}<table class="tbl" style="margin-top:12px"><tr><th>Started</th><th>Status</th><th class="r">Asked for</th><th class="r">Found</th><th class="r">Added</th></tr>{% for p in ins_pulls %}<tr><td>{{ (p.started_at or '')[:16].replace('T', ' ') }}</td><td>{{ 'Instantly is working on it' if p.status == 'running' else 'Done' }}</td><td class="r">{{ p.wanted }}</td><td class="r">{{ p.found if p.found is not none else '–' }}</td><td class="r">{{ p.imported if p.imported is not none else '–' }}</td></tr>{% endfor %}</table>{% endif %}
+ <p class="hint">Don't also run these leads in an Instantly campaign, or they'd get two sequences.</p></div></div>
+
+<div class="card" id="discover"><div class="card-h"><h2>Find more contacts on the web</h2>{% if dsc.enabled %}<span class="badge b-ok">on</span>{% endif %}</div><div class="card-b">
+ <form method="post" action="{{ url_for('save_discover') }}">
+ <p class="muted" style="margin-top:0">For companies already in BSO, the AI searches the public web for people in the roles below whose <b>work email is published</b> (company site, press releases, speaker pages…). BSO never guesses addresses: it opens the page the AI names and only adds an address it can see written there, at the company's own domain. With an Instantly key saved above, Instantly's verifier also checks each found address. Each company is searched once.</p>
+ {% if not ai_key %}<div class="help" style="border-color:#dd7a01">Needs your Anthropic key (Settings → AI &amp; Apollo keys).</div>{% endif %}
+ <label class="check"><input type="checkbox" name="enabled" {{ 'checked' if dsc.enabled }}> Search the web for more contacts on each bot run</label>
+ <div class="grid2"><div><label>Roles to look for (one per line)</label><textarea name="roles" style="min-height:90px">{{ (dsc.roles or dsc_default)|join('\n') }}</textarea></div>
+ <div><label>Companies to search per day</label><input name="per_day" type="number" min="1" max="200" value="{{ dsc.per_day or 10 }}"><p class="hint">About $0.03–0.05 per company in Anthropic usage (web search is $10 per 1,000 searches, up to 3 per company). 10 a day is about $10–15 a month.</p></div></div>
+ <label class="check"><input type="checkbox" name="add_to_sequence" {{ 'checked' if dsc.get('add_to_sequence', True) }}> Start the email sequence for contacts found</label>
+ <p class="hint">Contacts in the EU/UK: you need a legitimate interest to email them, and every email already carries an opt-out.</p>
+ <button class="btn brand" style="margin-top:8px">Save</button></form>
+ {% if dsc_recent %}<table class="tbl" style="margin-top:12px"><tr><th>Company</th><th>Searched</th><th class="r">Found</th><th class="r">Added</th><th>Not used</th></tr>{% for d in dsc_recent %}<tr><td>{{ d.domain }}</td><td>{{ d.at[:10] }}</td><td class="r">{{ d.found }}</td><td class="r">{{ d.added }}</td><td class="muted" style="font-size:12px">{{ d.note }}</td></tr>{% endfor %}</table>{% endif %}
+ </div></div>
+<div class="card" id="intake"><div class="card-h"><h2>Leads by email</h2>{% if li.enabled %}<span class="badge b-ok">on: {{ li.inbox }}</span>{% endif %}</div><div class="card-b">
  <form method="post" action="{{ url_for('save_intake') }}">
  <p class="muted" style="margin-top:0">Email a CSV or Excel (.xlsx) lead file, for example an Instantly export, to the inbox below. On its next run BSO imports it, skips duplicates and do-not-contact addresses, and replies with what it added. Nobody needs to import leads by hand.</p>
  <label class="check"><input type="checkbox" name="enabled" {{ 'checked' if li.enabled }}> Import lead files emailed to this inbox</label>

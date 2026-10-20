@@ -871,6 +871,42 @@ def prospect_stage(lead_id):
 
 # ---------------------------------------------------------------- handover settings
 
+@app.post("/settings/instantly")
+def save_instantly():
+    import instantly
+    f = request.form
+    lines = lambda k: [x.strip() for x in re.split(r"[\n,;]+", f.get(k, "")) if x.strip()]
+    if f.get("api_key"):
+        set_secret(instantly.KEY, f["api_key"].strip())
+    write_settings({"instantly": {"titles": lines("titles"), "levels": f.getlist("levels"), "departments": f.getlist("departments"),
+                                  "sizes": f.getlist("sizes"), "countries": lines("countries"), "industries": f.getlist("industries"),
+                                  "keywords": f.get("keywords", "").strip(), "one_per_company": f.get("one_per_company") == "on",
+                                  "per_pull": max(1, min(int(f.get("per_pull") or 50), 1000)),
+                                  "auto": f.get("auto") == "on", "auto_below_days": float(f.get("auto_below_days") or 3)}})
+    action = f.get("action", "save")
+    try:
+        if action == "count":
+            n = instantly.count(cfg())
+            msg, ok = f"{n:,} people in Instantly SuperSearch match these filters (not counting leads you already own).", 1
+        elif action == "pull":
+            instantly.start_pull(cfg(), db())
+            msg, ok = "Instantly is finding and enriching the leads now. The bot adds them on its next run (or click Run bot now in a few minutes).", 1
+        else:
+            msg, ok = "Instantly settings saved.", 1
+    except instantly.InstantlyError as e:
+        msg, ok = str(e), None
+    return redirect(url_for("settings", tab="targeting", result=msg, ok=ok, _anchor="instantly"))
+
+
+@app.post("/settings/discover")
+def save_discover():
+    f = request.form
+    roles = [x.strip() for x in re.split(r"[\n,;]+", f.get("roles", "")) if x.strip()]
+    write_settings({"discover": {"enabled": f.get("enabled") == "on", "roles": roles, "per_day": max(1, min(int(f.get("per_day") or 10), 200)),
+                                 "add_to_sequence": f.get("add_to_sequence") == "on"}})
+    return redirect(url_for("settings", tab="targeting", result="Saved.", ok=1, _anchor="discover"))
+
+
 @app.post("/settings/intake")
 def save_intake():
     f = request.form
@@ -1412,7 +1448,10 @@ def settings():
                         "SLACK_WEBHOOK_URL": mask(env("SLACK_WEBHOOK_URL"))},
                   tab=request.args.get("tab", "inbox"), result=request.args.get("result"),
                   ok=request.args.get("ok"), avoid_hits=template_avoid_hits(c), avoid_n=len(c.get("avoid_phrases") or []),
-                  li=dict(c.get("lead_intake") or {}), inbox_emails=[x.get("email") for x in (c.get("senders") or []) if x.get("email") and "example" not in x.get("email", "")],
+                  li=dict(c.get("lead_intake") or {}), ins=dict(c.get("instantly") or {}), ins_key=mask(env("INSTANTLY_API_KEY")),
+                  ins_opts=__import__("instantly"), ins_pulls=rows("SELECT * FROM instantly_pulls ORDER BY id DESC LIMIT 5"),
+                  dsc=dict(c.get("discover") or {}), dsc_default=__import__("discover").DEFAULT_ROLES,
+                  dsc_recent=rows("SELECT * FROM discovered ORDER BY at DESC LIMIT 8"), ai_key=bool(env("ANTHROPIC_API_KEY")), inbox_emails=[x.get("email") for x in (c.get("senders") or []) if x.get("email") and "example" not in x.get("email", "")],
                   startup_ok=startup_supported(), startup_on=startup_enabled(), is_bot=team.is_bot(),
                   ho=dict(c.get("handover") or {}), pm=dict(c.get("prospect_mailbox") or {}), pm_pw=mask(env(mailbox.PW_KEY)), ho_default=bot_default_intro(), team_sups=team.supervisors() if team.joined() else [],
                   team=dict(team.state(), joined=team.joined(), policy=team.policy(), disclosure=team.DISCLOSURE, locked=team.locked_in(), signed=team.signed_in()))

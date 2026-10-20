@@ -31,6 +31,8 @@ Data is sent only to services you configure, only to perform the feature you swi
 | Anthropic (AI) | For opening lines: the contact's company name, job title, industry and text from the company's public website. Never the contact's name or email address | Only if "AI-written line" is on and an Anthropic key is set |
 | Anthropic (AI) | The text of replies you receive | Only if "Use AI to sort replies" is switched on (off by default) |
 | Company websites | A standard web request for the public homepage of a contact's company | When writing an AI opening line |
+| Instantly | Your search filters (job titles, countries, company sizes, industries); for checking addresses found on the web, those addresses | Only if you add an Instantly API key and use automatic imports or web contact search |
+| Anthropic (AI web search) | A company's name and website, so the AI can look for its decision-makers' work emails published on the public web | Only if "Find more contacts on the web" is switched on |
 | Apollo.io | Your search filters (job titles, regions, company sizes, industries) and the Apollo IDs of people to look up | Only if you add an Apollo key and use Find leads |
 | Your organisation, through its team hub or a Google Apps Script that your organisation runs in its own Google account (data stored in your organisation's Google Drive) | See section 7 | About every two minutes while the Software is open, and after each sending run |
 | Slack | A notification with the contact's name, email, company and the start of their reply | Only if you add a Slack webhook |
