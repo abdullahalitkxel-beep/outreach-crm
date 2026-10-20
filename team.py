@@ -469,7 +469,9 @@ def status(con):
     day = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
     q = lambda sql, *a: con.execute(sql, a).fetchone()[0]
     run = con.execute("SELECT status, started_at, finished_at, output FROM jobs WHERE cmd='run' ORDER BY id DESC LIMIT 1").fetchone()
-    cap = sum(int(sv.get("daily_limit") or 0) for sv in (cfg.get("senders") or []) if sv.get("email") and "example" not in sv.get("email", ""))
+    paused = _bot.guard_paused(con)
+    cap = sum(_bot.ramp_limit(cfg, sv) for sv in (cfg.get("senders") or [])
+              if sv.get("email") and "example" not in sv.get("email", "") and sv["email"].lower() not in paused)
     fresh = q("SELECT COUNT(*) FROM leads WHERE status='active' AND step=0")
     last_line = ""
     if run and run["output"]:
@@ -484,7 +486,9 @@ def status(con):
             "leads_active": q("SELECT COUNT(*) FROM leads WHERE status='active'"), "leads_not_started": fresh,
             "daily_capacity": cap, "days_of_leads": round(fresh / cap, 1) if cap else None,
             "autorun": bool(ar.get("enabled")), "every_minutes": int(ar.get("every_minutes") or 0),
-            "test_mode": bool((cfg.get("test_mode") or {}).get("enabled")), "review": bool((cfg.get("review") or {}).get("enabled"))}
+            "test_mode": bool((cfg.get("test_mode") or {}).get("enabled")), "review": bool((cfg.get("review") or {}).get("enabled")),
+            "paused_inboxes": sorted(paused), "inboxes": len([sv for sv in cfg.get("senders") or [] if sv.get("email") and "example" not in sv["email"]]),
+            "campaigns": [dict(r) for r in con.execute("SELECT id, name, status FROM campaigns ORDER BY id")]}
 
 
 def sync(con, version=""):

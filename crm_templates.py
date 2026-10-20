@@ -453,6 +453,9 @@ LEAD = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block titl
 {% endif %}
 {% if pending_draft %}{% call m.help('lead-draft-'~pending_draft.id, 'A draft email is waiting for your review.') %} <a href="{{ url_for('review') }}#d{{ pending_draft.id }}">Review it now →</a>{% endcall %}{% endif %}
 <div class="cols"><div>
+ <div class="card"><div class="card-h"><h2>Campaign</h2></div><div class="card-b"><form method="post" action="{{ url_for('lead_campaign', lead_id=l.id) }}" style="display:flex;gap:8px;align-items:end">
+  <div style="flex:1"><select name="campaign_id">{% for cp in all_campaigns %}<option value="{{ cp.id }}" {{ 'selected' if (l.campaign_id or 1) == cp.id }}>{{ cp.name }}{{ ' (paused)' if cp.status != 'active' }}</option>{% endfor %}</select></div>
+  <button class="btn">Move</button> <a class="btn" href="{{ url_for('campaign', cid=l.campaign_id or 1) }}">Open campaign</a></form></div></div>
  <div class="card"><div class="card-h"><h2>Details</h2></div><div class="card-b">
  <form method="post" action="{{ url_for('update_lead', lead_id=l.id) }}"><div class="grid2">
   <div><label>First name</label><input name="first_name" value="{{ l.first_name or '' }}"></div>
@@ -681,6 +684,7 @@ IMPORT = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block ti
 <p><a class="btn brand" href="{{ url_for('leads') }}">View leads</a> <a class="btn" href="{{ url_for('setup') }}">Back to Getting started</a></p></div></div>{% endif %}
 <div class="card" style="max-width:640px"><div class="card-b"><form method="post" enctype="multipart/form-data">
  <label>File</label><input type="file" name="file" accept=".csv,.xlsx" required>
+ <label>Campaign</label><select name="campaign_id">{% for c in all_campaigns %}<option value="{{ c.id }}" {{ 'selected' if request.args.get('campaign')|string == c.id|string }}>{{ c.name }}{{ ' (paused)' if c.status != 'active' }}</option>{% endfor %}</select>
  <label style="display:flex;gap:6px;align-items:center;margin-top:14px;color:var(--ink)"><input type="checkbox" name="sequence" value="1" checked style="width:auto"> Add these leads to the email sequence</label>
  <button class="btn brand" style="margin-top:12px">Import</button></form></div></div>
 {% endblock %}"""
@@ -701,10 +705,13 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
 
 {% if tab == 'inbox' %}
 <div class="card"><div class="card-h"><h2>Email inboxes</h2></div><div class="card-b">
-<p class="muted" style="margin-top:0">The addresses your emails are sent from. One is enough to start; add up to ten to send more per day. Use your <b>outreach domain</b>, not your main company inbox.</p>
+<p class="muted" style="margin-top:0">The addresses your emails are sent from. One is enough to start; add up to {{ max_inboxes }} (choose which ones each campaign uses on its page). Use your <b>outreach domains</b>, not your main company inbox. To add many at once, use <a href="#bulk">Add several inboxes</a> below.</p>
 <form method="post" action="{{ url_for('save_inbox') }}">
 {% for ib in inboxes %}{% set s = ib.s %}{% set n = ib.n %}
-<fieldset class="ibox" {{ 'data-optional' if n > 1 }}><legend>Inbox {{ n }}{{ ' (optional)' if n > 1 }}</legend>
+<fieldset class="ibox" {{ 'data-optional' if n > 1 }}>{% if s.email %}<details {{ 'open' if ib.paused }}><summary style="cursor:pointer"><b>Inbox {{ n }}: {{ s.email }}</b> <span class="muted">{{ s.name }} · {{ ib.today }}/day{% if s.ramp_from and ib.today < (s.daily_limit or 10) %} today (ramping up to {{ s.daily_limit }}){% endif %}{% if ib.campaigns %} · {{ ib.campaigns|join(', ') }}{% endif %}</span>
+ {% if ib.paused %}<span class="badge" style="background:#fde1e1;color:#7b1018">paused</span>{% elif ib.pw %}<span class="badge b-ok">saved</span>{% endif %}</summary>
+ {% if ib.paused %}<div class="help" style="margin:8px 0;border-color:#c23934">⛔ Paused by the deliverability guard: {{ ib.paused }} <button class="btn sm" formaction="{{ url_for('inbox_resume') }}" name="email" value="{{ s.email }}">Resume it</button></div>{% endif %}
+ {% else %}<legend>Inbox {{ n }}{{ ' (optional)' if n > 1 }}</legend>{% endif %}
  <div class="grid2">
   <div><label>Email provider</label><select name="provider{{ n }}" data-n="{{ n }}" class="prov">{% for k, p in providers.items() %}<option value="{{ k }}" {{ 'selected' if ib.provider == k }}>{{ p.label }}</option>{% endfor %}</select></div>
   <div><label>Email address</label><input name="email{{ n }}" type="email" value="{{ s.email or '' }}" placeholder="you@your-outreach-domain.com"></div>
@@ -718,9 +725,26 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
   <div><label>SMTP port</label><input name="smtp_port{{ n }}" id="port{{ n }}" type="number" value="{{ s.smtp_port or 587 }}"></div>
   <div><label>Receiving server (IMAP)</label><input name="imap_host{{ n }}" id="imap{{ n }}" value="{{ s.imap_host or providers[ib.provider].imap_host }}"></div>
  </div></details>
+ <label class="check"><input type="checkbox" name="ramp{{ n }}" {{ 'checked' if s.ramp_from }}> New inbox: ramp up gradually ({{ (c.ramp or {}).start or 5 }}/day, +{{ (c.ramp or {}).per_week or 5 }} each week, up to the limit above){% if s.ramp_from %} <span class="muted">· since {{ s.ramp_from }}</span>{% endif %}</label><input type="hidden" name="ramp_from{{ n }}" value="{{ s.ramp_from or '' }}">
  <button class="btn" name="test" value="{{ n }}" style="margin-top:10px">Save &amp; test connection</button>
-</fieldset>{% endfor %}
+{% if s.email %}</details>{% endif %}</fieldset>{% endfor %}
 <button class="btn brand">Save inboxes</button></form></div></div>
+
+<div class="card" id="health"><div class="card-h"><h2>Sending domain health</h2><span style="flex:1"></span><form method="post" action="{{ url_for('domains_check') }}" style="margin:0"><button class="btn sm">Check now</button></form></div><div class="card-b">
+ <p class="muted" style="margin-top:0">SPF, DKIM and DMARC tell receiving servers your emails are genuine; without them more of your emails land in spam. MX lets replies reach you.</p>
+ {% if dom_health %}<table class="tbl"><tr><th>Domain</th><th>SPF</th><th>DKIM</th><th>DMARC</th><th>MX</th><th>Checked</th></tr>{% for d, r in dom_health.items() %}<tr><td><b>{{ d }}</b></td>
+ {% if r.error %}<td colspan="4" class="muted">{{ r.error }}</td>{% else %}{% for k in ['spf','dkim','dmarc','mx'] %}<td>{{ '✅' if r[k][0] else '❌' }} <small class="muted">{{ r[k][1] }}</small></td>{% endfor %}{% endif %}<td class="muted">{{ r.at[:10] }}</td></tr>
+ {% if r.fix %}<tr><td colspan="6"><ul style="margin:0">{% for x in r.fix %}<li>{{ x }}</li>{% endfor %}</ul></td></tr>{% endif %}{% endfor %}</table>
+ {% else %}<p class="muted">Not checked yet. Click <b>Check now</b>.</p>{% endif %}
+ <p class="hint">The deliverability guard also pauses an inbox by itself if more than 5% of its last emails bounce (after at least 20) or its login fails 3 times in a row, and tells you. Keep warm-up running in Instantly for every inbox.</p></div></div>
+
+<div class="card" id="bulk"><div class="card-h"><h2>Add several inboxes</h2></div><div class="card-b"><form method="post" action="{{ url_for('inbox_bulk') }}">
+ <p class="muted" style="margin-top:0">For inboxes on the same mail server: one per line as <code>email, name, password</code>. Passwords are stored encrypted on this computer.</p>
+ <textarea name="lines" style="min-height:120px;font-family:ui-monospace,Menlo,Consolas,monospace" placeholder="maya.hart@getneosofttech.com, Maya Hart, password1&#10;liam.cole@getneosofttech.com, Liam Cole, password2" required></textarea>
+ <div class="grid2"><div><label>Sending server (SMTP)</label><input name="smtp_host" placeholder="mail.getneosofttech.com" required></div><div><label>SMTP port</label><input name="smtp_port" type="number" value="465"></div>
+ <div><label>Receiving server (IMAP)</label><input name="imap_host" placeholder="mail.getneosofttech.com" required></div><div><label>Emails per day from each</label><input name="daily_limit" type="number" min="1" max="100" value="10"></div></div>
+ <label class="check"><input type="checkbox" name="ramp" checked> New inboxes: ramp up gradually</label>
+ <button class="btn brand" style="margin-top:10px">Add inboxes</button></form></div></div>
 
 {% elif tab == 'safety' %}
 <div class="card"><div class="card-h"><h2>Safety &amp; automation</h2></div><div class="card-b"><form method="post" action="{{ url_for('save_safety') }}">
@@ -812,6 +836,7 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <label>Department</label><div class="checks">{% for v in ins_opts.DEPARTMENTS %}<label><input type="checkbox" name="departments" value="{{ v }}" {{ 'checked' if v in (ins.departments or []) }}> {{ v }}</label>{% endfor %}</div>
  <label>Company size (employees)</label><div class="checks">{% for v in ins_opts.SIZES %}<label><input type="checkbox" name="sizes" value="{{ v }}" {{ 'checked' if v in (ins.sizes or []) }}> {{ v }}</label>{% endfor %}</div>
  <label>Industries</label><div class="checks">{% for v in ins_opts.INDUSTRIES %}<label><input type="checkbox" name="industries" value="{{ v }}" {{ 'checked' if v in (ins.industries or []) }}> {{ v }}</label>{% endfor %}</div>
+ <div style="max-width:420px"><label>Put imported leads in this campaign</label><select name="campaign_id">{% for cp in all_campaigns %}<option value="{{ cp.id }}" {{ 'selected' if (ins.campaign_id or 1) == cp.id }}>{{ cp.name }}</option>{% endfor %}</select></div>
  <label class="check"><input type="checkbox" name="one_per_company" {{ 'checked' if ins.get('one_per_company', True) }}> One person per company</label>
  <div class="grid2"><div><label>Leads per import</label><input name="per_pull" type="number" min="1" max="1000" value="{{ ins.per_pull or 50 }}"></div>
  <div><label>Import automatically when fewer than this many days of new leads are left</label><input name="auto_below_days" type="number" min="0" step="0.5" value="{{ ins.auto_below_days or 3 }}"></div></div>
@@ -838,6 +863,7 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <label class="check"><input type="checkbox" name="enabled" {{ 'checked' if li.enabled }}> Import lead files emailed to this inbox</label>
  <div class="grid2"><div><label>Intake inbox (one of your inboxes)</label><select name="inbox">{% for e in inbox_emails %}<option {{ 'selected' if li.inbox == e }}>{{ e }}</option>{% endfor %}</select></div>
  <div><label>Who may send lead files (one address per line)</label><textarea name="allowed_senders" style="min-height:70px" placeholder="omar@blacswanken.com">{{ (li.allowed_senders or [])|join('\n') }}</textarea></div></div>
+ <div style="max-width:420px"><label>Put imported leads in this campaign <span class="muted">(or write "campaign: name" in the email's subject)</span></label><select name="campaign_id">{% for cp in all_campaigns %}<option value="{{ cp.id }}" {{ 'selected' if (li.campaign_id or 1) == cp.id }}>{{ cp.name }}</option>{% endfor %}</select></div>
  <label class="check"><input type="checkbox" name="add_to_sequence" {{ 'checked' if li.get('add_to_sequence', True) }}> Start the email sequence for imported leads</label>
  <label class="check"><input type="checkbox" name="verified_only" {{ 'checked' if li.get('verified_only', True) }}> Only accept files whose sender the mail server verified (recommended: stops someone faking your address)</label>
  <p class="hint">Emails from anyone else are treated as normal mail. The confirmation reply goes to whoever sent the file, even in test mode.</p>
@@ -969,6 +995,42 @@ ABOUT = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block tit
 </div></div>
 {% endblock %}"""
 
+CAMPAIGNS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}Campaigns{% endblock %}{% block body %}
+{% call m.header('t-rev', '⚑', 'Campaigns', items|length ~ ' campaign(s)') %}{% endcall %}
+<div class="help" style="margin-bottom:12px">Each campaign has its own emails, its own inboxes and its own leads. Use one per offer or audience (for example <i>CTOs, US fintech</i> and <i>Heads of Product, UK SaaS</i>). Imports, emailed lead files and Instantly imports each go into the campaign you choose.</div>
+<div class="card"><table class="tbl"><thead><tr><th>Campaign</th><th>Status</th><th class="r">Leads</th><th class="r">Not yet emailed</th><th class="r">In sequence</th><th class="r">Sent</th><th class="r">Reply rate</th><th class="r">Positive</th><th class="r">Handed over</th><th class="r">Bounces</th></tr></thead>
+{% for c in items %}<tr><td><a href="{{ url_for('campaign', cid=c.id) }}"><b>{{ c.name }}</b></a><br><small class="muted">{{ c.inbox_list|length ~ ' inbox(es)' if c.inbox_list else 'all inboxes' }}</small></td>
+<td>{{ m.status_badge('active' if c.status == 'active' else 'paused', {'active':'Running','paused':'Paused'}) }}</td><td class="r"><a href="{{ url_for('leads', campaign=c.id) }}">{{ c.st.leads }}</a></td><td class="r">{{ c.st.waiting }}</td><td class="r">{{ c.st.in_sequence }}</td>
+<td class="r">{{ c.st.sent }}</td><td class="r">{{ c.st.rate }}</td><td class="r">{{ c.st.positive }} <small class="muted">({{ c.st.pos_rate }})</small></td><td class="r">{{ c.st.handed }}</td><td class="r">{{ c.st.bounces }}</td></tr>{% endfor %}</table></div>
+<div class="card" style="max-width:640px"><div class="card-h"><h2>New campaign</h2></div><div class="card-b"><form method="post" action="{{ url_for('campaign_new') }}"><div class="grid2">
+<div><label>Name</label><input name="name" required placeholder="e.g. Heads of Product, UK SaaS"></div>
+<div><label>Start from the emails of</label><select name="copy_from">{% for c in items %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></div></div>
+<button class="btn brand" style="margin-top:12px">Create campaign</button></form></div></div>{% endblock %}"""
+
+CAMPAIGN = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}{{ c.name }}{% endblock %}{% block body %}
+{% call m.header('t-rev', '⚑', 'Campaign', c.name) %}
+ <form method="post" style="display:inline">{% if c.status == 'active' %}<button class="btn" name="action" value="pause">Pause campaign</button>{% else %}<button class="btn brand" name="action" value="resume">▶ Start campaign</button>{% endif %}</form>
+ <a class="btn" href="{{ url_for('leads', campaign=c.id) }}">Its leads ({{ st.leads }})</a>
+{% endcall %}
+<div class="stats" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:14px">{% for k, l in [('waiting','Not yet emailed'),('in_sequence','In sequence'),('sent','Emails sent'),('rate','Reply rate'),('positive','Positive replies'),('handed','Handed over'),('bounces','Bounces')] %}<div class="card" style="margin:0"><div class="card-b"><small class="muted">{{ l }}</small><div style="font-size:22px">{{ st[k] }}</div></div></div>{% endfor %}</div>
+<form method="post"><input type="hidden" name="action" value="save">
+<div class="card"><div class="card-h"><h2>Settings</h2>{{ m.status_badge('active' if c.status == 'active' else 'paused', {'active':'Running','paused':'Paused'}) }}</div><div class="card-b">
+ <label>Name</label><input name="name" value="{{ c.name }}">
+ <label>Send from these inboxes <span class="muted">(none ticked = all inboxes)</span></label><div class="checks">{% for e in inboxes %}<label><input type="checkbox" name="inboxes" value="{{ e }}" {{ 'checked' if e in picked }}> {{ e }}</label>{% endfor %}</div>
+ {% if c.id != 1 %}<label>What we offer, for the AI-written first line <span class="muted">(empty = same as the Main campaign)</span></label><textarea name="offer" style="min-height:70px" placeholder="{{ main_offer }}">{{ c.offer or '' }}</textarea>{% endif %}
+</div></div>
+{% if c.id == 1 %}<div class="card"><div class="card-b">The Main campaign's emails (with A/B variants) are edited in <a href="{{ url_for('settings', tab='emails') }}">Settings → Your offer &amp; emails</a>.</div></div>
+{% else %}<div class="card" id="emails"><div class="card-h"><h2>Emails</h2><span class="muted">{first_name}, {company}, {personal_line}, {sender_name} are filled in for each lead</span></div><div class="card-b">
+ {% for st in steps %}{% set i = loop.index0 %}<fieldset class="ibox"><legend>{{ 'First email' if i == 0 else 'Follow-up ' ~ i }}</legend>
+  {% if i > 0 %}<div style="max-width:240px"><label>Days after the previous email</label><input name="delay{{ i }}" type="number" min="1" value="{{ st.delay_days }}"></div>{% else %}<input type="hidden" name="delay0" value="0">{% endif %}
+  <label>Subject {% if i > 0 %}<span class="muted">(empty = reply in the same thread)</span>{% endif %}</label><input name="subject{{ i }}" value="{{ st.subject }}">
+  <label>Body</label><textarea name="body{{ i }}" style="min-height:170px;font-family:ui-monospace,Menlo,Consolas,monospace">{{ st.body }}</textarea>
+  {% if steps|length > 1 %}<label class="check"><input type="checkbox" name="remove{{ i }}"> Remove this email</label>{% endif %}</fieldset>{% endfor %}
+ <button class="btn" name="action" value="add_step">+ Add a follow-up</button></div></div>{% endif %}
+<button class="btn brand">Save campaign</button></form>
+{% if c.id != 1 %}<form method="post" style="margin-top:20px" onsubmit="return confirm('Delete this campaign? Its leads move to the Main campaign.')"><button class="btn danger" name="action" value="delete">Delete campaign</button></form>{% endif %}
+{% endblock %}"""
+
 PROSPECTS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}My prospects{% endblock %}{% block body %}
 {% call m.header('t-opp', '★', 'My prospects', items|length ~ ' handed over to you · ' ~ counts['new'] ~ ' not contacted yet') %}{% endcall %}
 <div class="help" style="margin-bottom:12px"><b>Prospects handed over to you.</b> Each one replied with interest, a meeting request or a question. Reply from your own mailbox (you were in CC on the introduction), then keep the stage up to date here; your manager sees it in the Master Console. Open a prospect for their reply, the full conversation, notes and tasks.</div>
@@ -1025,5 +1087,5 @@ TEMPLATES = {
     "base.html": BASE, "macros.html": MACROS, "home.html": HOME, "leads.html": LEADS, "lead.html": LEAD,
     "accounts.html": ACCOUNTS, "account.html": ACCOUNT, "opps.html": OPPS, "opp.html": OPP,
     "tasks.html": TASKS, "reports.html": REPORTS, "review.html": REVIEW, "setup.html": SETUP,
-    "job.html": JOB, "settings.html": SETTINGS, "welcome.html": WELCOME, "signin.html": SIGNIN, "prospects.html": PROSPECTS, "legal.html": LEGAL, "about.html": ABOUT, "jobs.html": JOBS, "new.html": NEW_LEAD, "import.html": IMPORT, "search.html": SEARCH,
+    "job.html": JOB, "settings.html": SETTINGS, "welcome.html": WELCOME, "signin.html": SIGNIN, "prospects.html": PROSPECTS, "campaigns.html": CAMPAIGNS, "campaign.html": CAMPAIGN, "legal.html": LEGAL, "about.html": ABOUT, "jobs.html": JOBS, "new.html": NEW_LEAD, "import.html": IMPORT, "search.html": SEARCH,
 }

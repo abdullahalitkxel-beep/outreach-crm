@@ -65,6 +65,9 @@ jobs:
       - name: Test referrals, Instantly auto-pull and web contact search
         run: python tests/lead_growth_test.py
 
+      - name: Test campaigns, many inboxes, ramp-up, deliverability guard and domain health
+        run: python tests/campaigns_test.py
+
       - name: Test the AI line with thinking models
         run: python tests/llm_test.py
 
@@ -99,6 +102,7 @@ jobs:
           --hidden-import mailbox
           --hidden-import instantly
           --hidden-import discover
+          --hidden-import health
           --hidden-import waitress
           --hidden-import secretstore
           --hidden-import bs4

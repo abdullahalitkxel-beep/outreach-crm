@@ -199,6 +199,16 @@ CREATE TABLE IF NOT EXISTS messages (                -- a supervisor's emails wi
     id INTEGER PRIMARY KEY, lead_id INTEGER, msg_id TEXT UNIQUE, direction TEXT, at TEXT, frm TEXT, to_ TEXT, cc TEXT,
     subject TEXT, body TEXT, seen INTEGER DEFAULT 0, via TEXT
 );
+CREATE TABLE IF NOT EXISTS campaigns (                   -- separate offers / segments, each with its own sequence and inboxes
+    id INTEGER PRIMARY KEY, name TEXT, status TEXT DEFAULT 'active', inboxes TEXT DEFAULT '[]', sequence TEXT,
+    offer TEXT, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS inbox_health (                -- inboxes the deliverability guard has paused
+    email TEXT PRIMARY KEY, paused INTEGER DEFAULT 0, reason TEXT, at TEXT, login_failures INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS domain_health (               -- SPF / DKIM / DMARC / MX checks of the sending domains
+    domain TEXT PRIMARY KEY, at TEXT, result TEXT
+);
 CREATE TABLE IF NOT EXISTS instantly_pulls (            -- SuperSearch imports started by the bot
     id INTEGER PRIMARY KEY, resource_id TEXT, started_at TEXT, finished_at TEXT, wanted INTEGER, status TEXT,
     found INTEGER, imported INTEGER, skipped TEXT
@@ -255,6 +265,10 @@ def db_connect(path):
         _add_column(con, "leads", "handed_at", "TEXT")
         _add_column(con, "leads", "handed_from", "TEXT")        # who handed it over (supervisor side)
         _add_column(con, "leads", "prospect_stage", "TEXT")     # supervisor's stage for a handed-over prospect
+        _add_column(con, "leads", "campaign_id", "INTEGER DEFAULT 1")
+        _add_column(con, "inbox_health", "resumed_at", "TEXT")
+        _add_column(con, "instantly_pulls", "campaign_id", "INTEGER DEFAULT 1")
+        con.execute("INSERT OR IGNORE INTO campaigns(id, name, status, created_at) VALUES (1, 'Main campaign', 'active', ?)", (iso(now_utc()),))
         con.execute("UPDATE leads SET stage='qualified' WHERE stage IN ('meeting','proposal','won')")
         con.execute("UPDATE leads SET stage='unqualified' WHERE stage='lost'")
         con.commit()
@@ -303,14 +317,78 @@ def suppress(con, addr, reason):
 
 # ---------------------------------------------------------------- senders
 
+def ramp_limit(cfg, s, today=None):
+    """New inboxes start low and climb each week up to their daily limit (protects a young domain's reputation)."""
+    full = int(s.get("daily_limit") or 10)
+    if not s.get("ramp_from"):
+        return full
+    rc = cfg.get("ramp") or {}
+    try:
+        start = datetime.fromisoformat(str(s["ramp_from"])[:10]).date()
+    except ValueError:
+        return full
+    weeks = max(0, ((today or datetime.now().date()) - start).days // 7)
+    return min(full, int(rc.get("start", 5)) + int(rc.get("per_week", 5)) * weeks)
+
+
 def load_senders(cfg):
     senders = []
     for s in cfg["senders"]:
         pw = env(s["password_env"])
         if not pw:
             log.warning("No password in env var %s for %s", s["password_env"], s["email"])
-        senders.append({**s, "password": pw})
+        senders.append({**s, "password": pw, "full_limit": int(s.get("daily_limit") or 10), "daily_limit": ramp_limit(cfg, s)})
     return senders
+
+
+# ---------------------------------------------------------------- deliverability guard
+
+def guard_paused(con):
+    return {r["email"].lower(): r["reason"] for r in con.execute("SELECT email, reason FROM inbox_health WHERE paused=1")}
+
+
+def guard_pause(cfg, con, email, reason):
+    con.execute("INSERT INTO inbox_health(email, paused, reason, at) VALUES (?,1,?,?) "
+                "ON CONFLICT(email) DO UPDATE SET paused=1, reason=excluded.reason, at=excluded.at", (email.lower(), reason, iso(now_utc())))
+    con.commit()
+    log.error("Inbox %s paused: %s", email, reason)
+    notify(f"⛔ BSO paused the inbox {email}: {reason} It sends nothing until you resume it in Settings → Email inboxes.", cfg)
+
+
+def guard_check(cfg, con, senders):
+    """Pause inboxes whose recent bounce rate is too high. Returns the problems found."""
+    g = cfg.get("guard") or {}
+    if g.get("enabled", True) is False:
+        return []
+    limit, min_sent = float(g.get("bounce_rate", 0.05)), int(g.get("min_sent", 20))
+    paused, out = guard_paused(con), []
+    since_default = iso(now_utc() - timedelta(days=7))
+    for s in senders:
+        e = s["email"].lower()
+        if e in paused:
+            continue
+        r = con.execute("SELECT resumed_at FROM inbox_health WHERE email=?", (e,)).fetchone()
+        since = max(since_default, r["resumed_at"]) if r and r["resumed_at"] else since_default
+        op = ">" if r and r["resumed_at"] and r["resumed_at"] >= since_default else ">="     # after a resume: only what happened since
+        sent = con.execute(f"SELECT COUNT(*) FROM events WHERE type='sent' AND lower(sender)=? AND at{op}? AND detail NOT LIKE '%(test)%'", (e, since)).fetchone()[0]
+        bounced = con.execute(f"SELECT COUNT(*) FROM events WHERE type='bounce' AND lower(sender)=? AND at{op}?", (e, since)).fetchone()[0]
+        if sent >= min_sent and bounced / sent >= limit:
+            reason = f"{bounced} of its last {sent} emails bounced ({bounced * 100 // sent}%, the limit is {limit * 100:g}%)."
+            guard_pause(cfg, con, e, reason)
+            out.append(f"{s['email']}: paused, {reason}")
+    return out
+
+
+def guard_login(cfg, con, email, ok):
+    """Count login failures; pause after 3 in a row so a broken inbox isn't retried forever."""
+    e = email.lower()
+    if ok:
+        con.execute("UPDATE inbox_health SET login_failures=0 WHERE email=?", (e,))
+        return
+    con.execute("INSERT INTO inbox_health(email, login_failures) VALUES (?,1) ON CONFLICT(email) DO UPDATE SET login_failures=login_failures+1", (e,))
+    n = con.execute("SELECT login_failures FROM inbox_health WHERE email=?", (e,)).fetchone()[0]
+    if n >= int((cfg.get("guard") or {}).get("login_failures", 3)):
+        guard_pause(cfg, con, e, f"its login was rejected {n} times in a row (password changed or mailbox locked?).")
 
 
 def sent_today(con, sender_email, cfg):
@@ -578,6 +656,38 @@ def pick_sender(lead, senders, capacity):
     return max(open_, key=lambda s: capacity[s["email"]]) if open_ else None
 
 
+# ---------------------------------------------------------------- campaigns
+
+def campaign_row(con, cid):
+    return con.execute("SELECT * FROM campaigns WHERE id=?", (cid or 1,)).fetchone() or con.execute("SELECT * FROM campaigns WHERE id=1").fetchone()
+
+
+def campaign_cfg(cfg, con, cid):
+    """The settings one campaign runs with: its own sequence and offer if set, else the main ones."""
+    c = campaign_row(con, cid)
+    if not c or c["id"] == 1 and not c["sequence"]:
+        return cfg
+    out = dict(cfg)
+    if c["sequence"]:
+        try:
+            seq = json.loads(c["sequence"])
+            if seq:
+                out["sequence"] = seq
+        except ValueError:
+            pass
+    if c["offer"]:
+        out["offer"] = c["offer"]
+    return out
+
+
+def campaign_inboxes(con, cid):
+    c = campaign_row(con, cid)
+    try:
+        return {e.lower() for e in json.loads(c["inboxes"] or "[]")} if c else set()
+    except ValueError:
+        return set()
+
+
 def pick_variant(cfg, lead, idx, force_name=None):
     """Each step can have several template variants; leads are spread evenly across the enabled ones."""
     step = cfg["sequence"][idx]
@@ -620,7 +730,7 @@ def regenerate_draft(cfg, con, draft_id):
     d = con.execute("SELECT * FROM outbox WHERE id=?", (draft_id,)).fetchone()
     lead = dict(con.execute("SELECT * FROM leads WHERE id=?", (d["lead_id"],)).fetchone())
     sender = next(s for s in cfg["senders"] if s["email"] == d["sender"])
-    subject, body, _ = compose(cfg, con, lead, sender, d["step"], fresh_opener=True, variant_name=d["variant"])
+    subject, body, _ = compose(campaign_cfg(cfg, con, lead.get("campaign_id")), con, lead, sender, d["step"], fresh_opener=True, variant_name=d["variant"])
     con.execute("UPDATE outbox SET subject=?, body=? WHERE id=?", (subject, body, draft_id))
     con.commit()
 
@@ -659,6 +769,12 @@ def cmd_run(cfg, con, args):
 
     steps = cfg["sequence"]
     senders = [s for s in load_senders(cfg) if s["password"] or args.dry_run]
+    guard_notes = [] if args.dry_run else guard_check(cfg, con, senders)
+    paused_inboxes = guard_paused(con)
+    if paused_inboxes and not args.dry_run:
+        senders = [s for s in senders if s["email"].lower() not in paused_inboxes]
+        for e, why in paused_inboxes.items():
+            print(f"Inbox {e} is paused by the deliverability guard: {why}")
     if not senders:
         print("No usable sender inboxes (check your .env passwords).")
         return
@@ -684,10 +800,18 @@ def cmd_run(cfg, con, args):
         draft_budget = min(draft_budget, max(0, cap_left - queued))
 
     due = con.execute(
-        "SELECT * FROM leads WHERE status='active' AND next_send_at<=? "
-        "ORDER BY step DESC, id LIMIT ?",  # finish running sequences before starting new ones
+        "SELECT l.* FROM leads l LEFT JOIN campaigns c ON c.id=COALESCE(l.campaign_id,1) "
+        "WHERE l.status='active' AND l.next_send_at<=? AND COALESCE(c.status,'active')='active' "
+        "ORDER BY l.step DESC, l.id LIMIT ?",  # finish running sequences before starting new ones; paused campaigns wait
         (iso(now_utc()), args.limit),
     ).fetchall()
+    all_senders, ccache = senders, {}
+
+    def for_campaign(cid):
+        if cid not in ccache:
+            pick = campaign_inboxes(con, cid)
+            ccache[cid] = (campaign_cfg(cfg, con, cid), [s for s in all_senders if not pick or s["email"].lower() in pick])
+        return ccache[cid]
 
     sent = drafted = waiting = failed = 0
     problems = []
@@ -695,6 +819,11 @@ def cmd_run(cfg, con, args):
     for row in due:
         lead = dict(row)
         idx = lead["step"]
+        ccfg, senders = for_campaign(lead.get("campaign_id") or 1)
+        steps = ccfg["sequence"]
+        if not senders:
+            problems.append(f"Campaign {lead.get('campaign_id')}: none of its inboxes can send right now.")
+            continue
         if idx >= len(steps):
             con.execute("UPDATE leads SET status='done' WHERE id=?", (lead["id"],))
             continue
@@ -708,8 +837,8 @@ def cmd_run(cfg, con, args):
                 if draft_budget <= 0:
                     continue
                 sender = pick_sender(lead, senders, {s["email"]: 1 for s in senders})
-                subject, body, variant = compose(cfg, con, lead, sender, idx)
-                hits = find_avoid(cfg, subject, body)
+                subject, body, variant = compose(ccfg, con, lead, sender, idx)
+                hits = find_avoid(ccfg, subject, body)
                 if hits:
                     problems.append(f"Step {idx + 1} email for {lead['email']} uses avoided phrases ({', '.join(hits)}); not drafted. "
                                     "Edit the template in Settings → Your offer & emails.")
@@ -734,15 +863,15 @@ def cmd_run(cfg, con, args):
             sender = pick_sender(lead, senders, capacity)
             if not sender:
                 continue
-            subject, body, variant = compose(cfg, con, lead, sender, idx)
-            hits = find_avoid(cfg, subject, body)
+            subject, body, variant = compose(ccfg, con, lead, sender, idx)
+            hits = find_avoid(ccfg, subject, body)
             if hits:
                 problems.append(f"Step {idx + 1} email for {lead['email']} uses avoided phrases ({', '.join(hits)}); not sent. "
                                 "Edit the template in Settings → Your offer & emails.")
                 continue
 
         reply_to = lead["first_msg_id"] if idx > 0 else None
-        full_body = body + "\n\n" + render(cfg["footer"], lead, sender, cfg)
+        full_body = body + "\n\n" + render(ccfg["footer"], lead, sender, ccfg)
         to, shown_subject = lead["email"], subject
         if redirect:  # test mode: real lead data, but it lands in your own inbox
             to, shown_subject = redirect, f"[TEST for {lead['email']}] {subject}"
@@ -756,6 +885,8 @@ def cmd_run(cfg, con, args):
         except smtplib.SMTPAuthenticationError as e:
             log.error("Login failed for %s: %s — skipping this inbox", sender["email"], e)
             capacity[sender["email"]] = 0
+            if not args.dry_run:
+                guard_login(cfg, con, sender["email"], False)
             problems.append(f"{sender['email']}: login rejected. Check the app password in Settings → Email inboxes.")
             continue
         except (ConnectionError, TimeoutError, socket.gaierror) as e:
@@ -772,6 +903,8 @@ def cmd_run(cfg, con, args):
 
         sent += 1
         capacity[sender["email"]] -= 1
+        if not args.dry_run:
+            guard_login(cfg, con, sender["email"], True)
         if args.dry_run:
             continue
         if draft:
@@ -807,7 +940,7 @@ def cmd_run(cfg, con, args):
     if failed:
         msg += f" {failed} failed to send (details above)."
     print(msg)
-    for p in dict.fromkeys(problems):
+    for p in dict.fromkeys(guard_notes + problems):
         print("PROBLEM:", p)
     if problems or failed:
         sys.exit(1)  # marks the run as Failed in the CRM so it's noticed
@@ -905,6 +1038,15 @@ def intake_message(cfg, con, sender, msg):
         notify(f"⚠ A lead file emailed from {frm} was refused because the sender couldn't be verified.", cfg)
         return True
     status = "active" if li.get("add_to_sequence", True) else "paused"
+    cid, cname = int(li.get("campaign_id") or 1), None
+    m = re.search(r"campaign\s*[:=-]\s*(.+)$", subject, re.I)        # "Leads, campaign: UK SaaS" picks a campaign by name
+    if m:
+        want = m.group(1).strip().lower()
+        hit = con.execute("SELECT id, name FROM campaigns WHERE lower(name)=?", (want,)).fetchone() or \
+            con.execute("SELECT id, name FROM campaigns WHERE lower(name) LIKE ?", (want + "%",)).fetchone()
+        if hit:
+            cid, cname = hit["id"], hit["name"]
+    cname = cname or campaign_row(con, cid)["name"]
     lines, total = [], 0
     for name, data in files:
         if len(data) > INTAKE_MAX_BYTES:
@@ -919,7 +1061,7 @@ def intake_message(cfg, con, sender, msg):
                 rows = read_rows(io.StringIO(text), name)
             else:
                 rows = read_rows(io.BytesIO(data), name)
-            added, skipped = import_rows(con, rows, status, source=f"emailed by {frm}: {name}")
+            added, skipped = import_rows(con, rows, status, source=f"emailed by {frm}: {name}", campaign_id=cid)
         except Exception as e:
             lines.append(f"{name}: couldn't be read ({e}). Check it's a normal CSV or Excel file with a header row.")
             continue
@@ -928,7 +1070,7 @@ def intake_message(cfg, con, sender, msg):
         lines.append(f"{name}: {added} lead(s) added. Skipped: {why}.")
     seq = "They're in the email sequence and get their first email on the next runs." if status == "active" else "They were added without starting the email sequence."
     waiting = con.execute("SELECT COUNT(*) FROM leads WHERE status='active' AND step=0").fetchone()[0]
-    answer("BSO imported your lead file.\n\n" + "\n".join(lines) + (f"\n\n{seq}" if total else "") +
+    answer(f"BSO imported your lead file into the campaign \"{cname}\".\n\n" + "\n".join(lines) + (f"\n\n{seq}" if total else "") +
            f"\n\nLeads waiting for their first email: {waiting}.")
     notify(f"📥 {total} lead(s) imported from a file emailed by {frm}", cfg)
     return True
@@ -972,7 +1114,8 @@ def capture_referral(cfg, con, lead, sender, body):
         name = _name_near(text, addr)
         row = {"email": addr, "first_name": name[0] if name else "", "last_name": " ".join(name[1:]) if len(name) > 1 else "",
                "company": lead.get("company") or "", "website": lead.get("website") or "",
-               "source": f"referral from {lead['email']}", "referred_by": referrer, "referred_by_email": lead["email"]}
+               "source": f"referral from {lead['email']}", "referred_by": referrer, "referred_by_email": lead["email"],
+               "campaign_id": lead.get("campaign_id") or 1}
         lid = add_lead(con, row, "active")
         if lid:
             new.append(lid)
@@ -1311,12 +1454,16 @@ def add_lead(con, row, status="active", why=None):
             why.append(reason)
         return None
     row["fit"] = fit_grade(row.get("title"))
+    try:
+        campaign = int(row.pop("campaign_id", None) or 1)
+    except (TypeError, ValueError):
+        campaign = 1
     extra = {k: v for k, v in row.items() if k not in CORE_FIELDS and v}
     cur = con.execute(
         "INSERT OR IGNORE INTO leads(email, first_name, company, website, extra, status, "
-        "next_send_at, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        "next_send_at, created_at, campaign_id) VALUES (?,?,?,?,?,?,?,?,?)",
         (addr, row.get("first_name"), row.get("company"), row.get("website"),
-         json.dumps(extra), status, iso(now_utc()), iso(now_utc())),
+         json.dumps(extra), status, iso(now_utc()), iso(now_utc()), campaign),
     )
     return cur.lastrowid if cur.rowcount else None
 
@@ -1340,12 +1487,13 @@ def read_rows(path_or_file, filename=""):
             yield from csv.DictReader(path_or_file)
 
 
-def import_rows(con, rows, status="active", source=""):
+def import_rows(con, rows, status="active", source="", campaign_id=1):
     """Returns (added, {reason: count})."""
     added, reasons = 0, []
     for row in rows:
         if source and not any(str(k).strip().lower() == "source" for k in row if k):
             row = {**row, "source": source}
+        row = {**row, "campaign_id": campaign_id}
         if add_lead(con, row, status, reasons):
             added += 1
     con.commit()

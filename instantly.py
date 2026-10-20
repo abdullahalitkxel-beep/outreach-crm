@@ -105,7 +105,8 @@ def start_pull(cfg, con, limit=None):
     rid = j.get("resource_id") or j.get("id")
     if not rid:
         raise InstantlyError("Instantly didn't return a list for the import.")
-    con.execute("INSERT INTO instantly_pulls(resource_id, started_at, wanted, status) VALUES (?,?,?,'running')", (rid, iso(now_utc()), limit))
+    con.execute("INSERT INTO instantly_pulls(resource_id, started_at, wanted, status, campaign_id) VALUES (?,?,?,'running',?)",
+                (rid, iso(now_utc()), limit, int(ic.get("campaign_id") or 1)))
     con.commit()
     log.info("Instantly: started importing up to %d leads into list %s", limit, rid)
     return rid
@@ -141,7 +142,7 @@ def collect(cfg, con):
             after = page.get("next_starting_after")
             if not after or not items:
                 break
-        added, skipped = import_rows(con, rows, "active", source="Instantly SuperSearch")
+        added, skipped = import_rows(con, rows, "active", source="Instantly SuperSearch", campaign_id=p["campaign_id"] or 1)
         con.execute("UPDATE instantly_pulls SET status='done', finished_at=?, found=?, imported=?, skipped=? WHERE id=?",
                     (iso(now_utc()), len(rows), added, json.dumps(skipped), p["id"]))
         con.commit()
@@ -151,7 +152,8 @@ def collect(cfg, con):
 
 
 def days_of_leads(cfg, con):
-    cap = sum(int(sv.get("daily_limit") or 0) for sv in cfg.get("senders") or [] if sv.get("email") and "example" not in sv.get("email", ""))
+    from bot import ramp_limit
+    cap = sum(ramp_limit(cfg, sv) for sv in cfg.get("senders") or [] if sv.get("email") and "example" not in sv.get("email", ""))
     fresh = con.execute("SELECT COUNT(*) FROM leads WHERE status='active' AND step=0").fetchone()[0]
     return (fresh / cap) if cap else None
 

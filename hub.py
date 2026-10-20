@@ -550,6 +550,8 @@ def dashboard():
             warn.append(f"Only about {st['days_of_leads']} days of new leads left: import more.")
         if st.get("test_mode"):
             warn.append("Test mode is on: nothing goes to real leads yet.")
+        for e in st.get("paused_inboxes") or []:
+            warn.append(f"Inbox {e} was paused by the deliverability guard (bounces or failed logins). Check it in BSO → Settings → Email inboxes.")
         bots.append(dict(u=dict(u), st=st, warn=warn, online=is_online(u["last_seen"]), last_run=ago(iso(lr)) if lr else "never"))
     return render("dashboard.html", bots=bots, stats=stats, totals=totals, series=series, mx=mx, tab="dashboard")
 

@@ -172,7 +172,7 @@ def maybe_discover(cfg, con):
             name = str(p.get("name") or "").split()
             row = {"email": p["email"].strip().lower(), "first_name": name[0] if name else "", "last_name": " ".join(name[1:]),
                    "company": lead.get("company") or "", "website": lead.get("website") or domain, "title": p.get("title") or "",
-                   "source": f"published at {p.get('source_url')}", "found_via": lead["email"]}
+                   "source": f"published at {p.get('source_url')}", "found_via": lead["email"], "campaign_id": lead.get("campaign_id") or 1}
             if add_lead(con, row, "active" if ds.get("add_to_sequence", True) else "paused"):
                 added += 1
                 known.add(row["email"])

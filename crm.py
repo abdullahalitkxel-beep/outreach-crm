@@ -22,7 +22,7 @@ from jinja2 import DictLoader
 import brand
 import team
 import mailbox
-from bot import find_avoid, template_avoid_hits
+from bot import campaign_cfg, find_avoid, template_avoid_hits
 
 from bot import (DATA, HUMAN_STAGES, env, LEAD_OPEN_STAGES, OPP_OPEN_STAGES, OPP_STAGES, ROOT, STAGES, settings_path,
                  add_lead, add_task, cancel_drafts, db_connect, import_rows, iso, load_config,
@@ -209,7 +209,7 @@ def render(name, **ctx):
     tm = cfg().get("test_mode") or {}
     review_count = one("SELECT COUNT(*) FROM outbox WHERE status='pending'")
     overdue = one("SELECT COUNT(*) FROM tasks WHERE status='open' AND due_date<=?", today())
-    nav = [("home", "Home", None), ("leads", "Leads", None), ("review", "Review", review_count or None),
+    nav = [("home", "Home", None), ("campaigns", "Campaigns", None), ("leads", "Leads", None), ("review", "Review", review_count or None),
            ("accounts", "Accounts", None), ("opportunities", "Opportunities", None),
            ("tasks", "Tasks", overdue or None), ("reports", "Reports", None), ("setup", "Getting Started", None), ("settings", "Settings", None)]
     if (team.policy() or {}).get("role") == "supervisor" or one("SELECT COUNT(*) FROM leads WHERE handed_from IS NOT NULL"):
@@ -218,6 +218,7 @@ def render(name, **ctx):
         nav.insert(1, ("prospects", "My prospects", fresh or None))
     active = {"lead": "leads", "new_lead": "leads", "import_page": "leads", "account": "accounts",
               "opp": "opportunities", "job": "setup", "jobs": "setup"}.get(request.endpoint, request.endpoint)
+    ctx.setdefault("all_campaigns", rows("SELECT id, name, status FROM campaigns ORDER BY id"))
     return app.jinja_env.get_template(name).render(
         request=request, url_for=url_for, money=money, today=today(), status_labels=STATUS_LABELS,
         stages=STAGES, nav_items=nav, active=active, review_count=review_count, job_labels=JOB_LABELS,
@@ -348,6 +349,9 @@ def leads():
     if a.get("source"):
         where.append("json_extract(extra,'$.source')=?")
         params.append(a["source"])
+    if a.get("campaign"):
+        where.append("COALESCE(campaign_id,1)=?")
+        params.append(int(a["campaign"]))
     sort = a.get("sort", "created") if a.get("sort") in SORTS else "created"
     direction = "asc" if a.get("dir") == "asc" else "desc"
     sql = "SELECT * FROM leads" + (" WHERE " + " AND ".join(where) if where else "")
@@ -404,7 +408,7 @@ def lead(lead_id):
     if st in LEAD_OPEN_STAGES and LEAD_OPEN_STAGES.index(st) < len(LEAD_OPEN_STAGES) - 1:
         next_stage = LEAD_OPEN_STAGES[LEAD_OPEN_STAGES.index(st) + 1]
     return render(
-        "lead.html", l=l, x=l["x"], n_steps=len(cfg()["sequence"]), lead_open=LEAD_OPEN_STAGES,
+        "lead.html", l=l, x=l["x"], n_steps=len(campaign_cfg(cfg(), db(), l.get("campaign_id"))["sequence"]), lead_open=LEAD_OPEN_STAGES,
         closed_label=closed_label, closed_cls=closed_cls, next_stage=next_stage,
         account=(rows("SELECT * FROM accounts WHERE id=?", l["account_id"]) or [None])[0] if l.get("account_id") else None,
         emails=rows("SELECT * FROM outbox WHERE lead_id=? AND status!='cancelled' ORDER BY id", lead_id),
@@ -577,7 +581,7 @@ def sequence_action(lead_id):
         stop_sequence(con, lead_id, "by you")
         msg = "Emails paused."
     elif action == "resume":
-        if l["step"] >= len(cfg()["sequence"]):
+        if l["step"] >= len(campaign_cfg(cfg(), db(), l["campaign_id"])["sequence"]):
             return redirect(url_for("lead", lead_id=lead_id, msg="All emails in the sequence were already sent."))
         con.execute("UPDATE leads SET status='active', next_send_at=COALESCE(next_send_at, ?) WHERE id=?",
                     (iso(now_utc()), lead_id))
@@ -624,7 +628,8 @@ def import_page():
         src = io.StringIO(data.decode("utf-8-sig", "replace"))
     try:
         added, skipped = import_rows(db(), read_rows(src, file.filename),
-                                     "active" if request.form.get("sequence") else "paused", source=file.filename)
+                                     "active" if request.form.get("sequence") else "paused", source=file.filename,
+                                     campaign_id=int(request.form.get("campaign_id") or 1))
     except Exception as e:
         return redirect(url_for("import_page", msg=f"Couldn't read that file: {e}", err=1))
     return render("import.html", result={"added": added, "skipped": skipped})
@@ -831,6 +836,111 @@ def reports():
                   win_rate=f"{won / (won + lost):.0%}" if won + lost else "–")
 
 
+# ---------------------------------------------------------------- campaigns
+
+def campaign_stats(cid):
+    q = lambda sql, *a: one(sql, *a)
+    lead_ids = "SELECT id FROM leads WHERE COALESCE(campaign_id,1)=?"
+    sent = q(f"SELECT COUNT(*) FROM events WHERE type='sent' AND detail NOT LIKE '%handover%' AND lead_id IN ({lead_ids})", cid)
+    replies = q(f"SELECT COUNT(*) FROM events WHERE type='reply' AND lead_id IN ({lead_ids})", cid)
+    good = q(f"SELECT COUNT(*) FROM events WHERE type='reply' AND detail IN ('interested','meeting_request','question','referral') AND lead_id IN ({lead_ids})", cid)
+    return {"leads": q("SELECT COUNT(*) FROM leads WHERE COALESCE(campaign_id,1)=?", cid),
+            "waiting": q("SELECT COUNT(*) FROM leads WHERE COALESCE(campaign_id,1)=? AND status='active' AND step=0", cid),
+            "in_sequence": q("SELECT COUNT(*) FROM leads WHERE COALESCE(campaign_id,1)=? AND status='active' AND step>0", cid),
+            "sent": sent, "replies": replies, "positive": good,
+            "handed": q(f"SELECT COUNT(*) FROM events WHERE type='handover' AND lead_id IN ({lead_ids})", cid),
+            "bounces": q(f"SELECT COUNT(*) FROM events WHERE type='bounce' AND lead_id IN ({lead_ids})", cid),
+            "rate": f"{replies * 100 / sent:.1f}%" if sent else "–", "pos_rate": f"{good * 100 / sent:.1f}%" if sent else "–"}
+
+
+def campaign_sequence(c):
+    """A campaign's steps as editable [{delay_days, subject, body}] (first enabled variant of each step)."""
+    seq = json.loads(c["sequence"]) if c and c["sequence"] else (cfg().get("sequence") or [])
+    out = []
+    for st in seq:
+        v = st if "variants" not in st else next((x for x in st["variants"] if x.get("enabled", True)), (st["variants"] or [{}])[0])
+        out.append({"delay_days": st.get("delay_days", 3), "subject": v.get("subject", ""), "body": v.get("body", "")})
+    return out
+
+
+@app.route("/campaigns")
+def campaigns():
+    data = [dict(c, st=campaign_stats(c["id"]), inbox_list=json.loads(c["inboxes"] or "[]")) for c in rows("SELECT * FROM campaigns ORDER BY id")]
+    return render("campaigns.html", items=data)
+
+
+@app.post("/campaigns/new")
+def campaign_new():
+    f = request.form
+    name = f.get("name", "").strip()[:80]
+    if not name:
+        return redirect(url_for("campaigns", msg="Give the campaign a name.", err=1))
+    if one("SELECT COUNT(*) FROM campaigns WHERE lower(name)=?", name.lower()):
+        return redirect(url_for("campaigns", msg="A campaign with that name already exists.", err=1))
+    src = rows("SELECT * FROM campaigns WHERE id=?", int(f.get("copy_from") or 1))
+    seq = campaign_sequence(src[0] if src else None)
+    db().execute("INSERT INTO campaigns(name, status, inboxes, sequence, offer, created_at) VALUES (?,?,?,?,?,?)",
+                 (name, "paused", "[]", json.dumps(seq), (src[0]["offer"] if src else None), date.today().isoformat()))
+    db().commit()
+    cid = one("SELECT MAX(id) FROM campaigns")
+    return redirect(url_for("campaign", cid=cid, msg="Campaign created (paused). Write its emails, pick its inboxes, add leads, then switch it on."))
+
+
+@app.route("/campaign/<int:cid>", methods=["GET", "POST"])
+def campaign(cid):
+    c = (rows("SELECT * FROM campaigns WHERE id=?", cid) or [None])[0]
+    if not c:
+        abort(404)
+    if request.method == "POST":
+        f = request.form
+        action = f.get("action", "save")
+        if action in ("pause", "resume"):
+            db().execute("UPDATE campaigns SET status=? WHERE id=?", ("paused" if action == "pause" else "active", cid))
+            db().commit()
+            return redirect(url_for("campaign", cid=cid, msg="Campaign paused: no emails go out for it." if action == "pause" else "Campaign is running."))
+        if action == "delete" and cid != 1:
+            moved = one("SELECT COUNT(*) FROM leads WHERE campaign_id=?", cid)
+            db().execute("UPDATE leads SET campaign_id=1 WHERE campaign_id=?", (cid,))
+            db().execute("DELETE FROM campaigns WHERE id=?", (cid,))
+            db().commit()
+            return redirect(url_for("campaigns", msg=f"Campaign deleted; its {moved} lead(s) moved to the Main campaign."))
+        if cid == 1:          # the Main campaign's emails live in Settings → Your offer & emails (with A/B variants)
+            db().execute("UPDATE campaigns SET name=?, inboxes=? WHERE id=1", (f.get("name", c["name"]).strip()[:80] or c["name"], json.dumps(f.getlist("inboxes"))))
+            db().commit()
+            return redirect(url_for("campaign", cid=1, msg="Saved."))
+        steps = []
+        i = 0
+        while f"body{i}" in f:
+            if f"remove{i}" not in f and f.get(f"body{i}", "").strip():
+                steps.append({"delay_days": max(0, int(f.get(f"delay{i}") or 0)), "subject": f.get(f"subject{i}", "").strip(),
+                              "body": f.get(f"body{i}", "").replace("\r\n", "\n").strip()})
+            i += 1
+        if action == "add_step":
+            steps.append({"delay_days": 4, "subject": "", "body": "Hi {first_name},\n\n"})
+        if not steps:
+            return redirect(url_for("campaign", cid=cid, msg="A campaign needs at least one email.", err=1))
+        steps[0]["delay_days"] = 0
+        seq = [{"delay_days": st["delay_days"], "variants": [{"name": "Variant A", "enabled": True, "subject": st["subject"], "body": st["body"]}]} for st in steps]
+        name = f.get("name", c["name"]).strip()[:80] or c["name"]
+        db().execute("UPDATE campaigns SET name=?, inboxes=?, offer=?, sequence=? WHERE id=?",
+                     (name, json.dumps(f.getlist("inboxes")), f.get("offer", "").strip() or None, json.dumps(seq), cid))
+        db().commit()
+        hits = find_avoid(cfg(), *[st["subject"] + "\n" + st["body"] for st in steps])
+        msg = "Saved." + (f" ⚠ Your emails use words on the avoid list: {', '.join(hits)}." if hits else "")
+        return redirect(url_for("campaign", cid=cid, msg=msg, _anchor="emails" if action == "add_step" else None))
+    inboxes = [x.get("email") for x in (cfg().get("senders") or []) if x.get("email") and "example" not in x.get("email", "")]
+    return render("campaign.html", c=c, st=campaign_stats(cid), steps=campaign_sequence(c), inboxes=inboxes,
+                  picked=json.loads(c["inboxes"] or "[]"), main_offer=cfg().get("offer", ""))
+
+
+@app.post("/lead/<int:lead_id>/campaign")
+def lead_campaign(lead_id):
+    cid = int(request.form.get("campaign_id") or 1)
+    db().execute("UPDATE leads SET campaign_id=? WHERE id=?", (cid, lead_id))
+    db().commit()
+    return redirect(url_for("lead", lead_id=lead_id, msg="Moved. The next email uses that campaign's sequence."))
+
+
 # ---------------------------------------------------------------- my prospects (lead gen supervisor)
 
 PROSPECT_LABELS = {"new": "New: not contacted yet", "contacted": "Contacted", "meeting": "Meeting booked",
@@ -881,7 +991,7 @@ def save_instantly():
     write_settings({"instantly": {"titles": lines("titles"), "levels": f.getlist("levels"), "departments": f.getlist("departments"),
                                   "sizes": f.getlist("sizes"), "countries": lines("countries"), "industries": f.getlist("industries"),
                                   "keywords": f.get("keywords", "").strip(), "one_per_company": f.get("one_per_company") == "on",
-                                  "per_pull": max(1, min(int(f.get("per_pull") or 50), 1000)),
+                                  "per_pull": max(1, min(int(f.get("per_pull") or 50), 1000)), "campaign_id": int(f.get("campaign_id") or 1),
                                   "auto": f.get("auto") == "on", "auto_below_days": float(f.get("auto_below_days") or 3)}})
     action = f.get("action", "save")
     try:
@@ -918,6 +1028,7 @@ def save_intake():
     if on and not allowed:
         return redirect(url_for("settings", tab="targeting", result="Add at least one address that may send lead files.", _anchor="intake"))
     write_settings({"lead_intake": {"enabled": on, "inbox": f.get("inbox", "").strip().lower(), "allowed_senders": allowed,
+                                    "campaign_id": int(f.get("campaign_id") or 1),
                                     "add_to_sequence": f.get("add_to_sequence") == "on", "verified_only": f.get("verified_only") == "on"}})
     return redirect(url_for("settings", tab="targeting", result="Saved. Lead files emailed to that inbox are imported on each bot run.", ok=1, _anchor="intake"))
 
@@ -1424,25 +1535,38 @@ def test_apollo(key):
         return False, f"Apollo key didn't work: {str(e)[:200]}"
 
 
+MAX_INBOXES = 50
+
+
 @app.route("/settings")
 def settings():
     c = cfg()
     senders = list(c.get("senders") or [])
     real_n = sum(1 for x in senders if not any(p in (x.get("email") or "") for p in PLACEHOLDERS))
-    while len(senders) < min(10, max(3, real_n + 1)):
+    while len(senders) < min(MAX_INBOXES, max(3, real_n + 1)):
         senders.append({})
+    from bot import guard_paused, ramp_limit
+    paused = guard_paused(db())
+    used_by = {}
+    for cp in rows("SELECT name, inboxes FROM campaigns"):
+        for e in json.loads(cp["inboxes"] or "[]"):
+            used_by.setdefault(e.lower(), []).append(cp["name"])
     inboxes = []
-    for i, s in enumerate(senders[:10], 1):
+    for i, s in enumerate(senders[:MAX_INBOXES], 1):
         placeholder = any(p in (s.get("email") or "") for p in PLACEHOLDERS)
+        e = (s.get("email") or "").lower()
         inboxes.append({"n": i, "s": {} if placeholder else s, "provider": guess_provider(s),
-                        "pw": mask(env(s.get("password_env") or f"SENDER{i}_PASSWORD"))})
+                        "pw": mask(env(s.get("password_env") or f"SENDER{i}_PASSWORD")),
+                        "today": ramp_limit(c, s) if s.get("email") else None, "paused": paused.get(e),
+                        "campaigns": used_by.get(e, [])})
+    dom_health = {r["domain"]: dict(json.loads(r["result"]), at=r["at"]) for r in rows("SELECT * FROM domain_health")}
     ac = c.get("apollo") or {}
     cf = ac.get("common_filters") or {}
     seq = []
     for st in c.get("sequence") or []:
         vs = st.get("variants") or [{"name": "Variant A", "enabled": True, "subject": st.get("subject", ""), "body": st.get("body", "")}]
         seq.append({"delay_days": st.get("delay_days", 3), "variants": vs})
-    return render("settings.html", c=c, inboxes=inboxes, seq=seq, providers=PROVIDERS, timezones=TIMEZONES,
+    return render("settings.html", c=c, inboxes=inboxes, max_inboxes=MAX_INBOXES, dom_health=dom_health, seq=seq, providers=PROVIDERS, timezones=TIMEZONES,
                   regions=REGIONS, sizes=SIZES, seniorities=SENIORITIES, cf=cf, ac=ac,
                   keys={"ANTHROPIC_API_KEY": mask(env("ANTHROPIC_API_KEY")), "APOLLO_API_KEY": mask(env("APOLLO_API_KEY")),
                         "SLACK_WEBHOOK_URL": mask(env("SLACK_WEBHOOK_URL"))},
@@ -1495,6 +1619,7 @@ def _inbox_from_form(f, n):
         "imap_host": (f.get(f"imap_host{n}") or prov["imap_host"]).strip(),
         "password_env": f"SENDER{n}_PASSWORD",
         "daily_limit": max(1, min(int(f.get(f"daily_limit{n}") or 10), 100)),
+        "ramp_from": (f.get(f"ramp_from{n}") or date.today().isoformat()) if f.get(f"ramp{n}") else None,
     }
 
 
@@ -1502,7 +1627,7 @@ def _inbox_from_form(f, n):
 def save_inbox():
     f = request.form
     senders = []
-    for n in range(1, 11):
+    for n in range(1, MAX_INBOXES + 1):
         if f.get(f"provider{n}") is None:
             continue
         s = _inbox_from_form(f, n)
@@ -1521,6 +1646,60 @@ def save_inbox():
         ok, msg = test_inbox(s, env(s["password_env"]))
         return redirect(url_for("settings", tab="inbox", result=f"Inbox {test_n}: {msg}", ok=1 if ok else None))
     return redirect(url_for("settings", tab="inbox", result="Inboxes saved.", ok=1))
+
+
+@app.post("/settings/inboxes/bulk")
+def inbox_bulk():
+    """Add many inboxes on the same mail server at once: one 'email, name, password' per line."""
+    f = request.form
+    senders = [x for x in (cfg().get("senders") or []) if x.get("email") and not any(p in x["email"] for p in PLACEHOLDERS)]
+    have = {x["email"].lower() for x in senders}
+    used = {int(re.sub(r"\D", "", x.get("password_env", "")) or 0) for x in senders}
+    added, errors = 0, []
+    for ln, line in enumerate(f.get("lines", "").splitlines(), 1):
+        parts = [p.strip() for p in re.split(r"[,;\t]", line) if p.strip()]
+        if not parts:
+            continue
+        if len(parts) < 3 or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", parts[0]):
+            errors.append(f"line {ln}: expected email, name, password")
+            continue
+        email_, name, pw = parts[0].lower(), parts[1], ",".join(parts[2:])
+        if email_ in have:
+            errors.append(f"{email_}: already added")
+            continue
+        if len(senders) >= MAX_INBOXES:
+            errors.append(f"{email_}: the limit is {MAX_INBOXES} inboxes")
+            break
+        n = next(i for i in range(1, MAX_INBOXES + 1) if i not in used)
+        used.add(n)
+        set_secret(f"SENDER{n}_PASSWORD", pw)
+        senders.append({"email": email_, "name": name, "smtp_host": f.get("smtp_host", "").strip(), "smtp_port": int(f.get("smtp_port") or 465),
+                        "imap_host": f.get("imap_host", "").strip(), "password_env": f"SENDER{n}_PASSWORD",
+                        "daily_limit": max(1, min(int(f.get("daily_limit") or 10), 100)),
+                        "ramp_from": date.today().isoformat() if f.get("ramp") else None})
+        have.add(email_)
+        added += 1
+    if added:
+        write_settings({"senders": senders})
+    msg = f"Added {added} inbox(es)." + (" Problems: " + "; ".join(errors) if errors else "") + (" Use Save & test on each one to check the login." if added else "")
+    return redirect(url_for("settings", tab="inbox", result=msg, ok=1 if added and not errors else None))
+
+
+@app.post("/settings/inboxes/resume")
+def inbox_resume():
+    e = request.form.get("email", "").lower()
+    db().execute("UPDATE inbox_health SET paused=0, login_failures=0, resumed_at=?, reason=NULL WHERE email=?", (iso(now_utc()), e))
+    db().commit()
+    return redirect(url_for("settings", tab="inbox", result=f"{e} resumed. Its bounce rate is counted again from now.", ok=1))
+
+
+@app.post("/settings/domains/check")
+def domains_check():
+    import health
+    res = health.check_all(cfg(), db())
+    bad = [d for d, r in res.items() if r.get("error") or r.get("score", 0) < 4]
+    msg = "All sending domains look healthy." if res and not bad else (f"Problems on: {', '.join(bad)}. See the fixes below." if bad else "Add an inbox first.")
+    return redirect(url_for("settings", tab="inbox", result=msg, ok=None if bad else 1))
 
 
 @app.post("/settings/safety")
