@@ -311,6 +311,11 @@ def in_send_window(cfg):
 
 # ---------------------------------------------------------------- LLM
 
+def _reply_text(msg):
+    """The answer text of a Messages API reply (newer models put thinking blocks before it)."""
+    return "".join(getattr(b, "text", "") for b in (msg.content or []) if getattr(b, "type", "") == "text").strip()
+
+
 def llm(cfg, model_key, prompt, max_tokens=200):
     """Call Claude; returns text or None if unavailable/failing."""
     if not env("ANTHROPIC_API_KEY"):
@@ -318,12 +323,16 @@ def llm(cfg, model_key, prompt, max_tokens=200):
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=env("ANTHROPIC_API_KEY"))
-        msg = client.messages.create(
-            model=cfg["models"][model_key],
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return msg.content[0].text.strip()
+        model = cfg["models"][model_key]
+        try:
+            # short, simple writing: no thinking needed (Haiku accepts this; others may refuse it)
+            msg = client.messages.create(model=model, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}],
+                                         extra_body={"thinking": {"type": "disabled"}})
+        except anthropic.BadRequestError:
+            # model can't switch thinking off: leave room for it, keep only the answer
+            msg = client.messages.create(model=model, max_tokens=max_tokens + 4000, messages=[{"role": "user", "content": prompt}])
+        text = _reply_text(msg)
+        return text or None
     except Exception as e:  # network, quota, etc. -> fall back gracefully
         log.warning("LLM call failed: %s", e)
         return None

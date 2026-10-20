@@ -815,6 +815,21 @@ def review_action(draft_id):
     return redirect(url_for("review", msg=msg, _anchor=anchor))
 
 
+@app.post("/review/rewrite-openers")
+def rewrite_openers():
+    """Give every waiting first email a fresh AI opener (e.g. after adding the AI key)."""
+    con = db()
+    ids = [r["id"] for r in rows("SELECT id FROM outbox WHERE status='pending' AND step=0 ORDER BY id LIMIT 60")]
+    done = 0
+    for i in ids:
+        try:
+            regenerate_draft(cfg(), con, i)
+            done += 1
+        except Exception as e:
+            print("rewrite opener:", e)
+    return redirect(url_for("review", msg=f"Rewrote the opener in {done} first email(s). Where a company's website couldn't be read, the standard opening line is kept."))
+
+
 @app.post("/review/approve-all")
 def approve_all():
     if team.holds_approval():
@@ -1143,9 +1158,16 @@ def test_anthropic(key):
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=key)
-        r = client.messages.create(model=cfg()["models"]["personalize"], max_tokens=5,
-                                   messages=[{"role": "user", "content": "Reply with OK"}])
-        return True, "AI key works."
+        from bot import _reply_text
+        model = cfg()["models"]["personalize"]
+        try:
+            r = client.messages.create(model=model, max_tokens=20, messages=[{"role": "user", "content": "Reply with OK"}],
+                                       extra_body={"thinking": {"type": "disabled"}})
+        except anthropic.BadRequestError:
+            r = client.messages.create(model=model, max_tokens=4020, messages=[{"role": "user", "content": "Reply with OK"}])
+        if not _reply_text(r):
+            return False, "The key works, but the AI model gave no text. Tell BlacSwanken support."
+        return True, "AI key works and writes text."
     except ImportError:
         return False, "The AI library isn't installed."
     except Exception as e:

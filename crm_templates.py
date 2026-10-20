@@ -578,6 +578,7 @@ REPORTS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block t
 
 REVIEW = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}Review queue{% endblock %}{% block body %}
 {% call m.header('t-rev', '✉', 'Review', drafts|length ~ ' draft(s) waiting · ' ~ approved ~ ' approved') %}
+ {% if drafts and ai_on %}<form method="post" action="{{ url_for('rewrite_openers') }}" onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Rewriting… (about 5 seconds per email)'"><button class="btn">↻ Rewrite all AI openers</button></form>{% endif %}
  {% if drafts and not held %}<form method="post" action="{{ url_for('approve_all') }}" onsubmit="return confirm('Approve all {{ drafts|length }} drafts as they are?')"><button class="btn">Approve all</button></form>{% endif %}
  {% if approved %}<form method="post" action="{{ url_for('job_start') }}"><input type="hidden" name="cmd" value="run"><button class="btn brand">▶ Send approved now</button></form>{% endif %}
 {% endcall %}

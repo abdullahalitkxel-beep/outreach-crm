@@ -49,6 +49,9 @@ jobs:
       - name: Test team mode (hub and laptop)
         run: python tests/team_test.py
 
+      - name: Test the AI line with thinking models
+        run: python tests/llm_test.py
+
       - name: Test team mode through the Google Drive relay
         run: python tests/relay_test.py
 
