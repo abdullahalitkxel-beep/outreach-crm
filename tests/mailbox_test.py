@@ -75,7 +75,7 @@ check(s0["sender"] == "ali@blacswanken.com" and s0["to"] == "sarah@acme.com" and
       "reply sent from Ali's mailbox, in the same thread")
 lead = con.execute("SELECT prospect_stage FROM leads WHERE id=?", (lid,)).fetchone()
 check(lead["prospect_stage"] == "contacted" and "confirming Thursday" in w.get(f"/lead/{lid}").get_data(as_text=True),
-      "first reply moves New → Contacted and appears in the conversation")
+      "first reply moves New to Contacted and appears in the conversation")
 
 crm.write_settings({"test_mode": {"enabled": True, "redirect_to": "omar@blacswanken.com"}})
 w.post(f"/lead/{lid}/reply", data={"body": "test"})
