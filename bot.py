@@ -891,6 +891,10 @@ HEADER_ALIASES = {
     "employee linkedin": "linkedin", "linkedin": "linkedin", "person linkedin": "linkedin",
     "linkedin url": "linkedin", "company li": "company_linkedin", "company linkedin": "company_linkedin",
     "industry": "industry", "city": "city", "country": "country", "source": "source",
+    # Instantly exports (SuperSearch / lead lists / campaign leads)
+    "companyname": "company", "jobtitle": "title", "company domain": "website", "companydomain": "website",
+    "linkedin profile": "linkedin", "linkedinurl": "linkedin", "location": "city", "company_name": "company",
+    "job_title": "title", "website url": "website",
 }
 ROLE_INBOXES = {"info", "hello", "help", "support", "sales", "contact", "admin", "office",
                 "team", "hr", "careers", "jobs", "marketing", "billing", "noreply", "no-reply"}
