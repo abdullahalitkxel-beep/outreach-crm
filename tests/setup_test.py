@@ -16,6 +16,7 @@ if len(sys.argv) > 1 and sys.argv[1] == "--laptop":
     team.built_in_hub = lambda: URL
     con = bot.db_connect("outreach.db")
     team.sign_in(con, user, pw, consent=True)
+    team.sync(con)                  # the app checks in every couple of minutes
     sp = bot.settings_path(str(bot.DATA / "config.yaml"))
     cur = yaml.safe_load(sp.read_text(encoding="utf-8")) if sp.exists() else {}
     print("RESULT " + json.dumps({"senders": [x["email"] for x in cur.get("senders") or []],
@@ -153,6 +154,40 @@ try:
     r = c.post(f"/users/{cole}", data={"_csrf": tok(f"/users/{cole}"), "action": "setup", "inboxes": "cole.reed@getneosofttech.com, Cole Reed, pw-x", "password": "cole-pass-12345"},
                follow_redirects=True)
     check("Setup sent" in txt(r), "with the right one the setup is sent")
+    # ---- one spreadsheet for everyone
+    import io, openpyxl
+    r = c.get("/bso-setup/template.xlsx")
+    wb = openpyxl.load_workbook(io.BytesIO(r.data))
+    check([x.value for x in wb["Inboxes"][1]] == hub.TEMPLATE_HEADERS and "How to fill" in wb.sheetnames, "the template downloads as an Excel file")
+    ws = wb["Inboxes"]
+    ws.delete_rows(2, 3)
+    for i in range(5, 11):                           # 6 more inboxes for the bot
+        ws.append([f"inbox{i}@getneosofttech.com", f"Sender {i}", f"mailbox-pw-{i}", "bso.bot", "", ""])
+    ws.append(["sam.lee@getneosofttech.com", "Sam Lee", "sam-box-pw", "sam.lee", "Sam Lee", "member"])
+    ws.append(["oops@getneosofttech.com", "Oops", "replace-with-password", "sam.lee", "", ""])
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    r = c.post("/bso-setup/import", data={"_csrf": tok("/bso-setup"), "assign_to": "", "role": "member", "file": (buf, "inboxes.xlsx")},
+               content_type="multipart/form-data")
+    page = txt(r)
+    check("still the example password" in page, "rows left with the example password are skipped")
+    check(len(hub.user_inboxes(bot_id)) == 10, "the bot now has 10 inboxes (4 kept, 6 added)")
+    sam = hcon.execute("SELECT * FROM users WHERE username='sam.lee'").fetchone()
+    check(sam and sam["role"] == "member" and sam["name"] == "Sam Lee" and "1 new sign-in" in page, "a new person in the sheet is created")
+    tokn = re.search(r"/bso-setup/credentials/([^.]+)\.csv", page).group(1)
+    csvt = c.get(f"/bso-setup/credentials/{tokn}.csv").get_data(as_text=True)
+    sam_pw = csvt.strip().splitlines()[1].split(",")[2]
+    check("sam.lee" in csvt and len(sam_pw) >= 10, "their sign-in can be downloaded")
+    hub.relay_cycle()
+    r_ = subprocess.run([sys.executable, __file__, "--laptop", str(tmp / "laptop2"), "bso.bot", "new-bot-pass-999"], capture_output=True, text=True, timeout=180, env=envc)
+    res = json.loads(next(l for l in r_.stdout.splitlines() if l.startswith("RESULT "))[7:])
+    check(len(res["senders"]) == 10, "the bot's computer picks up all 10 inboxes")
+    r_ = subprocess.run([sys.executable, __file__, "--laptop", str(tmp / "sam"), "sam.lee", sam_pw], capture_output=True, text=True, timeout=180, env=envc)
+    res = json.loads(next(l for l in r_.stdout.splitlines() if l.startswith("RESULT "))[7:])
+    check(res["senders"] == ["sam.lee@getneosofttech.com"] and res["pw1"] == "sam-box-pw", "Sam signs in on his laptop and his inbox is ready")
+    buf2 = io.StringIO("inbox email,sender name,password\ncsv1@getneosofttech.com,Csv One,pw-c1\n")
+    r = c.post("/bso-setup/import", data={"_csrf": tok("/bso-setup"), "assign_to": str(bot_id), "file": (io.BytesIO(buf2.getvalue().encode()), "more.csv")},
+               content_type="multipart/form-data")
+    check(len(hub.user_inboxes(bot_id)) == 11, "a plain CSV works too, with everything assigned to the bot")
     print(f"\nAll {n} setup checks passed.")
 finally:
     node.terminate()

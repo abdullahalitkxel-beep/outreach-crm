@@ -807,7 +807,209 @@ def bso_setup():
     for u in db().execute("SELECT * FROM users WHERE role IN ('member','manager','bot') AND status NOT IN ('removed') ORDER BY name").fetchall():
         people.append({"id": u["id"], "name": u["name"], "role": u["role"], "inboxes": len(user_inboxes(u["id"])),
                        "sent": u["setup_sent"], "applied": u["setup_applied"]})
-    return render("bso_setup.html", t=t, msg=msg, people=people, mask=lambda v: ("•" * 8 + v[-4:]) if v else "", tab="bso_setup")
+    return render("bso_setup.html", t=t, msg=msg, people=people,
+                  senders=db().execute("SELECT id, name, role FROM users WHERE role IN ('member','manager','bot') AND status NOT IN ('removed','removing') ORDER BY role!='bot', name").fetchall(), mask=lambda v: ("•" * 8 + v[-4:]) if v else "", tab="bso_setup")
+
+
+# ---- import inboxes (and the people they belong to) from one spreadsheet
+
+IMPORT_COLS = {
+    "email": ("inbox", "inbox email", "email", "email address", "mailbox", "address", "sender email", "from email"),
+    "name": ("sender name", "name prospects see", "display name", "from name", "name", "sender"),
+    "password": ("password", "inbox password", "mailbox password", "pass", "pwd"),
+    "user": ("user", "owner", "assigned to", "belongs to", "sign-in id", "sign in id", "login", "id", "user id", "username"),
+    "user_name": ("user full name", "user name", "person", "person name", "full name", "owner name"),
+    "user_email": ("user email", "owner email", "person email"),
+    "role": ("role",),
+}
+_CRED_FILES = {}
+
+
+def read_sheet(storage):
+    name = (storage.filename or "").lower()
+    data = storage.read()
+    if name.endswith((".xlsx", ".xlsm")):
+        import io as _io
+        import openpyxl
+        wb = openpyxl.load_workbook(_io.BytesIO(data), read_only=True, data_only=True)
+        it = wb.active.iter_rows(values_only=True)
+        header = [str(h or "").strip() for h in (next(it, None) or [])]
+        return [dict(zip(header, ["" if v is None else str(v).strip() for v in r])) for r in it if any(v not in (None, "") for v in r)]
+    import csv as _csv
+    import io as _io
+    text = data.decode("utf-8-sig", errors="replace")
+    try:
+        dialect = _csv.Sniffer().sniff(text[:2000], delimiters=",;\t")
+    except _csv.Error:
+        dialect = _csv.excel
+    return [{str(k or "").strip(): str(v or "").strip() for k, v in r.items()} for r in _csv.DictReader(_io.StringIO(text), dialect=dialect)]
+
+
+def map_columns(header):
+    low = {h.lower().strip(): h for h in header if h}
+    out = {}
+    for field, names in IMPORT_COLS.items():
+        for n_ in names:
+            if n_ in low and low[n_] not in out.values():
+                out[field] = low[n_]
+                break
+    return out
+
+
+def import_inboxes(con, rows, assign_to=None, role_default="member"):
+    """Group inbox rows by person; create missing people; add or update their inboxes and send their setup.
+    Returns (report rows, new sign-ins, problems)."""
+    cols = map_columns(list(rows[0].keys()) if rows else [])
+    problems, groups = [], {}
+    if not {"email", "password"} <= set(cols):
+        return [], [], ["The sheet needs at least an inbox email column and a password column (see the template)."]
+    if not assign_to and "user" not in cols and "user_email" not in cols:
+        return [], [], ["Choose who the inboxes belong to, or add a 'user' column saying whose each inbox is."]
+    for i, r in enumerate(rows, 2):
+        e = (r.get(cols["email"]) or "").strip().lower()
+        pw = r.get(cols["password"]) or ""
+        if not e and not pw:
+            continue
+        if pw == "replace-with-password":
+            problems.append(f"row {i} ({e}): still the example password; skipped")
+            continue
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", e) or not pw:
+            problems.append(f"row {i}: needs a valid inbox email and its password")
+            continue
+        who = assign_to or (r.get(cols.get("user", "")) or r.get(cols.get("user_email", "")) or "").strip().lower()
+        if not who:
+            problems.append(f"row {i} ({e}): no user given")
+            continue
+        g_ = groups.setdefault(who, {"inboxes": [], "user_name": "", "user_email": "", "role": ""})
+        name = (r.get(cols.get("name", "")) or "").strip() or e.split("@")[0].replace(".", " ").title()
+        g_["inboxes"].append({"email": e, "name": name, "password": pw})
+        g_["user_name"] = g_["user_name"] or (r.get(cols.get("user_name", "")) or "").strip()
+        g_["user_email"] = g_["user_email"] or (r.get(cols.get("user_email", "")) or "").strip().lower()
+        g_["role"] = g_["role"] or (r.get(cols.get("role", "")) or "").strip().lower()
+    report, creds = [], []
+    for who, g_ in groups.items():
+        u = con.execute("SELECT * FROM users WHERE (username=? OR email=? OR lower(name)=?) AND status!='removed'", (who, who, who)).fetchone()
+        new_pw = None
+        if not u:
+            username = clean_username(who.split("@")[0] if "@" in who else who)
+            email = g_["user_email"] or (who if "@" in who else g_["inboxes"][0]["email"])
+            role = g_["role"] if g_["role"] in ("member", "manager", "bot") else role_default
+            if len(username) < 3 or con.execute("SELECT 1 FROM users WHERE username=? OR email=?", (username, email)).fetchone():
+                problems.append(f"{who}: can't create this person (the ID or email is already used, or the ID is shorter than 3 characters)")
+                continue
+            new_pw = gen_password()
+            name = g_["user_name"] or (who.split("@")[0] if "@" in who else who).replace(".", " ").title()
+            con.execute("INSERT INTO users(name,email,username,role,status,pw_hash,approval,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (name, email, username, role, "invited", generate_password_hash(new_pw), "member", iso()))
+            u = con.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+            set_password(con, u["id"], new_pw)
+            creds.append({"name": name, "username": username, "password": new_pw, "role": role})
+        if u["role"] not in ("member", "manager", "bot"):
+            problems.append(f"{u['name']} is a {u['role']}; only members, managers and the BSO Bot send emails")
+            continue
+        have = {x["email"]: x for x in user_inboxes(u["id"])}
+        added = sum(1 for x in g_["inboxes"] if x["email"] not in have)
+        for x in g_["inboxes"]:
+            have[x["email"]] = x
+        if len(have) > 50:
+            problems.append(f"{u['name']}: only the first 50 inboxes are kept")
+        _secret_store().set(f"SETUP_INBOXES_{u['id']}", json.dumps(list(have.values())[:50]))
+        if new_pw:
+            deliver_setup_key(con, u["id"], u["username"], new_pw)
+        sent = push_setup(con, u["id"])
+        report.append({"id": u["id"], "name": u["name"], "username": u["username"], "new": bool(new_pw), "added": added,
+                       "updated": len(g_["inboxes"]) - added, "total": min(len(have), 50), "sent": sent})
+    con.commit()
+    return report, creds, problems
+
+
+@app.post("/bso-setup/import")
+@need("owner")
+def bso_import():
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return redirect(url_for("bso_setup", err="Choose the spreadsheet first."))
+    try:
+        rows = read_sheet(f)
+    except Exception as e:
+        return redirect(url_for("bso_setup", err=f"Couldn't read that file: {e}"))
+    assign = request.form.get("assign_to", "")
+    who = None
+    if assign.isdigit():
+        u = db().execute("SELECT * FROM users WHERE id=?", (int(assign),)).fetchone()
+        who = (u["username"] or u["email"]) if u else None
+    report, creds, problems = import_inboxes(db(), rows, assign_to=who, role_default=request.form.get("role", "member"))
+    audit("inboxes_imported", f"{sum(r['added'] for r in report)} added, {len(creds)} new user(s), from {f.filename}")
+    threading.Thread(target=relay_cycle, daemon=True).start()
+    token = None
+    if creds:
+        token = secrets.token_urlsafe(16)
+        _CRED_FILES[token] = (time.time(), creds)
+    return render("bso_import.html", report=report, creds=creds, problems=problems, token=token, filename=f.filename, tab="bso_setup")
+
+
+@app.get("/bso-setup/credentials/<token>.csv")
+@need("owner")
+def bso_creds(token):
+    at, creds = _CRED_FILES.get(token, (0, None))
+    if not creds or time.time() - at > 3600:
+        abort(404)
+    lines = ["name,sign-in id,password,role"] + [f'"{c["name"]}",{c["username"]},{c["password"]},{c["role"]}' for c in creds]
+    resp = app.response_class("\r\n".join(lines) + "\r\n", mimetype="text/csv")
+    resp.headers["Content-Disposition"] = "attachment; filename=bso-sign-ins.csv"
+    return resp
+
+
+TEMPLATE_HEADERS = ["Inbox Email", "Sender Name", "Inbox Password", "User ID", "User Full Name", "Role"]
+
+
+def template_xlsx():
+    """The import template: one row per inbox, plus a 'How to fill' sheet."""
+    import io as _io
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.worksheet.datavalidation import DataValidation
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Inboxes"
+    ws.append(TEMPLATE_HEADERS)
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor="1B1F24")
+    for row in (["cole.reed@getneosofttech.com", "Cole Reed", "replace-with-password", "bso.bot", "BSO Bot", "bot"],
+                ["emma.hart@getneosofttech.com", "Emma Hart", "replace-with-password", "bso.bot", "BSO Bot", "bot"],
+                ["sam.lee@getneosofttech.com", "Sam Lee", "replace-with-password", "sam.lee", "Sam Lee", "member"]):
+        ws.append(row)
+    for col, w in zip("ABCDEF", (36, 20, 26, 16, 20, 10)):
+        ws.column_dimensions[col].width = w
+    dv = DataValidation(type="list", formula1='"bot,member,manager"', allow_blank=True)
+    ws.add_data_validation(dv)
+    dv.add("F2:F500")
+    ws.freeze_panes = "A2"
+    h = wb.create_sheet("How to fill")
+    for line in ("One row per sending inbox. Replace the example rows.",
+                 "Inbox Email: the mailbox address BSO sends from (e.g. cole.reed@getneosofttech.com).",
+                 "Sender Name: the name prospects see in their inbox.",
+                 "Inbox Password: that mailbox's password (from SiteGround). Stored encrypted; never shown again.",
+                 "User ID: the BSO sign-in of the person or bot who owns this inbox. Rows with the same User ID go to the same BSO.",
+                 "    A new User ID creates that person, with a generated password you download after the import.",
+                 "    All inboxes for the BSO Bot: put bso.bot (or your bot's ID) on every row, or leave the column empty and pick the bot when importing.",
+                 "User Full Name and Role: only used when the person is new. Role is bot, member or manager (blank = member).",
+                 "Importing again adds new inboxes and updates changed passwords; nothing is deleted.",
+                 "Delete this file after importing: it contains passwords."):
+        h.append([line])
+    h.column_dimensions["A"].width = 120
+    buf = _io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+@app.get("/bso-setup/template.xlsx")
+@need("owner")
+def bso_template():
+    resp = app.response_class(template_xlsx(), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    resp.headers["Content-Disposition"] = "attachment; filename=BSO-inboxes-template.xlsx"
+    return resp
 
 
 @app.post("/users/new")
@@ -2103,11 +2305,28 @@ T["bso_setup.html"] = """{% extends 'base.html' %}{% block title %}BSO setup{% e
 <div class="grid"><div><label>Run the campaigns automatically every N minutes (0 = only when someone clicks Run)</label><input name="autorun_minutes" type="number" min="0" value="{{ t.autorun_minutes }}"></div>
 <div><label>Mode</label><select name="mode"><option value="live" {{ 'selected' if t.live }}>Live: send to real leads</option><option value="test" {{ 'selected' if not t.live }}>Test: send everything to the inbox owner first</option></select></div></div>
 <p><button class="btn brand">Save and send to every BSO</button></p></form></div></div>
+<div class="card"><div class="card-h"><h2>Import inboxes from a spreadsheet</h2></div><div class="card-b">
+<p style="margin-top:0">Excel (.xlsx) or CSV with one row per inbox: <b>inbox email, sender name, password</b>, and optionally <b>user</b> (whose inbox it is: their sign-in ID or email), <b>user name</b> and <b>role</b>. People who don't exist yet are created, with a password generated for each. <a href="{{ url_for('bso_template') }}">Download the template</a></p>
+<form method="post" action="{{ url_for('bso_import') }}" enctype="multipart/form-data"><input type="hidden" name="_csrf" value="{{ csrf }}">
+<div class="grid"><div><label>Spreadsheet</label><input type="file" name="file" accept=".xlsx,.xlsm,.csv,.txt" required></div>
+<div><label>Whose inboxes are these?</label><select name="assign_to"><option value="">Use the "user" column in the sheet</option>{% for s_ in senders %}<option value="{{ s_.id }}">All of them: {{ s_.name }} ({{ s_.role }})</option>{% endfor %}</select></div>
+<div><label>Role for people the sheet creates (if no role column)</label><select name="role"><option value="member">Member</option><option value="bot">BSO Bot</option><option value="manager">Manager</option></select></div></div>
+<p><button class="btn brand">Import and send to their BSO</button></p></form></div></div>
 <div class="card"><div class="card-h"><h2>Who has it</h2></div><table><tr><th>Person</th><th>Role</th><th class="r">Inboxes</th><th>Status</th></tr>
 {% for p in people %}<tr><td><a href="{{ url_for('user_detail', uid=p.id) }}">{{ p.name }}</a></td><td>{{ p.role }}</td><td class="r">{{ p.inboxes }}</td>
 <td>{% if p.applied and p.applied == p.sent %}<span class="badge b-ok">applied</span>{% elif p.sent %}<span class="badge b-warn">waiting for their BSO</span>{% else %}<span class="muted">add inboxes on their page</span>{% endif %}</td></tr>{% else %}<tr><td colspan="4" class="muted">No senders yet.</td></tr>{% endfor %}</table></div>
 <p class="muted">What each person still does on their laptop: install BSO, sign in with the ID and password you gave them, and accept the terms (the law requires each user to accept them). The BSO Bot account does this once on its computer.</p>
 {% endblock %}"""
+T["bso_import.html"] = """{% extends 'base.html' %}{% block title %}Import inboxes{% endblock %}{% block body %}
+<p><a href="{{ url_for('bso_setup') }}">← BSO setup</a></p>
+<div class="card"><div class="card-h"><h2>Imported {{ filename }}</h2></div><div class="card-b">
+{% for p in problems %}<div class="err">{{ p }}</div>{% endfor %}
+{% if creds %}<div class="note"><b>{{ creds|length }} new sign-in(s) created.</b> Give each person their ID and password (shown only now). <a class="btn brand" href="{{ url_for('bso_creds', token=token) }}">Download sign-ins (CSV)</a>
+<table style="margin-top:8px"><tr><th>Name</th><th>Sign-in ID</th><th>Password</th><th>Role</th></tr>{% for c in creds %}<tr><td>{{ c.name }}</td><td class="code" style="font-size:13px">{{ c.username }}</td><td class="code" style="font-size:13px">{{ c.password }}</td><td>{{ c.role }}</td></tr>{% endfor %}</table></div>{% endif %}
+<table><tr><th>Person</th><th class="r">New inboxes</th><th class="r">Updated</th><th class="r">Total</th><th>Status</th></tr>
+{% for r in report %}<tr><td><a href="{{ url_for('user_detail', uid=r.id) }}">{{ r.name }}</a>{% if r.new %} <span class="badge b-ok">new</span>{% endif %}</td><td class="r">{{ r.added }}</td><td class="r">{{ r.updated }}</td><td class="r">{{ r.total }}</td>
+<td>{% if r.sent %}sent; their BSO applies it at its next check-in{% else %}<span class="badge b-warn">saved; enter their BSO password once on their page to send it</span>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="muted">Nothing imported.</td></tr>{% endfor %}</table>
+</div></div>{% endblock %}"""
 T["security.html"] = """{% extends 'base.html' %}{% block title %}Security{% endblock %}{% block body %}
 {% if msg %}<div class="note">{{ msg }}</div>{% endif %}
 <div class="card"><div class="card-h"><h2>Alerts</h2><span class="muted">last 7 days</span></div><div class="card-b">
