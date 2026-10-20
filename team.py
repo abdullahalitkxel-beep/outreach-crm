@@ -85,6 +85,7 @@ def holds_approval():
 # ---------------------------------------------------------------- signing in
 
 SIGNED_IN = {}          # lives only in this running app: who is signed in right now
+_PW = {}                # the password just typed, kept in memory a few minutes so a setup sent by the master can be unlocked
 
 
 def app_dir():
@@ -290,9 +291,11 @@ def sign_in(con, username, password, consent=False, hub=None):
     save_state(s)
     SIGNED_IN.clear()
     SIGNED_IN.update(user=username, name=pol.get("name", username), bot=pol.get("role") == "bot")
-    if first_time:
-        restore(con)
-        sync(con)          # pick up anything waiting in this person's queue straight away
+    _PW.update(user=username, pw=password, at=time.time())
+    if first_time or not SECRETS.load().get(SETUP_KEY):
+        if first_time:
+            restore(con)
+        sync(con)          # pick up anything waiting in this person's queue (and their setup) straight away
     return pol
 
 
@@ -654,9 +657,97 @@ def erase_everything(con):
         cp.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
     except Exception:
         pass
+    try:
+        import yaml
+        sp = Path(DATA) / "settings.yaml"
+        if sp.exists():
+            cur = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
+            sp.write_text(yaml.safe_dump({k: v for k, v in cur.items() if k == "legal_acceptance"}), encoding="utf-8")
+    except Exception:
+        pass
     hub = state().get("hub", "")
     save_state({"hub": hub, "revoked": True, "wiped": iso(now_utc())})
+    _PW.clear()
     SIGNED_IN.clear()
+
+
+# ---------------------------------------------------------------- setup sent by the master
+
+SETUP_KEY = "BSO_SETUP_KEY"
+
+
+def _take_setup_key(d):
+    """Unlock the per-person key with the password typed at sign-in. True when done (or no longer possible)."""
+    import sealbox
+    if not (_PW.get("pw") and time.time() - _PW.get("at", 0) < 900):
+        return False                      # wait until someone signs in with the password
+    try:
+        k = sealbox.unwrap(d.get("wrap") or {}, _PW["user"], _PW["pw"])
+    except Exception:
+        return True                       # made for an older password: the master will send a new one
+    SECRETS.set(SETUP_KEY, k.hex())
+    return True
+
+
+def apply_setup(con, d):
+    """Apply inboxes, mail server, keys and schedule the master sent. True when applied (or unusable)."""
+    import sealbox
+    import yaml
+    from datetime import date
+    k = SECRETS.load().get(SETUP_KEY)
+    if not k:
+        return False
+    try:
+        data = json.loads(sealbox.open_(bytes.fromhex(k), d.get("box") or ""))
+    except Exception:
+        return True
+    from bot import settings_path
+    sp = settings_path(str(Path(DATA) / "config.yaml"))
+    try:
+        cur = yaml.safe_load(sp.read_text(encoding="utf-8")) or {} if sp.exists() else {}
+    except Exception:
+        cur = {}
+    senders = [x for x in (cur.get("senders") or []) if x.get("email") and "example" not in x["email"]]
+    by = {x["email"].lower(): x for x in senders}
+    used = {int(re.sub(r"\D", "", x.get("password_env", "")) or 0) for x in senders}
+    for sv in data.get("senders") or []:
+        e = str(sv.get("email") or "").lower()
+        if not e:
+            continue
+        x = by.get(e)
+        if not x:
+            n = next(i for i in range(1, 200) if i not in used)
+            used.add(n)
+            x = {"email": e, "password_env": f"SENDER{n}_PASSWORD", "ramp_from": date.today().isoformat() if sv.get("ramp") else None}
+            senders.append(x)
+            by[e] = x
+        x.update(name=sv.get("name") or x.get("name") or e, smtp_host=sv.get("smtp_host") or x.get("smtp_host", ""),
+                 smtp_port=int(sv.get("smtp_port") or x.get("smtp_port") or 465), imap_host=sv.get("imap_host") or x.get("imap_host", ""),
+                 daily_limit=int(sv.get("daily_limit") or x.get("daily_limit") or 10))
+        if sv.get("password"):
+            SECRETS.set(x["password_env"], sv["password"])
+    if senders:
+        cur["senders"] = senders
+    for name, val in (data.get("keys") or {}).items():
+        if name in ("ANTHROPIC_API_KEY", "INSTANTLY_API_KEY") and val:
+            SECRETS.set(name, val)
+    opt = data.get("options") or {}
+    if "autorun_minutes" in opt:
+        m = int(opt.get("autorun_minutes") or 0)
+        cur["autorun"] = dict(cur.get("autorun") or {}, enabled=m > 0, every_minutes=m or int((cur.get("autorun") or {}).get("every_minutes") or 30))
+    if "live" in opt:
+        cur["test_mode"] = dict(cur.get("test_mode") or {}, enabled=not opt["live"])
+    if (data.get("keys") or {}).get("INSTANTLY_API_KEY"):
+        cur["instantly"] = dict(cur.get("instantly") or {}, enabled=True)
+    tmp = sp.with_suffix(".tmp")
+    tmp.write_text(yaml.safe_dump(cur, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    os.replace(tmp, sp)
+    s = state()
+    s["setup_v"] = data.get("v")
+    s["setup_ack"] = data.get("v")
+    save_state(s)
+    record_access(con, "setup", f"{len(data.get('senders') or [])} inbox(es) set up by the master")
+    return True
 
 
 def _transfer_out(con):
@@ -716,6 +807,7 @@ def _leads_in(con, d):
 def _apply_decisions(con, decisions):
     """Apply what the master console sent. Returns (draft ids done, handover ids received)."""
     done, ho_done = [], []
+    decisions = sorted(decisions, key=lambda d: 0 if d.get("action") == "setup_key" else 1)
     for d in decisions:
         action = d.get("action")
         if action == "config":
@@ -726,6 +818,15 @@ def _apply_decisions(con, decisions):
             if isinstance(d.get("security"), dict):
                 s["security"] = d["security"]
             save_state(s)
+            continue
+        if action in ("setup_key", "setup"):
+            try:
+                ok = _take_setup_key(d) if action == "setup_key" else apply_setup(con, d)
+            except Exception as e:
+                print(action + ":", e)
+                ok = False
+            if ok and d.get("handover_id"):
+                ho_done.append(d["handover_id"])
             continue
         if action in ("wipe", "canary"):
             hid = d.get("handover_id")
@@ -882,6 +983,8 @@ def _sync(con, version=""):
             save_state(s)
         packed += [{"id": f"a{a['id']}", "type": "__audit", "data": {"uid": f"{dev}-{a['id']}", "kind": a["kind"], "detail": a["detail"], "n": a["n"], "at": a["at"]}}
                    for a in acc]
+        if s.get("setup_ack"):
+            packed.append({"id": "setup", "type": "__setup", "data": {"v": s["setup_ack"]}})
         wiping = bool(s.get("wipe_then")) and not s.get("transfer_queue")
         if wiping:
             packed.append({"id": "w", "type": "__wiped", "data": {"at": iso(now_utc())}})
@@ -910,6 +1013,8 @@ def _sync(con, version=""):
         con.execute(f"UPDATE comments SET synced=1 WHERE id IN ({','.join('?' * len(cms))})", [c["id"] for c in cms])
         con.commit()
     s.pop("away_pending", None)
+    if s.get("setup_ack") and any(p.get("type") == "__setup" for p in packed):
+        s.pop("setup_ack", None)
     if acc:
         con.execute(f"UPDATE access_log SET synced=1 WHERE id IN ({','.join('?' * len(acc))})", [a["id"] for a in acc])
         con.commit()

@@ -74,6 +74,9 @@ jobs:
       - name: Test security (2-step sign-in, permissions, idle lock, trap contacts, erase)
         run: python tests/security_test.py
 
+      - name: Test setting up a BSO from the console
+        run: python tests/setup_test.py
+
       - name: Test the AI line with thinking models
         run: python tests/llm_test.py
 

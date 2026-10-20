@@ -153,7 +153,8 @@ def init_db():
         con.execute("UPDATE users SET username=lower(email) WHERE username IS NULL")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username)")
     for col, decl in (("relay_pw", "TEXT"), ("tv", "INTEGER DEFAULT 1"), ("bot_status", "TEXT"), ("away_until", "TEXT"),
-                      ("totp_secret", "TEXT"), ("recovery_codes", "TEXT"), ("wipe", "TEXT")):
+                      ("totp_secret", "TEXT"), ("recovery_codes", "TEXT"), ("wipe", "TEXT"),
+                      ("setup_sent", "TEXT"), ("setup_applied", "TEXT")):
         if col not in {r[1] for r in con.execute("PRAGMA table_info(users)")}:
             con.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
     con.commit()
@@ -690,6 +691,125 @@ def creds_note(name, username, password):
             "url": (meta_get("public_url", DEFAULT_PUBLIC_URL) or request.host_url).rstrip("/")}
 
 
+# ------------------------------------------------------------------ BSO setup sent from the console
+# The master enters the mail server, API keys and each person's inboxes once, here. Their BSO receives it at first sign-in.
+# It travels encrypted: a random key per person is wrapped with that person's sign-in password (which only the master
+# and that person know), and the setup is sealed with that key. Google Drive and the relay only ever hold ciphertext.
+
+import sealbox  # noqa: E402
+
+SETUP_TEAM_DEFAULTS = {"smtp_host": "", "smtp_port": 465, "imap_host": "", "daily_limit": 10, "ramp": True, "autorun_minutes": 30,
+                       "live": True, "anthropic_key": "", "instantly_key": ""}
+
+
+def team_setup():
+    try:
+        d = json.loads(_secret_store().load().get("SETUP_TEAM", "") or "{}")
+    except Exception:
+        d = {}
+    return dict(SETUP_TEAM_DEFAULTS, **d)
+
+
+def user_inboxes(uid):
+    try:
+        return json.loads(_secret_store().load().get(f"SETUP_INBOXES_{uid}", "") or "[]")
+    except Exception:
+        return []
+
+
+def parse_inbox_lines(text):
+    """'email, name, password' per line. Returns (inboxes, problems)."""
+    out, bad, seen = [], [], set()
+    for ln, line in enumerate((text or "").splitlines(), 1):
+        parts = [p.strip() for p in re.split(r"[,;\t]", line) if p.strip()]
+        if not parts:
+            continue
+        if len(parts) < 3 or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", parts[0]):
+            bad.append(f"line {ln}: expected email, name, password")
+            continue
+        e = parts[0].lower()
+        if e in seen:
+            continue
+        seen.add(e)
+        out.append({"email": e, "name": parts[1], "password": ",".join(parts[2:])})
+    return out[:50], bad
+
+
+def setup_payload(uid):
+    t, ib = team_setup(), user_inboxes(uid)
+    keys = {k: v for k, v in (("ANTHROPIC_API_KEY", t["anthropic_key"]), ("INSTANTLY_API_KEY", t["instantly_key"])) if v}
+    if not ib and not keys and not t["smtp_host"]:
+        return None
+    senders = [dict(x, smtp_host=x.get("smtp_host") or t["smtp_host"], smtp_port=int(x.get("smtp_port") or t["smtp_port"] or 465),
+                    imap_host=x.get("imap_host") or t["imap_host"], daily_limit=int(t["daily_limit"] or 10), ramp=bool(t["ramp"])) for x in ib]
+    return {"v": iso(), "senders": senders, "keys": keys,
+            "options": {"autorun_minutes": int(t["autorun_minutes"] or 0), "live": bool(t["live"])}}
+
+
+def _supersede(con, uid, action):
+    con.execute("UPDATE notices SET delivered=1 WHERE user_id=? AND delivered=0 AND item LIKE ?", (uid, f'{{"action": "{action}"%'))
+
+
+def deliver_setup_key(con, uid, username, password):
+    """Called whenever the master sets a person's password: lets their BSO open setups sent to it."""
+    st = _secret_store()
+    k = st.load().get(f"SETUP_KEY_{uid}")
+    if not k:
+        k = secrets.token_hex(32)
+        st.set(f"SETUP_KEY_{uid}", k)
+    _supersede(con, uid, "setup_key")
+    con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)",
+                (uid, json.dumps({"action": "setup_key", "wrap": sealbox.wrap(bytes.fromhex(k), username, password)})))
+
+
+def push_setup(con, uid):
+    """(Re)send this person's setup. Returns False when there's nothing to send or no key yet."""
+    k = _secret_store().load().get(f"SETUP_KEY_{uid}")
+    data = setup_payload(uid)
+    if not (k and data):
+        return False
+    _supersede(con, uid, "setup")
+    con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)",
+                (uid, json.dumps({"action": "setup", "v": data["v"], "box": sealbox.seal(bytes.fromhex(k), json.dumps(data))})))
+    con.execute("UPDATE users SET setup_sent=? WHERE id=?", (data["v"], uid))
+    return True
+
+
+def push_setup_all(con):
+    n = 0
+    for u in con.execute("SELECT id FROM users WHERE role IN ('member','manager','bot') AND status NOT IN ('disabled','removed','removing')").fetchall():
+        n += push_setup(con, u["id"])
+    con.commit()
+    return n
+
+
+@app.route("/bso-setup", methods=["GET", "POST"])
+@need("owner")
+def bso_setup():
+    msg = None
+    t = team_setup()
+    if request.method == "POST":
+        f = request.form
+        t.update(smtp_host=f.get("smtp_host", "").strip(), smtp_port=_valid_int(f.get("smtp_port"), 1, 65535) or 465,
+                 imap_host=f.get("imap_host", "").strip(), daily_limit=_valid_int(f.get("daily_limit"), 1, 100) or 10,
+                 ramp=bool(f.get("ramp")), autorun_minutes=_valid_int(f.get("autorun_minutes"), 0, 1440), live=f.get("mode") == "live")
+        for k in ("anthropic_key", "instantly_key"):
+            if f.get(k, "").strip():
+                t[k] = f[k].strip()
+            if f.get("clear_" + k):
+                t[k] = ""
+        _secret_store().set("SETUP_TEAM", json.dumps(t))
+        n = push_setup_all(db())
+        audit("bso_setup_changed", f"mail={t['smtp_host']} autorun={t['autorun_minutes']} live={t['live']}")
+        threading.Thread(target=relay_cycle, daemon=True).start()
+        msg = f"Saved. Sent to {n} person(s); each BSO applies it at its next check-in." if n else "Saved. It goes to each person's BSO with their inboxes (on their user page)."
+    people = []
+    for u in db().execute("SELECT * FROM users WHERE role IN ('member','manager','bot') AND status NOT IN ('removed') ORDER BY name").fetchall():
+        people.append({"id": u["id"], "name": u["name"], "role": u["role"], "inboxes": len(user_inboxes(u["id"])),
+                       "sent": u["setup_sent"], "applied": u["setup_applied"]})
+    return render("bso_setup.html", t=t, msg=msg, people=people, mask=lambda v: ("•" * 8 + v[-4:]) if v else "", tab="bso_setup")
+
+
 @app.post("/users/new")
 @need("owner")
 def user_new():
@@ -707,9 +827,16 @@ def user_new():
                  (name, email, username, role, "invited", generate_password_hash(pw),
                   _valid_int(f.get("daily_cap")), _valid_int(f.get("weekly_target")),
                   "master" if f.get("approval") == "master" else "member", iso()))
-    set_password(db(), db().execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()["id"], pw)
+    new_id = db().execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()["id"]
+    set_password(db(), new_id, pw)
+    inboxes, bad = parse_inbox_lines(f.get("inboxes", ""))
+    if role in ("member", "manager", "bot"):
+        if inboxes:
+            _secret_store().set(f"SETUP_INBOXES_{new_id}", json.dumps(inboxes))
+        deliver_setup_key(db(), new_id, username, pw)
+        push_setup(db(), new_id)
     db().commit()
-    audit("user_created", f"{username} ({role})")
+    audit("user_created", f"{username} ({role})" + (f", {len(inboxes)} inbox(es) set up" if inboxes else ""))
     session["new_creds"] = creds_note(name, username, pw)
     return redirect(url_for("users"))
 
@@ -721,7 +848,10 @@ def user_detail(uid):
     st = next(s for s in user_stats(30) if s["u"]["id"] == uid)
     events = db().execute("SELECT * FROM events WHERE user_id=? ORDER BY at DESC, id DESC LIMIT 60", (uid,)).fetchall()
     devices = db().execute("SELECT * FROM devices WHERE user_id=? ORDER BY created_at DESC", (uid,)).fetchall()
-    return render("user.html", u=dict(u), st=st, events=events, devices=devices, tab="users", new_creds=session.pop("new_creds", None))
+    ib = user_inboxes(uid) if g.me["role"] == "owner" else []
+    has_key = bool(_secret_store().load().get(f"SETUP_KEY_{uid}")) if g.me["role"] == "owner" else False
+    return render("user.html", u=dict(u), st=st, events=events, devices=devices, tab="users", new_creds=session.pop("new_creds", None),
+                  inbox_lines="\n".join(f"{x['email']}, {x['name']}, keep" for x in ib), has_key=has_key, t=team_setup() if g.me["role"] == "owner" else {})
 
 
 @app.post("/users/<int:uid>")
@@ -766,8 +896,30 @@ def user_save(uid):
         if not strong(pw):
             return redirect(url_for("user_detail", uid=uid, err="Password must be at least 10 characters (or leave blank to generate one)."))
         set_password(db(), uid, pw, sign_out=True)   # a new password signs the old laptops out
+        if u["role"] in ("member", "manager", "bot"):
+            deliver_setup_key(db(), uid, u["username"] or u["email"], pw)
+            push_setup(db(), uid)
         session["new_creds"] = creds_note(u["name"], u["username"] or u["email"], pw)
         audit("password_reset", u["email"])
+    elif action == "setup":
+        inboxes, bad = parse_inbox_lines(f.get("inboxes", ""))
+        old = {x["email"]: x for x in user_inboxes(uid)}
+        for x in inboxes:                              # "keep" as the password keeps the one already saved
+            if x["password"].lower() == "keep" and x["email"] in old:
+                x["password"] = old[x["email"]]["password"]
+        if bad:
+            return redirect(url_for("user_detail", uid=uid, err="Inboxes: " + "; ".join(bad)))
+        _secret_store().set(f"SETUP_INBOXES_{uid}", json.dumps(inboxes))
+        if f.get("password"):
+            if not check_password_hash(u["pw_hash"] or "", f["password"]):
+                return redirect(url_for("user_detail", uid=uid, err="That isn't their current BSO password. Use Reset password instead if you don't know it."))
+            deliver_setup_key(db(), uid, u["username"] or u["email"], f["password"])
+        sent = push_setup(db(), uid)
+        audit("bso_setup_changed", f"{u['email']}: {len(inboxes)} inbox(es)")
+        db().commit()
+        threading.Thread(target=relay_cycle, daemon=True).start()
+        return redirect(url_for("user_detail", uid=uid, ok=("Setup sent. Their BSO applies it at its next check-in." if sent else
+                                                           "Saved. To send it, enter their current BSO password once below (or reset it), so it can be encrypted for them.")))
     elif action == "wipe_revoke":
         request_wipe(db(), uid, then="disconnect")
         audit("laptop_erase_requested", u["email"])
@@ -1295,6 +1447,9 @@ def ingest(con, uid, j):
                         (uid, str(a.get("uid") or "")[:80] or None, str(a.get("kind") or "")[:30], str(a.get("detail") or "")[:300],
                          int(a.get("n") or 0), str(a.get("at") or iso())[:25]))
             continue
+        if isinstance(e, dict) and e.get("type") == "__setup":
+            con.execute("UPDATE users SET setup_applied=? WHERE id=?", (str((e.get("data") or {}).get("v") or "")[:25], uid))
+            continue
         if isinstance(e, dict) and e.get("type") == "__wiped":
             wiped(con, uid)
             continue
@@ -1487,6 +1642,12 @@ def complete_removal(con, uid):
     con.execute("UPDATE devices SET revoked=1 WHERE user_id=?", (uid,))
     con.execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)", (iso(), "system", "user_removed", u["email"]))
     con.commit()
+    try:
+        st = _secret_store()
+        for k in (f"SETUP_KEY_{uid}", f"SETUP_INBOXES_{uid}"):
+            st.set(k, "")
+    except Exception:
+        pass
 
 
 def remove_user(con, u, wait_for_leads=True):
@@ -1759,7 +1920,7 @@ BASE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name=
 <title>{% block title %}Master console{% endblock %} · BSO</title><style>""" + CSS + """{{ logo_css|safe }}</style></head><body>
 {% if me %}<div class="top">{{ logo(30, tile=True, uid='tp', weight='b', label='BSO')|safe }}<b>BSO Master console</b><small>{{ org }}</small><span class="sp"></span>
 <small>{{ me.name }} · {{ me.role }}</small><a href="{{ url_for('twofa') }}" style="color:#b9c3c9;font-size:12px">2-step sign-in</a><form method="post" action="{{ url_for('logout') }}" style="margin:0"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" style="padding:4px 10px">Sign out</button></form></div>
-<div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('users','Users','users'),('approvals','Approvals','approvals'),('board','Prospect board','board'),('handovers','Handovers','handovers_page'),('activity','Activity','activity')] + ([('security','Security','security_page'),('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
+<div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('users','Users','users'),('approvals','Approvals','approvals'),('board','Prospect board','board'),('handovers','Handovers','handovers_page'),('activity','Activity','activity')] + ([('bso_setup','BSO setup','bso_setup'),('security','Security','security_page'),('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
 <div class="wrap">{% if request.args.get('err') %}<div class="err">{{ request.args.get('err') }}</div>{% endif %}{% if request.args.get('ok') %}<div class="note">{{ request.args.get('ok') }}</div>{% endif %}{% block body %}{% endblock %}</div><script src="/hub.js"></script></body></html>"""
 
 T = {}
@@ -1845,6 +2006,9 @@ T["users.html"] = """{% extends 'base.html' %}{% block title %}Users{% endblock 
 <div><label>Password (10+ characters; blank = generate one)</label><input name="password" autocomplete="off"></div>
 <div><label>Daily send cap (0 = no cap)</label><input name="daily_cap" type="number" min="0" value="0"></div><div><label>Weekly target (emails, 0 = none)</label><input name="weekly_target" type="number" min="0" value="0"></div>
 <div><label>Who approves their emails</label><select name="approval"><option value="member">They approve their own</option><option value="master">The master approves every email</option></select></div></div>
+<label>Their sending inboxes (members and the BSO Bot): one per line as <b>email, name prospects see, password</b>. Optional, you can add them later on their page.</label>
+<textarea name="inboxes" style="min-height:90px" placeholder="cole.reed@getneosofttech.com, Cole Reed, mailbox-password&#10;emma.hart@getneosofttech.com, Emma Hart, mailbox-password" autocomplete="off"></textarea>
+<p class="muted" style="margin:4px 0 0">Their BSO sets itself up at first sign-in: these inboxes plus the mail server, AI key and schedule from <a href="{{ url_for('bso_setup') }}">BSO setup</a>. Everything is encrypted with their sign-in password on the way.</p>
 <p><button class="btn brand">Create user</button></p></form></div></div>{% endif %}{% endblock %}"""
 T["user.html"] = """{% extends 'base.html' %}{% block title %}{{ u.name }}{% endblock %}{% block body %}{% include '_invite.html' %}
 <p><a href="{{ url_for('users') }}">← All users</a></p>
@@ -1859,6 +2023,13 @@ T["user.html"] = """{% extends 'base.html' %}{% block title %}{{ u.name }}{% end
 <div><label>Who approves their emails</label><select name="approval"><option value="member" {{ 'selected' if u.approval != 'master' }}>They approve their own</option><option value="master" {{ 'selected' if u.approval == 'master' }}>The master approves every email</option></select></div>
 </div>
 <label>Private note</label><input name="note" value="{{ u.note or '' }}"><p><button class="btn brand">Save</button></p></form>
+{% if u.role in ('member', 'manager', 'bot') %}<div class="card" style="margin:14px 0"><div class="card-h"><h2>BSO setup for {{ u.name }}</h2>
+{% if u.setup_applied and u.setup_applied == u.setup_sent %}<span class="badge b-ok">applied on their BSO</span>{% elif u.setup_sent %}<span class="badge b-warn">sent, waiting for their BSO</span>{% else %}<span class="badge b-off">not sent</span>{% endif %}</div><div class="card-b">
+<form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="setup">
+<label>Sending inboxes: <b>email, name prospects see, password</b> per line ("keep" keeps the saved password)</label><textarea name="inboxes" style="min-height:120px" autocomplete="off">{{ inbox_lines }}</textarea>
+<p class="muted" style="margin:4px 0">Mail server {{ t.smtp_host or '(not set)' }} · {{ t.daily_limit }} emails a day per inbox{{ ', warming up' if t.ramp }} · AI key {{ 'included' if t.anthropic_key else 'not set' }} · runs every {{ t.autorun_minutes }} min. Change these for everyone in <a href="{{ url_for('bso_setup') }}">BSO setup</a>.</p>
+{% if not has_key %}<label>Their current BSO password (needed once, to encrypt the setup for them; not stored)</label><input name="password" type="password" autocomplete="off" style="max-width:300px">{% endif %}
+<p><button class="btn brand">Save and send to their BSO</button></p></form></div></div>{% endif %}
 <form method="post" style="display:inline-flex;gap:6px;align-items:center" onsubmit="return confirm('Set a new password? Their laptops are signed out and must sign in again.')"><input type="hidden" name="_csrf" value="{{ csrf }}"><input name="password" placeholder="new password (blank = generate)" autocomplete="off" style="width:240px"><button class="btn" name="action" value="resetpw">Reset password</button></form>
 {% if u.totp_secret %}<form method="post" style="display:inline" onsubmit="return confirm('Switch off this person\\'s 2-step sign-in? They set it up again next time.')"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" name="action" value="reset2fa">Reset 2-step sign-in</button></form>{% endif %}
 <form method="post" style="display:inline" onsubmit="return confirm('At its next check-in this person\\'s BSO hands its leads over (shared equally among the others), then erases its data (leads, prospects, emails, saved passwords) and signs out. The account stays. Continue?')"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn danger" name="action" value="wipe_revoke">Erase laptop and disconnect</button></form>
@@ -1918,6 +2089,25 @@ T["activity.html"] = """{% extends 'base.html' %}{% block title %}Activity{% end
 <form method="get" class="card"><div class="card-b grid"><div><label>User</label><select name="user"><option value="">Everyone</option>{% for u in ulist %}<option value="{{ u.id }}" {{ 'selected' if uid == u.id }}>{{ u.name }}</option>{% endfor %}</select></div>
 <div><label>Event</label><select name="type"><option value="">All</option>{% for t in types %}<option {{ 'selected' if typ == t }}>{{ t }}</option>{% endfor %}</select></div><div style="align-self:end"><button class="btn brand">Filter</button></div></div></form>
 <div class="card"><table><tr><th>When</th><th>User</th><th>Event</th><th>Lead</th><th>Inbox</th><th>Detail</th></tr>{% for e in rows %}<tr><td class="muted">{{ e.at|dt }}</td><td>{{ e.uname }}</td><td>{{ e.type }}</td><td>{{ e.lead_email }}{% if e.company %}<br><span class="muted">{{ e.company }}</span>{% endif %}</td><td class="muted">{{ e.sender }}</td><td>{{ e.detail }}</td></tr>{% else %}<tr><td colspan="6" class="muted">No activity yet.</td></tr>{% endfor %}</table></div>{% endblock %}"""
+T["bso_setup.html"] = """{% extends 'base.html' %}{% block title %}BSO setup{% endblock %}{% block body %}{% if msg %}<div class="note">{{ msg }}</div>{% endif %}
+<div class="card"><div class="card-h"><h2>Set up every BSO from here</h2></div><div class="card-b">
+<p style="margin-top:0">Fill this in once. When you create a person (or the BSO Bot) and add their inboxes, their BSO sets itself up the first time they sign in: inboxes, mail server, AI key, Instantly key and schedule. Nobody types settings on the laptop. Changes here are sent to every BSO at its next check-in.</p>
+<form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><h3 style="font-size:14px;margin:6px 0">Mail server for the sending inboxes</h3>
+<div class="grid"><div><label>Outgoing (SMTP) server</label><input name="smtp_host" value="{{ t.smtp_host }}" placeholder="mail.getneosofttech.com"></div><div><label>SMTP port</label><input name="smtp_port" type="number" value="{{ t.smtp_port }}"></div>
+<div><label>Incoming (IMAP) server, port 993</label><input name="imap_host" value="{{ t.imap_host }}" placeholder="mail.getneosofttech.com"></div><div><label>Emails a day per inbox</label><input name="daily_limit" type="number" min="1" max="100" value="{{ t.daily_limit }}"></div></div>
+<label style="display:flex;gap:8px;align-items:center;color:inherit"><input type="checkbox" name="ramp" style="width:auto" {{ 'checked' if t.ramp }}> Warm up new inboxes (start low and build up over about 3 weeks)</label>
+<h3 style="font-size:14px;margin:16px 0 6px">Keys (kept encrypted on this computer; sent encrypted)</h3>
+<div class="grid"><div><label>Anthropic API key {% if t.anthropic_key %}<span class="badge b-ok">{{ mask(t.anthropic_key) }}</span>{% endif %}</label><input name="anthropic_key" type="password" autocomplete="off" placeholder="{{ 'leave blank to keep' if t.anthropic_key else 'sk-ant-…' }}">{% if t.anthropic_key %}<label style="display:flex;gap:6px;color:inherit"><input type="checkbox" name="clear_anthropic_key" style="width:auto"> remove</label>{% endif %}</div>
+<div><label>Instantly API key (optional) {% if t.instantly_key %}<span class="badge b-ok">{{ mask(t.instantly_key) }}</span>{% endif %}</label><input name="instantly_key" type="password" autocomplete="off" placeholder="{{ 'leave blank to keep' if t.instantly_key else '' }}">{% if t.instantly_key %}<label style="display:flex;gap:6px;color:inherit"><input type="checkbox" name="clear_instantly_key" style="width:auto"> remove</label>{% endif %}</div></div>
+<h3 style="font-size:14px;margin:16px 0 6px">Running</h3>
+<div class="grid"><div><label>Run the campaigns automatically every N minutes (0 = only when someone clicks Run)</label><input name="autorun_minutes" type="number" min="0" value="{{ t.autorun_minutes }}"></div>
+<div><label>Mode</label><select name="mode"><option value="live" {{ 'selected' if t.live }}>Live: send to real leads</option><option value="test" {{ 'selected' if not t.live }}>Test: send everything to the inbox owner first</option></select></div></div>
+<p><button class="btn brand">Save and send to every BSO</button></p></form></div></div>
+<div class="card"><div class="card-h"><h2>Who has it</h2></div><table><tr><th>Person</th><th>Role</th><th class="r">Inboxes</th><th>Status</th></tr>
+{% for p in people %}<tr><td><a href="{{ url_for('user_detail', uid=p.id) }}">{{ p.name }}</a></td><td>{{ p.role }}</td><td class="r">{{ p.inboxes }}</td>
+<td>{% if p.applied and p.applied == p.sent %}<span class="badge b-ok">applied</span>{% elif p.sent %}<span class="badge b-warn">waiting for their BSO</span>{% else %}<span class="muted">add inboxes on their page</span>{% endif %}</td></tr>{% else %}<tr><td colspan="4" class="muted">No senders yet.</td></tr>{% endfor %}</table></div>
+<p class="muted">What each person still does on their laptop: install BSO, sign in with the ID and password you gave them, and accept the terms (the law requires each user to accept them). The BSO Bot account does this once on its computer.</p>
+{% endblock %}"""
 T["security.html"] = """{% extends 'base.html' %}{% block title %}Security{% endblock %}{% block body %}
 {% if msg %}<div class="note">{{ msg }}</div>{% endif %}
 <div class="card"><div class="card-h"><h2>Alerts</h2><span class="muted">last 7 days</span></div><div class="card-b">

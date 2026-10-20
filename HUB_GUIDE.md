@@ -62,6 +62,14 @@ Until someone signs in, BSO opens nothing and sends nothing, including automatic
 
 Roles: **owner** (everything, including users and settings), **manager** (sees everyone, approves drafts, signs in to the console), **member** (uses BSO on their laptop).
 
+## Set up every BSO from the console (no settings on the laptops)
+
+1. Master Console → **BSO setup**: enter the mail server (SiteGround: `mail.getneosofttech.com`, SMTP 465, IMAP 993), emails a day per inbox, warm-up, the Anthropic key (and Instantly key if used), and how often campaigns run. Save.
+2. **Users → Add a user** (or the BSO Bot): in *Their sending inboxes* paste one line per inbox: `email, name prospects see, password`.
+3. On the laptop: install BSO, sign in with the ID and password you created, accept the terms. BSO sets itself up straight away: inboxes, passwords, keys, schedule.
+
+Later changes (a new inbox on the user's page, a new key or schedule in BSO setup) reach each BSO at its next check-in; nobody signs in again. The user page and BSO setup show **applied** once a BSO has it. Inbox passwords and keys are stored encrypted on the console computer and travel encrypted with the person's sign-in password, so Google Drive only ever holds scrambled data. For people created before this existed, enter their current BSO password once in the setup box on their page (or reset their password).
+
 ## Running BSO as a bot (recommended)
 
 Let one BSO run every campaign by itself and make every person a Lead Gen Supervisor:
