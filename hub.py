@@ -107,6 +107,12 @@ CREATE TABLE IF NOT EXISTS notices (                      -- items for one perso
 CREATE TABLE IF NOT EXISTS transfers (                    -- a removed person's leads, uploaded by their laptop, waiting to be shared out
     id INTEGER PRIMARY KEY, user_id INTEGER, part INTEGER, leads TEXT, at TEXT, UNIQUE(user_id, part)
 );
+CREATE TABLE IF NOT EXISTS data_audit (                   -- who looked at or exported how much data, reported by each BSO
+    id INTEGER PRIMARY KEY, user_id INTEGER, uid TEXT UNIQUE, kind TEXT, detail TEXT, n INTEGER, at TEXT
+);
+CREATE TABLE IF NOT EXISTS canaries (                     -- trap contacts: never emailed by BSO; if one gets mail, that person's list leaked
+    email TEXT PRIMARY KEY, user_id INTEGER, name TEXT, company TEXT, at TEXT, hit_at TEXT, hit_detail TEXT
+);
 CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, at TEXT, actor TEXT, action TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS reset_tokens (id INTEGER PRIMARY KEY, user_id INTEGER, token_hash TEXT UNIQUE, expires_at TEXT, used_at TEXT);
 CREATE TABLE IF NOT EXISTS throttle (key TEXT PRIMARY KEY, n INTEGER, first_at REAL);
@@ -146,7 +152,8 @@ def init_db():
         con.execute("ALTER TABLE users ADD COLUMN username TEXT")
         con.execute("UPDATE users SET username=lower(email) WHERE username IS NULL")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username)")
-    for col, decl in (("relay_pw", "TEXT"), ("tv", "INTEGER DEFAULT 1"), ("bot_status", "TEXT"), ("away_until", "TEXT")):
+    for col, decl in (("relay_pw", "TEXT"), ("tv", "INTEGER DEFAULT 1"), ("bot_status", "TEXT"), ("away_until", "TEXT"),
+                      ("totp_secret", "TEXT"), ("recovery_codes", "TEXT"), ("wipe", "TEXT")):
         if col not in {r[1] for r in con.execute("PRAGMA table_info(users)")}:
             con.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
     con.commit()
@@ -370,6 +377,94 @@ def setup():
     return render("setup.html", err=err, local=local_request(), owner_email=meta_get("owner_email", "omar@blacswanken.com"))
 
 
+# ---------------------------------------------------------------------------------------------- 2-step sign-in
+
+def totp(secret_b32, at=None, step=30, digits=6):
+    key = base64.b32decode(secret_b32.upper() + "=" * (-len(secret_b32) % 8))
+    counter = int((at or time.time()) // step)
+    h = hmac.new(key, counter.to_bytes(8, "big"), hashlib.sha1).digest()
+    o = h[-1] & 15
+    return str((int.from_bytes(h[o:o + 4], "big") & 0x7FFFFFFF) % 10 ** digits).zfill(digits)
+
+
+def totp_ok(secret_b32, code):
+    code = re.sub(r"\s", "", code or "")
+    return bool(secret_b32 and code.isdigit()) and any(hmac.compare_digest(totp(secret_b32, time.time() + d * 30), code) for d in (-1, 0, 1))
+
+
+def use_recovery(con, u, code):
+    codes = json.loads(u["recovery_codes"] or "[]")
+    h = sha(re.sub(r"[\s-]", "", (code or "").upper()))
+    if h in codes:
+        codes.remove(h)
+        con.execute("UPDATE users SET recovery_codes=? WHERE id=?", (json.dumps(codes), u["id"]))
+        con.commit()
+        return True
+    return False
+
+
+@app.route("/login/code", methods=["GET", "POST"])
+def login_code():
+    uid_ = session.get("pending_uid")
+    if not uid_ or time.time() - session.get("pending_at", 0) > 300:
+        session.clear()
+        return redirect(url_for("login"))
+    err = None
+    if request.method == "POST":
+        u = db().execute("SELECT * FROM users WHERE id=?", (uid_,)).fetchone()
+        ip = request.remote_addr or "?"
+        k = f"totp:{uid_}"
+        code = request.form.get("code", "")
+        if throttled(k, 6, 900):
+            err = "Too many wrong codes. Wait 15 minutes."
+        elif u and (totp_ok(u["totp_secret"], code) or use_recovery(db(), u, code)):
+            throttle_clear(k)
+            nxt = session.get("pending_next", "")
+            session.clear()
+            session.permanent = True
+            session["uid"] = u["id"]
+            g.me = dict(u)
+            audit("login (2-step)")
+            return redirect(nxt if nxt.startswith("/") and not nxt.startswith("//") else url_for("dashboard"))
+        else:
+            throttle_hit(k, 900)
+            err = "That code isn't right. Use the 6-digit code from your authenticator app, or one of your recovery codes."
+    return render("login_code.html", err=err)
+
+
+@app.route("/security/2fa", methods=["GET", "POST"])
+@need()
+def twofa():
+    msg, new_codes = None, None
+    if request.method == "POST":
+        f = request.form
+        if f.get("action") == "start":
+            session["totp_new"] = base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+        elif f.get("action") == "confirm" and session.get("totp_new"):
+            if totp_ok(session["totp_new"], f.get("code")):
+                codes = ["-".join(secrets.token_hex(2).upper() for _ in range(3)) for _ in range(8)]
+                db().execute("UPDATE users SET totp_secret=?, recovery_codes=? WHERE id=?",
+                             (session.pop("totp_new"), json.dumps([sha(c.replace("-", "")) for c in codes]), g.me["id"]))
+                db().commit()
+                audit("2-step sign-in switched on")
+                new_codes = codes
+            else:
+                msg = "That code didn't match. Check the time on your phone is set automatically, and try the newest code."
+        elif f.get("action") == "off":
+            me_ = db().execute("SELECT * FROM users WHERE id=?", (g.me["id"],)).fetchone()
+            if totp_ok(me_["totp_secret"], f.get("code")):
+                db().execute("UPDATE users SET totp_secret=NULL, recovery_codes=NULL WHERE id=?", (g.me["id"],))
+                db().commit()
+                audit("2-step sign-in switched off")
+                msg = "2-step sign-in is off."
+            else:
+                msg = "Enter a current code from your authenticator app to switch it off."
+    me_ = db().execute("SELECT * FROM users WHERE id=?", (g.me["id"],)).fetchone()
+    pending = session.get("totp_new")
+    uri = f"otpauth://totp/BSO%20Console:{me_['email']}?secret={pending}&issuer=BSO%20Console" if pending else None
+    return render("twofa.html", on=bool(me_["totp_secret"]), pending=pending, uri=uri, msg=msg, new_codes=new_codes, tab="settings")
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if not has_owner():
@@ -386,6 +481,9 @@ def login():
             if u and u["pw_hash"] and check_password_hash(u["pw_hash"], request.form.get("password", "")):
                 throttle_clear(k1)
                 session.clear()
+                if u["totp_secret"]:                          # second step: the code from their phone
+                    session.update(pending_uid=u["id"], pending_at=time.time(), pending_next=request.args.get("next", ""))
+                    return redirect(url_for("login_code"))
                 session.permanent = True
                 session["uid"] = u["id"]
                 g.me = dict(u)
@@ -657,9 +755,12 @@ def user_save(uid):
         audit("user_remove_started" if waiting else "user_removed", f"{u['email']}: {moved} prospect(s) shared out")
         threading.Thread(target=relay_cycle, daemon=True).start()
         msg = (f"{moved} open prospect(s) shared equally among the other supervisors. " if moved else "") + \
-              ("Their BSO has stopped sending; at its next check-in it hands over its leads, which are then shared equally among the remaining senders, and the account is removed." if waiting
+              ("Their BSO has stopped; at its next check-in it hands over its work (shared equally among the people who remain), erases its copy, and the account is removed." if waiting
                else "The account is removed.")
         return redirect(url_for("users", err=None, ok=msg))
+    elif action == "reset2fa":
+        db().execute("UPDATE users SET totp_secret=NULL, recovery_codes=NULL WHERE id=?", (uid,))
+        audit("2-step sign-in reset", u["email"])
     elif action == "resetpw":
         pw = f.get("password", "") or gen_password()
         if not strong(pw):
@@ -667,6 +768,9 @@ def user_save(uid):
         set_password(db(), uid, pw, sign_out=True)   # a new password signs the old laptops out
         session["new_creds"] = creds_note(u["name"], u["username"] or u["email"], pw)
         audit("password_reset", u["email"])
+    elif action == "wipe_revoke":
+        request_wipe(db(), uid, then="disconnect")
+        audit("laptop_erase_requested", u["email"])
     elif action == "revoke":
         db().execute("UPDATE devices SET revoked=1 WHERE user_id=?", (uid,))
         db().execute("UPDATE users SET tv=COALESCE(tv,1)+1 WHERE id=?", (uid,))
@@ -878,6 +982,175 @@ def audit_page():
     return render("audit.html", rows=db().execute("SELECT * FROM audit ORDER BY id DESC LIMIT 200").fetchall(), tab="audit")
 
 
+# ------------------------------------------------------------------ security
+
+CANARY_FIRST = ["Avery", "Jordan", "Riley", "Morgan", "Quinn", "Rowan", "Emerson", "Hollis", "Marlow", "Sutton", "Teagan", "Ellis"]
+CANARY_LAST = ["Halvorsen", "Pemberton", "Okafor", "Lindqvist", "Marchetti", "Castellan", "Whitlock", "Ferreira", "Ashdown", "Kovalenko"]
+CANARY_CO = ["Northgate", "Bluefin", "Harborline", "Copperleaf", "Stillwater", "Brightmoor", "Ironbridge", "Westvale"]
+
+
+def ensure_canaries(con, per_user=2):
+    """Give every sending account its own trap contacts (fake people at the canary domain).
+    BSO never emails them; mail arriving for one means that person's list was copied out."""
+    dom = security_cfg(con)["canary_domain"].strip().lower().lstrip("@")
+    if not dom:
+        return 0
+    made = 0
+    for u in con.execute("SELECT * FROM users WHERE role IN ('member','manager','bot') AND status NOT IN ('disabled','removed','removing')").fetchall():
+        have = con.execute("SELECT COUNT(*) FROM canaries WHERE user_id=? AND email LIKE ?", (u["id"], "%@" + dom)).fetchone()[0]
+        leads = []
+        for _ in range(per_user - have):
+            fn, ln, co = secrets.choice(CANARY_FIRST), secrets.choice(CANARY_LAST), secrets.choice(CANARY_CO)
+            email = f"{fn.lower()}.{ln.lower()}{secrets.randbelow(900) + 100}@{dom}"
+            company = f"{co} {secrets.choice(['Logistics', 'Partners', 'Analytics', 'Holdings', 'Systems'])}"
+            con.execute("INSERT OR IGNORE INTO canaries(email, user_id, name, company, at) VALUES (?,?,?,?,?)", (email, u["id"], f"{fn} {ln}", company, iso()))
+            leads.append({"email": email, "first_name": fn, "last_name": ln, "company": company,
+                          "title": secrets.choice(["Operations Director", "Head of IT", "VP Engineering", "COO"])})
+        if leads:
+            con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (u["id"], json.dumps({"action": "canary", "leads": leads})))
+            made += len(leads)
+    if made:
+        con.commit()
+    return made
+
+
+def canary_hit(con, address, detail):
+    c = con.execute("SELECT * FROM canaries WHERE email=?", (address.strip().lower(),)).fetchone()
+    if not c:
+        return None
+    if not c["hit_at"]:
+        con.execute("UPDATE canaries SET hit_at=?, hit_detail=? WHERE email=?", (iso(), str(detail)[:300], c["email"]))
+        u = con.execute("SELECT email FROM users WHERE id=?", (c["user_id"],)).fetchone()
+        con.execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)",
+                    (iso(), "system", "canary_hit", f"{c['email']} (planted for {u['email'] if u else '?'}): {detail}"[:300]))
+        con.commit()
+    return c
+
+
+def canary_watch(con):
+    """Look in the catch-all mailbox for anything sent to a trap address."""
+    host, user = _m_get(con, "canary_imap_host", ""), _m_get(con, "canary_imap_user", "")
+    if not (host and user):
+        return 0
+    try:
+        pw = _secret_store().load().get("HUB_CANARY_IMAP_PASSWORD", "")
+    except Exception:
+        pw = ""
+    import email as _email
+    import imaplib
+    traps = {r["email"] for r in con.execute("SELECT email FROM canaries WHERE hit_at IS NULL").fetchall()}
+    if not traps:
+        return 0
+    hits = 0
+    with imaplib.IMAP4_SSL(host, 993, ssl_context=ssl.create_default_context(), timeout=30) as m:
+        m.login(user, pw)
+        m.select("INBOX", readonly=True)
+        since = (now() - timedelta(days=3)).strftime("%d-%b-%Y")
+        _, data = m.search(None, "SINCE", since)
+        for num in (data[0].split() if data and data[0] else [])[-500:]:
+            _, msg = m.fetch(num, "(BODY.PEEK[HEADER.FIELDS (TO CC DELIVERED-TO X-ORIGINAL-TO FROM SUBJECT DATE)])")
+            hdr = _email.message_from_bytes(msg[0][1]) if msg and msg[0] else None
+            if not hdr:
+                continue
+            addrs = " ".join(str(hdr.get_all(k) or "") for k in ("To", "Cc", "Delivered-To", "X-Original-To")).lower()
+            for t in list(traps):
+                if t in addrs:
+                    canary_hit(con, t, f"from {hdr.get('From', '?')} · {hdr.get('Subject', '')} · {hdr.get('Date', '')}")
+                    traps.discard(t)
+                    hits += 1
+    return hits
+
+
+def security_alerts(con):
+    cfg, out = security_cfg(con), []
+    for c in con.execute("SELECT c.*, u.name uname FROM canaries c LEFT JOIN users u ON u.id=c.user_id WHERE hit_at IS NOT NULL ORDER BY hit_at DESC").fetchall():
+        out.append(("bad", f"Trap contact {c['email']} received mail. It was only ever on {c['uname'] or 'a removed account'}'s laptop, so that list was copied out.", c["hit_detail"]))
+    since = iso(now() - timedelta(days=7))
+    for a in con.execute("SELECT d.*, u.name uname FROM data_audit d JOIN users u ON u.id=d.user_id WHERE d.at>=? AND (d.kind IN ('export','open_folder','denied') OR d.n>=?) "
+                         "ORDER BY d.at DESC LIMIT 30", (since, cfg["big_list"])).fetchall():
+        lvl = "bad" if a["kind"] == "denied" else "warn"
+        out.append((lvl, f"{a['uname']}: {a['kind'].replace('_', ' ')} · {a['n']} record(s)", f"{a['detail']} · {a['at'][:16].replace('T', ' ')}"))
+    try:
+        fails = json.loads(_m_get(con, "relay_fails", "{}") or "{}")
+    except Exception:
+        fails = {}
+    tot = {}
+    for day, v in fails.items():
+        for name, n in (v or {}).items():
+            tot[name] = tot.get(name, 0) + int(n or 0)
+    for name, n in sorted(tot.items(), key=lambda x: -x[1]):
+        if n >= 5:
+            out.append(("warn", f"{n} wrong passwords for “{ident_from_relay(name)}” in the last 3 days", "Someone may be guessing. Reset the password if it wasn't them."))
+    try:
+        locked = json.loads(_m_get(con, "relay_locked", "{}") or "{}")
+    except Exception:
+        locked = {}
+    for name, until in locked.items():
+        out.append(("warn", f"“{ident_from_relay(name)}” is locked out until {until[11:16]} UTC", "After 5 wrong passwords sign-in pauses for 15 minutes, then 1 hour, then 6 hours."))
+    for u in con.execute("SELECT * FROM users WHERE status NOT IN ('removed','disabled') AND bot_status IS NOT NULL").fetchall():
+        try:
+            st = json.loads(u["bot_status"] or "{}")
+        except Exception:
+            st = {}
+        if st.get("disk_encrypted") is False:
+            out.append(("warn", f"{u['name']}'s laptop drive is not encrypted (BitLocker off)", "If the laptop is lost or stolen, the BSO data on it can be read. Turn on BitLocker or Device encryption."))
+    for u in con.execute("SELECT * FROM users WHERE wipe LIKE 'pending%' AND status!='removed'").fetchall():
+        out.append(("warn", f"Waiting for {u['name']}'s BSO to erase its data", "This happens at its next check-in."))
+    return out
+
+
+@app.route("/security", methods=["GET", "POST"])
+@need("owner")
+def security_page():
+    con, msg = db(), None
+    if request.method == "POST":
+        f = request.form
+        act = f.get("action")
+        if act == "save":
+            dom = f.get("canary_domain", "").strip().lower().lstrip("@")
+            if dom and not re.match(r"^[a-z0-9-]+(\.[a-z0-9-]+)+$", dom):
+                msg = "The trap domain should look like traps.example.com."
+            else:
+                meta_set("sec_idle_minutes", str(_valid_int(f.get("idle_minutes"), 0, 240)))
+                meta_set("sec_reauth_days", str(_valid_int(f.get("reauth_days"), 1, 90)))
+                meta_set("sec_big_list", str(_valid_int(f.get("big_list"), 50, 100000)))
+                meta_set("sec_export_roles", "owner,manager" + (",member" if f.get("members_export") else ""))
+                meta_set("sec_canary_domain", dom)
+                meta_set("canary_imap_host", f.get("imap_host", "").strip())
+                meta_set("canary_imap_user", f.get("imap_user", "").strip())
+                if f.get("imap_password"):
+                    _secret_store().set("HUB_CANARY_IMAP_PASSWORD", f.get("imap_password"))
+                n = ensure_canaries(con)
+                audit("security_settings", f"idle={f.get('idle_minutes')} reauth={f.get('reauth_days')} canary={dom}")
+                threading.Thread(target=relay_cycle, daemon=True).start()
+                msg = "Saved. Every BSO picks this up at its next check-in." + (f" {n} trap contact(s) planted." if n else "")
+        elif act == "lookup":
+            c = con.execute("SELECT c.*, u.name uname, u.email uemail FROM canaries c LEFT JOIN users u ON u.id=c.user_id WHERE c.email=?",
+                            (f.get("address", "").strip().lower(),)).fetchone()
+            if c:
+                canary_hit(con, c["email"], f.get("note", "").strip() or "reported by hand")
+                msg = f"{c['email']} is a trap contact planted only for {c['uname'] or 'a removed account'} ({c['uemail'] or ''}). Logged as a leak."
+            else:
+                msg = "That address isn't one of our trap contacts."
+        elif act == "check_now":
+            try:
+                msg = f"Checked the trap mailbox: {canary_watch(con)} new hit(s)."
+            except Exception as e:
+                msg = f"Couldn't check the trap mailbox: {e}"
+    cfg = security_cfg(con)
+    rows = con.execute("SELECT d.*, u.name uname FROM data_audit d JOIN users u ON u.id=d.user_id ORDER BY d.at DESC LIMIT 200").fetchall()
+    traps = con.execute("SELECT c.*, u.name uname FROM canaries c LEFT JOIN users u ON u.id=c.user_id ORDER BY c.at DESC LIMIT 200").fetchall()
+    enc = []
+    for u in con.execute("SELECT * FROM users WHERE status NOT IN ('removed') AND role!='owner' ORDER BY name").fetchall():
+        try:
+            st = json.loads(u["bot_status"] or "{}")
+        except Exception:
+            st = {}
+        enc.append({"name": u["name"], "enc": st.get("disk_encrypted"), "lock": st.get("idle_lock"), "seen": u["last_seen"], "wipe": u["wipe"]})
+    return render("security.html", msg=msg, cfg=cfg, alerts=security_alerts(con), rows=rows, traps=traps, enc=enc,
+                  imap_host=meta_get("canary_imap_host", ""), imap_user=meta_get("canary_imap_user", ""), tab="security")
+
+
 @app.route("/settings", methods=["GET", "POST"])
 @need("owner")
 def hub_settings():
@@ -1015,6 +1288,15 @@ def ingest(con, uid, j):
                         (uid, int(d.get("part") or 0), json.dumps({"leads": d.get("leads") or [], "suppress": d.get("suppress") or []}), iso()))
             if d.get("last"):
                 finish_removal(con, uid)
+            continue
+        if isinstance(e, dict) and e.get("type") == "__audit":
+            a = e.get("data") or {}
+            con.execute("INSERT OR IGNORE INTO data_audit(user_id, uid, kind, detail, n, at) VALUES (?,?,?,?,?,?)",
+                        (uid, str(a.get("uid") or "")[:80] or None, str(a.get("kind") or "")[:30], str(a.get("detail") or "")[:300],
+                         int(a.get("n") or 0), str(a.get("at") or iso())[:25]))
+            continue
+        if isinstance(e, dict) and e.get("type") == "__wiped":
+            wiped(con, uid)
             continue
         if isinstance(e, dict) and e.get("type") == "__away":
             con.execute("UPDATE users SET away_until=? WHERE id=?", (str((e.get("data") or {}).get("until") or "")[:10] or None, uid))
@@ -1154,15 +1436,57 @@ def finish_removal(con, uid):
             for i, part in enumerate(parts):           # everyone gets the do-not-contact list
                 con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)",
                             (tid, json.dumps({"action": "leads_in", "from_name": u["name"], "leads": part, "suppress": supp if i == 0 else []})))
-    con.execute("UPDATE users SET status='removed', name=?, username=?, pw_hash=NULL, relay_pw=NULL, tv=COALESCE(tv,1)+1 WHERE id=?",
-                (u["name"] + " (removed)", f"removed-{uid}-{u['username'] or u['email']}", uid))
-    con.execute("UPDATE devices SET revoked=1 WHERE user_id=?", (uid,))
     con.execute("DELETE FROM transfers WHERE user_id=?", (uid,))
-    con.execute("UPDATE users SET email=? WHERE id=?", (f"removed-{uid}-{u['email']}", uid))
     con.execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)",
-                (iso(), "system", "user_removed", f"{u['email']}: {len(leads)} lead(s) shared among {len(senders)} person(s)"))
+                (iso(), "system", "user_work_shared", f"{u['email']}: {len(leads)} lead(s) shared among {len(senders)} person(s)"))
+    if (u["wipe"] or "") == "pending:disconnect":     # erase-and-disconnect: their work is shared, the account stays
+        pass
+    elif u["wipe"] != "done" and has_laptop(con, uid):
+        if not (u["wipe"] or "").startswith("pending"):
+            request_wipe(con, uid, then="remove")      # erase their copy first; removal completes when it confirms
+    else:
+        complete_removal(con, uid)
     con.commit()
     return len(leads)
+
+
+def has_laptop(con, uid):
+    u = con.execute("SELECT last_seen FROM users WHERE id=?", (uid,)).fetchone()
+    return bool(con.execute("SELECT 1 FROM devices WHERE user_id=? AND revoked=0", (uid,)).fetchone() or (u and u["last_seen"]))
+
+
+def request_wipe(con, uid, then="remove"):
+    """Tell the person's BSO to erase its leads, prospects, emails and saved passwords at its next check-in."""
+    con.execute("UPDATE users SET wipe=? WHERE id=?", (f"pending:{then}", uid))
+    con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (uid, json.dumps({"action": "wipe", "then": then})))
+    con.commit()
+
+
+def wiped(con, uid):
+    u = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        return
+    then = (u["wipe"] or "").split(":", 1)[-1]
+    con.execute("UPDATE users SET wipe='done' WHERE id=?", (uid,))
+    con.execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)", (iso(), "system", "laptop_erased", u["email"]))
+    if then == "remove":
+        complete_removal(con, uid)
+    else:                                              # erase-and-disconnect: sign the laptops out
+        con.execute("UPDATE users SET tv=COALESCE(tv,1)+1 WHERE id=?", (uid,))
+        con.execute("UPDATE devices SET revoked=1 WHERE user_id=?", (uid,))
+    con.commit()
+
+
+def complete_removal(con, uid):
+    u = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not u or u["status"] == "removed":
+        return
+    con.execute("UPDATE users SET status='removed', name=?, username=?, email=?, pw_hash=NULL, relay_pw=NULL, totp_secret=NULL, "
+                "tv=COALESCE(tv,1)+1 WHERE id=?",
+                (u["name"] + " (removed)", f"removed-{uid}-{u['username'] or u['email']}", f"removed-{uid}-{u['email']}", uid))
+    con.execute("UPDATE devices SET revoked=1 WHERE user_id=?", (uid,))
+    con.execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)", (iso(), "system", "user_removed", u["email"]))
+    con.commit()
 
 
 def remove_user(con, u, wait_for_leads=True):
@@ -1181,13 +1505,18 @@ def remove_user(con, u, wait_for_leads=True):
                 for h in hs:
                     reassign_prospect(con, h, by_id[oid], u)
                     moved += 1
-    has_laptop = con.execute("SELECT 1 FROM devices WHERE user_id=? AND revoked=0", (u["id"],)).fetchone() or u["last_seen"]
-    if wait_for_leads and u["role"] in ("member", "manager", "bot") and has_laptop:
+    laptop = has_laptop(con, u["id"])
+    if wait_for_leads and u["role"] in ("member", "manager", "bot") and laptop:
         con.execute("UPDATE users SET status='removing' WHERE id=?", (u["id"],))
         con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (u["id"], json.dumps({"action": "transfer_out"})))
         con.commit()
         return moved, True
+    if wait_for_leads and laptop:
+        con.execute("UPDATE users SET status='removing' WHERE id=?", (u["id"],))
+        request_wipe(con, u["id"], then="remove")
+        return moved, True
     finish_removal(con, u["id"])
+    complete_removal(con, u["id"])
     return moved, False
 
 
@@ -1201,7 +1530,19 @@ def supervisor_config(con):
     last = con.execute("SELECT MAX(at) FROM handovers").fetchone()[0] or ""
     ppl = [{"key": relay_key_for(u["username"] or u["email"]), "name": u["name"], "role": u["role"]}
            for u in con.execute("SELECT * FROM users WHERE status NOT IN ('disabled','removed','removing') AND role!='bot' ORDER BY name").fetchall()]
-    return {"action": "config", "local_id": None, "supervisors": sups, "people": ppl, "as_of": last}
+    return {"action": "config", "local_id": None, "supervisors": sups, "people": ppl, "as_of": last, "security": security_cfg(con)}
+
+
+SECURITY_DEFAULTS = {"idle_minutes": 15, "reauth_days": 7, "export_roles": "owner,manager", "big_list": 500, "canary_domain": ""}
+
+
+def security_cfg(con):
+    out = dict(SECURITY_DEFAULTS)
+    for k in out:
+        r = con.execute("SELECT value FROM meta WHERE key=?", (f"sec_{k}",)).fetchone()
+        if r and r["value"] not in (None, ""):
+            out[k] = int(r["value"]) if isinstance(SECURITY_DEFAULTS[k], int) else r["value"]
+    return out
 
 
 def decisions_for(con, uid, handovers=True):
@@ -1241,7 +1582,7 @@ def api_sync():
 # this console publishes users, limits and decisions to it and collects the reports, about once a minute.
 
 RELAY_EVERY = 60
-RELAY_LATEST = 3          # version of relay/Code.gs shipped with this BSO
+RELAY_LATEST = 4          # version of relay/Code.gs shipped with this BSO
 _relay_lock = threading.Lock()
 
 
@@ -1322,6 +1663,9 @@ def relay_cycle(con=None):
                                     "status=CASE WHEN status='invited' THEN 'active' ELSE status END "
                                     "WHERE (username=? OR email=?) AND (last_seen IS NULL OR last_seen<?)",
                                     (at, str(seen.get("version", ""))[:20], name, name, at))
+                    if "failed_signins" in res:
+                        _m_set(con, "relay_fails", json.dumps(res.get("failed_signins") or {})[:20000])
+                        _m_set(con, "relay_locked", json.dumps(res.get("locked") or {})[:20000])
                     con.commit()
                     if not done:
                         break
@@ -1347,8 +1691,21 @@ def relay_cycle(con=None):
 
 
 def _relay_loop():
+    last_watch = 0
     while True:
         time.sleep(RELAY_EVERY)
+        try:
+            con = sqlite3.connect(str(DB_PATH), timeout=30)
+            con.row_factory = sqlite3.Row
+            try:
+                ensure_canaries(con)
+                if time.time() - last_watch > 1800:
+                    last_watch = time.time()
+                    canary_watch(con)
+            finally:
+                con.close()
+        except Exception as e:
+            print("security:", e)
         try:
             relay_cycle()
         except Exception as e:      # never let the background sync die
@@ -1401,8 +1758,8 @@ label{display:block;font-size:12px;color:var(--muted);margin:10px 0 3px}input,se
 BASE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{% block title %}Master console{% endblock %} · BSO</title><style>""" + CSS + """{{ logo_css|safe }}</style></head><body>
 {% if me %}<div class="top">{{ logo(30, tile=True, uid='tp', weight='b', label='BSO')|safe }}<b>BSO Master console</b><small>{{ org }}</small><span class="sp"></span>
-<small>{{ me.name }} · {{ me.role }}</small><form method="post" action="{{ url_for('logout') }}" style="margin:0"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" style="padding:4px 10px">Sign out</button></form></div>
-<div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('users','Users','users'),('approvals','Approvals','approvals'),('board','Prospect board','board'),('handovers','Handovers','handovers_page'),('activity','Activity','activity')] + ([('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
+<small>{{ me.name }} · {{ me.role }}</small><a href="{{ url_for('twofa') }}" style="color:#b9c3c9;font-size:12px">2-step sign-in</a><form method="post" action="{{ url_for('logout') }}" style="margin:0"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" style="padding:4px 10px">Sign out</button></form></div>
+<div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('users','Users','users'),('approvals','Approvals','approvals'),('board','Prospect board','board'),('handovers','Handovers','handovers_page'),('activity','Activity','activity')] + ([('security','Security','security_page'),('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
 <div class="wrap">{% if request.args.get('err') %}<div class="err">{{ request.args.get('err') }}</div>{% endif %}{% if request.args.get('ok') %}<div class="note">{{ request.args.get('ok') }}</div>{% endif %}{% block body %}{% endblock %}</div><script src="/hub.js"></script></body></html>"""
 
 T = {}
@@ -1431,6 +1788,26 @@ T["reset.html"] = """{% extends 'base.html' %}{% block title %}Choose a new pass
 {% else %}<h2 style="margin-top:0">Choose a new password</h2>{% if err %}<div class="err">{{ err }}</div>{% endif %}
 <form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><label>New password (at least 10 characters)</label><input name="password" type="password" autocomplete="new-password" required autofocus>
 <label>Again</label><input name="password2" type="password" autocomplete="new-password" required><p><button class="btn brand">Save password</button></p></form>{% endif %}</div></div>{% endblock %}"""
+T["login_code.html"] = """{% extends 'base.html' %}{% block title %}2-step sign-in{% endblock %}{% block body %}<div class="center card"><div class="card-b">
+<h2 style="margin-top:0">Enter your code</h2><p class="muted">Open your authenticator app and type the 6-digit code for BSO Console, or one of your recovery codes.</p>
+{% if err %}<div class="err">{{ err }}</div>{% endif %}<form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}">
+<input name="code" inputmode="numeric" autocomplete="one-time-code" autofocus required placeholder="123456" style="font-size:22px;letter-spacing:4px"><p><button class="btn brand">Continue</button> <a href="{{ url_for('login') }}" style="margin-left:10px">Cancel</a></p></form></div></div>{% endblock %}"""
+T["twofa.html"] = """{% extends 'base.html' %}{% block title %}2-step sign-in{% endblock %}{% block body %}
+<p><a href="{{ url_for('hub_settings') if me.role == 'owner' else url_for('dashboard') }}">← Back</a></p>
+<div class="card" style="max-width:640px"><div class="card-h"><h2>2-step sign-in</h2>{% if on %}<span class="badge b-ok">on</span>{% else %}<span class="badge b-warn">off</span>{% endif %}</div><div class="card-b">
+{% if msg %}<div class="note">{{ msg }}</div>{% endif %}
+{% if new_codes %}<div class="note"><b>2-step sign-in is on.</b> Save these recovery codes somewhere safe (a password manager or a printout). Each one works once if you lose your phone. They're shown only now.
+<div class="code" style="margin-top:8px">{% for c in new_codes %}{{ c }}<br>{% endfor %}</div></div>
+{% elif on %}<p style="margin-top:0">Signing in asks for your password and then the 6-digit code from your authenticator app.</p>
+<form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="off"><label>To switch it off, enter a current code</label><input name="code" inputmode="numeric" style="max-width:200px"><p><button class="btn danger">Switch off</button></p></form>
+{% elif pending %}<ol style="line-height:1.8;margin-top:0"><li>On your phone, open <b>Google Authenticator</b> or <b>Microsoft Authenticator</b> → <b>+</b> → <b>Enter a setup key</b>.</li>
+<li>Account name: <b>BSO Console</b>. Key: <div class="code" style="margin:6px 0">{{ pending }}</div>Type: time-based. (Some apps can open this link instead: <a href="{{ uri }}">{{ uri[:46] }}…</a>)</li>
+<li>Type the 6-digit code the app now shows:</li></ol>
+<form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="confirm"><input name="code" inputmode="numeric" autocomplete="one-time-code" required style="max-width:200px;font-size:20px;letter-spacing:3px" autofocus>
+<p><button class="btn brand">Confirm and switch on</button></p></form><p class="muted">Nothing changes until the code matches.</p>
+{% else %}<p style="margin-top:0">Protect the console with a code from your phone as well as your password. Anyone who learns your password still can't get in.</p>
+<form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn brand" name="action" value="start">Set up 2-step sign-in</button></form>{% endif %}
+</div></div>{% endblock %}"""
 T["dashboard.html"] = """{% extends 'base.html' %}{% block body %}
 <div class="stats"><div class="stat"><small>Sent (7 days)</small><div>{{ totals.sent }}</div></div><div class="stat"><small>Replies (7 days)</small><div>{{ totals.replies }}</div></div>
 <div class="stat"><small>Interested replies</small><div>{{ totals.interested }}</div></div><div class="stat"><small>Drafts awaiting approval</small><div><a href="{{ url_for('approvals') }}">{{ totals.pending }}</a></div></div>
@@ -1483,6 +1860,9 @@ T["user.html"] = """{% extends 'base.html' %}{% block title %}{{ u.name }}{% end
 </div>
 <label>Private note</label><input name="note" value="{{ u.note or '' }}"><p><button class="btn brand">Save</button></p></form>
 <form method="post" style="display:inline-flex;gap:6px;align-items:center" onsubmit="return confirm('Set a new password? Their laptops are signed out and must sign in again.')"><input type="hidden" name="_csrf" value="{{ csrf }}"><input name="password" placeholder="new password (blank = generate)" autocomplete="off" style="width:240px"><button class="btn" name="action" value="resetpw">Reset password</button></form>
+{% if u.totp_secret %}<form method="post" style="display:inline" onsubmit="return confirm('Switch off this person\\'s 2-step sign-in? They set it up again next time.')"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" name="action" value="reset2fa">Reset 2-step sign-in</button></form>{% endif %}
+<form method="post" style="display:inline" onsubmit="return confirm('At its next check-in this person\\'s BSO hands its leads over (shared equally among the others), then erases its data (leads, prospects, emails, saved passwords) and signs out. The account stays. Continue?')"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn danger" name="action" value="wipe_revoke">Erase laptop and disconnect</button></form>
+{% if u.wipe and u.wipe.startswith('pending') %}<span class="badge b-warn">erase requested: waits for their BSO to check in</span>{% elif u.wipe == 'done' %}<span class="badge b-ok">laptop erased</span>{% endif %}
 <form method="post" style="display:inline" onsubmit="return confirm('Disconnect all of this user\\'s laptops? They must sign in again.')"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn danger" name="action" value="revoke">Disconnect laptops</button></form>
 {% if u.role != 'owner' %}<form method="post" style="display:inline" onsubmit="return confirm('Remove {{ u.name }} from the team? Their sign-in stops now; their prospects and leads are shared equally among the people who remain. This can\'t be undone.')"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn danger" name="action" value="remove">Remove user…</button></form>
 {% if u.status == 'removing' %}<div class="note" style="margin-top:10px">Being removed: waiting for their BSO to check in and hand over its leads. If that laptop won't come back online:
@@ -1538,6 +1918,29 @@ T["activity.html"] = """{% extends 'base.html' %}{% block title %}Activity{% end
 <form method="get" class="card"><div class="card-b grid"><div><label>User</label><select name="user"><option value="">Everyone</option>{% for u in ulist %}<option value="{{ u.id }}" {{ 'selected' if uid == u.id }}>{{ u.name }}</option>{% endfor %}</select></div>
 <div><label>Event</label><select name="type"><option value="">All</option>{% for t in types %}<option {{ 'selected' if typ == t }}>{{ t }}</option>{% endfor %}</select></div><div style="align-self:end"><button class="btn brand">Filter</button></div></div></form>
 <div class="card"><table><tr><th>When</th><th>User</th><th>Event</th><th>Lead</th><th>Inbox</th><th>Detail</th></tr>{% for e in rows %}<tr><td class="muted">{{ e.at|dt }}</td><td>{{ e.uname }}</td><td>{{ e.type }}</td><td>{{ e.lead_email }}{% if e.company %}<br><span class="muted">{{ e.company }}</span>{% endif %}</td><td class="muted">{{ e.sender }}</td><td>{{ e.detail }}</td></tr>{% else %}<tr><td colspan="6" class="muted">No activity yet.</td></tr>{% endfor %}</table></div>{% endblock %}"""
+T["security.html"] = """{% extends 'base.html' %}{% block title %}Security{% endblock %}{% block body %}
+{% if msg %}<div class="note">{{ msg }}</div>{% endif %}
+<div class="card"><div class="card-h"><h2>Alerts</h2><span class="muted">last 7 days</span></div><div class="card-b">
+{% for lvl, head, sub in alerts %}<div class="{{ 'err' if lvl == 'bad' else 'note' }}"><b>{{ head }}</b><br><span class="muted">{{ sub }}</span></div>{% else %}<span class="muted">Nothing needs your attention.</span>{% endfor %}</div></div>
+<div class="card"><div class="card-h"><h2>Rules for every BSO</h2></div><div class="card-b"><form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}">
+<div class="grid"><div><label>Lock BSO after this many idle minutes (0 = never)</label><input name="idle_minutes" type="number" min="0" max="240" value="{{ cfg.idle_minutes }}"></div>
+<div><label>Ask for the password again every N days, even offline</label><input name="reauth_days" type="number" min="1" max="90" value="{{ cfg.reauth_days }}"></div>
+<div><label>Flag anyone who views or exports more than this many records at once</label><input name="big_list" type="number" min="50" value="{{ cfg.big_list }}"></div></div>
+<label style="display:flex;gap:8px;align-items:center;color:inherit"><input type="checkbox" name="members_export" style="width:auto" {{ 'checked' if 'member' in cfg.export_roles }}> Let members export to CSV and open the data folder (owners and managers always can; every export is logged here)</label>
+<h3 style="margin:18px 0 4px;font-size:14px">Trap contacts</h3><p class="muted" style="margin:0">Each sending account gets 2 fake leads on a domain you own. BSO never emails them. If one ever receives mail, that person's list was copied out, and you'll see whose.</p>
+<div class="grid"><div><label>Trap domain (one you control, with a catch-all mailbox)</label><input name="canary_domain" value="{{ cfg.canary_domain }}" placeholder="e.g. mail-desk-co.com"></div>
+<div><label>Catch-all IMAP host (optional, checked every 30 min)</label><input name="imap_host" value="{{ imap_host }}" placeholder="mail.example.com"></div>
+<div><label>IMAP username</label><input name="imap_user" value="{{ imap_user }}"></div><div><label>IMAP password (kept encrypted on this computer)</label><input name="imap_password" type="password" placeholder="{{ 'saved, leave blank to keep' if imap_user else '' }}"></div></div>
+<p><button class="btn brand" name="action" value="save">Save</button> {% if imap_host %}<button class="btn" name="action" value="check_now">Check the trap mailbox now</button>{% endif %}</p></form>
+<form method="post" style="margin-top:8px"><input type="hidden" name="_csrf" value="{{ csrf }}"><div class="grid"><div><label>Got an email address from somewhere suspicious? Check if it's a trap</label><input name="address" placeholder="name@domain"></div><div><label>Where you saw it (optional)</label><input name="note"></div></div><p><button class="btn" name="action" value="lookup">Check</button></p></form></div></div>
+<div class="card"><div class="card-h"><h2>Laptops</h2></div><table><tr><th>Person</th><th>Drive encrypted</th><th>Idle lock</th><th>Last seen</th><th>Erase</th></tr>{% for e in enc %}<tr><td>{{ e.name }}</td>
+<td>{% if e.enc is sameas true %}<span class="badge b-ok">yes</span>{% elif e.enc is sameas false %}<span class="badge b-bad">no</span>{% else %}<span class="muted">not reported yet</span>{% endif %}</td>
+<td>{{ (e.lock ~ ' min') if e.lock else '—' }}</td><td class="muted">{{ e.seen|dt if e.seen else 'never' }}</td><td>{{ 'requested' if e.wipe and e.wipe.startswith('pending') else ('done' if e.wipe == 'done' else '') }}</td></tr>{% endfor %}</table></div>
+<div class="card"><div class="card-h"><h2>Data access log</h2><span class="muted">exports, big lists, searches, reported by each BSO</span></div><table><tr><th>When</th><th>Who</th><th>What</th><th class="r">Records</th><th>Detail</th></tr>
+{% for r in rows %}<tr><td class="muted">{{ r.at|dt }}</td><td>{{ r.uname }}</td><td>{% if r.kind == 'denied' %}<span class="badge b-bad">blocked</span>{% else %}{{ r.kind|replace('_', ' ') }}{% endif %}</td><td class="r">{{ r.n }}</td><td>{{ r.detail }}</td></tr>{% else %}<tr><td colspan="5" class="muted">Nothing yet.</td></tr>{% endfor %}</table></div>
+<div class="card"><div class="card-h"><h2>Trap contacts</h2></div><table><tr><th>Address</th><th>Planted for</th><th>Since</th><th>Status</th></tr>{% for t in traps %}<tr><td>{{ t.email }}</td><td>{{ t.uname or 'removed account' }}</td><td class="muted">{{ t.at|dt }}</td>
+<td>{% if t.hit_at %}<span class="badge b-bad">received mail {{ t.hit_at|dt }}</span> <span class="muted">{{ t.hit_detail }}</span>{% else %}<span class="badge b-ok">quiet</span>{% endif %}</td></tr>{% else %}<tr><td colspan="4" class="muted">Set a trap domain above to plant them.</td></tr>{% endfor %}</table></div>
+{% endblock %}"""
 T["audit.html"] = """{% extends 'base.html' %}{% block title %}Audit log{% endblock %}{% block body %}<div class="card"><div class="card-h"><h2>Who changed what in this console</h2></div><table><tr><th>When</th><th>Who</th><th>Action</th><th>Detail</th></tr>{% for r in rows %}<tr><td class="muted">{{ r.at|dt }}</td><td>{{ r.actor }}</td><td>{{ r.action }}</td><td>{{ r.detail }}</td></tr>{% endfor %}</table></div>{% endblock %}"""
 T["settings.html"] = """{% extends 'base.html' %}{% block title %}Settings{% endblock %}{% block body %}{% if msg %}<div class="note">{{ msg }}</div>{% endif %}
 <div class="card"><div class="card-h"><h2>Team connection through your Google Drive</h2>{% if relay_url and relay_ok and not relay_err %}<span class="badge b-ok">Connected</span>{% elif relay_url %}<span class="badge b-bad">Problem</span>{% else %}<span class="badge b-warn">Not set up</span>{% endif %}</div><div class="card-b">
@@ -1613,11 +2016,19 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8780)
     ap.add_argument("--data", help="folder for the hub database (default: the BSO data folder)")
     ap.add_argument("--owner-email", help="pre-fill the master sign-in email on the setup page (default omar@blacswanken.com)")
+    ap.add_argument("--reset-owner-2fa", action="store_true", help="lost your phone and recovery codes? Switch off the owner's 2-step sign-in from this computer")
     ap.add_argument("--reset-owner-password", action="store_true", help="locked out and email isn't set up? Set a new owner password from this computer")
     a = ap.parse_args(argv)
     d, key = prepare(a.data)
     if a.owner_email:
         _c = sqlite3.connect(str(DB_PATH)); _c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('owner_email',?)", (a.owner_email.strip().lower(),)); _c.commit(); _c.close()
+    if a.reset_owner_2fa:
+        con = sqlite3.connect(str(DB_PATH))
+        con.execute("UPDATE users SET totp_secret=NULL, recovery_codes=NULL WHERE role='owner'")
+        con.execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)", (iso(), "local", "owner 2-step reset from the hub computer", ""))
+        con.commit()
+        print("The owner's 2-step sign-in is off. Sign in with your password and set it up again.")
+        return
     if a.reset_owner_password:
         import getpass
         con = sqlite3.connect(str(DB_PATH))

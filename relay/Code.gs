@@ -6,6 +6,8 @@
  * The master console (BSO Master Console on the master's laptop) publishes the user list, limits and approval
  * decisions here, and collects the reported activity.
  *
+ * Version 4: sign-in hardening: lockouts grow with repeated failures (15 min, 1 h, 6 h), failed sign-ins are
+ *   counted for the master console, and removed or erased laptops are told so.
  * Version 3: comments with @mentions go straight to each person's queue; supervisors can mark themselves away
  *   (skipped in the turns); the master can move a prospect from one supervisor to another.
  * Version 2: each person's items wait in their own queue here, so nobody needs anyone else to be online.
@@ -15,7 +17,7 @@
  */
 var ADMIN_KEY_HASH = '__ADMIN_KEY_HASH__';
 var FOLDER_NAME = 'BSO Team Data';
-var RELAY_VERSION = 3;
+var RELAY_VERSION = 4;
 var MAX_PULL = 150;
 
 function doGet() {
@@ -181,21 +183,45 @@ function seen_(key, version) {
 // ------------------------------------------------------------------ team laptops
 
 function login_(req) {
-  var name = String(req.username || '').trim().toLowerCase();
-  var cache = CacheService.getScriptCache();
+  var name = String(req.username || '').trim().toLowerCase().substr(0, 120);
+  var cache = CacheService.getScriptCache(), p = props_();
+  var lockUntil = Number(p.getProperty('LOCK_' + name) || 0);
+  if (lockUntil > new Date().getTime()) {
+    fail_(429, 'Too many failed attempts. Try again after ' + new Date(lockUntil).toISOString().substr(11, 5) + ' UTC, or ask your manager to reset your password.');
+  }
   var tk = 'fail_' + name;
   var fails = Number(cache.get(tk) || 0);
-  if (fails >= 5) fail_(429, 'Too many failed attempts. Wait 15 minutes and try again.');
   var doc = readDoc_();
   var f = findUser_(doc, name);
   if (!f || !f.u.hash || !same_(passwordHash_(String(req.password || ''), f.u.salt, f.u.iter || 1500), f.u.hash)) {
-    cache.put(tk, String(fails + 1), 900);
+    fails += 1;
+    cache.put(tk, String(fails), 21600);
+    recordFail_(name);
+    if (fails >= 5) {                                     // 5 wrong in a row: 15 min, then 1 h, then 6 h
+      var strikes = Number(p.getProperty('STRIKES_' + name) || 0) + 1;
+      p.setProperty('STRIKES_' + name, String(strikes));
+      var mins = strikes === 1 ? 15 : strikes === 2 ? 60 : 360;
+      p.setProperty('LOCK_' + name, String(new Date().getTime() + mins * 60000));
+      cache.remove(tk);
+    }
     fail_(401, 'ID or password is wrong.');
   }
   if (f.u.status === 'disabled') fail_(403, 'This account is paused. Contact your manager.');
   cache.remove(tk);
+  p.deleteProperty('STRIKES_' + name);
+  p.deleteProperty('LOCK_' + name);
   seen_(f.key, req.version);
   return { token: tokenFor_(f.key, f.u.tv || 1), username: f.key, policy: policy_(doc, f.u) };
+}
+
+function recordFail_(name) {
+  var p = props_(), day = new Date().toISOString().substr(0, 10);
+  var k = 'FAILS_' + day;
+  var v = JSON.parse(p.getProperty(k) || '{}');
+  v[name] = (v[name] || 0) + 1;
+  var keys = Object.keys(v);
+  if (keys.length > 200) { var t = {}; for (var i = 0; i < 200; i++) t[keys[i]] = v[keys[i]]; v = t; }
+  p.setProperty(k, JSON.stringify(v));
 }
 
 function userFromToken_(doc, token) {
@@ -452,7 +478,13 @@ function adminPull_(req) {
       items.push({ id: files[j].getId(), body: JSON.parse(files[j].getBlob().getDataAsString()) });
     } catch (x) { files[j].setTrashed(true); }
   }
-  var all = props_().getProperties(), seen = {};
-  for (var k in all) if (k.indexOf('SEEN_') === 0) seen[k.substr(5)] = JSON.parse(all[k]);
-  return { items: items, more: files.length > items.length, seen: seen, relay_version: RELAY_VERSION };
+  var all = props_().getProperties(), seen = {}, fails = {}, locked = {}, now = new Date().getTime();
+  var cutoff = new Date(now - 3 * 86400000).toISOString().substr(0, 10);
+  for (var k in all) {
+    if (k.indexOf('SEEN_') === 0) seen[k.substr(5)] = JSON.parse(all[k]);
+    else if (k.indexOf('FAILS_') === 0) {
+      if (k.substr(6) < cutoff) props_().deleteProperty(k); else fails[k.substr(6)] = JSON.parse(all[k]);
+    } else if (k.indexOf('LOCK_') === 0 && Number(all[k]) > now) locked[k.substr(5)] = new Date(Number(all[k])).toISOString();
+  }
+  return { items: items, more: files.length > items.length, seen: seen, failed_signins: fails, locked: locked, relay_version: RELAY_VERSION };
 }

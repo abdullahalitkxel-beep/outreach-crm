@@ -89,12 +89,32 @@ LAST_SEEN = None  # last time an app window pinged /heartbeat
 LAST_BYE = None   # last time a window said it was closing (/bye)
 
 
+LAST_ACTIVE = {"t": None}   # last time the person moved the mouse or typed in a BSO window (for the idle lock)
+
+
 @app.post("/heartbeat")
 def heartbeat():
     global LAST_SEEN
     import time as _t
     LAST_SEEN = _t.time()
+    if request.args.get("active") == "1" or LAST_ACTIVE["t"] is None:
+        LAST_ACTIVE["t"] = _t.time()
+    if idle_locked():
+        return jsonify(locked=True)
     return ("", 204)
+
+
+def idle_locked():
+    """Lock BSO (back to the sign-in screen) when nobody has touched it for the time the master set."""
+    import time as _t
+    mins = team.idle_minutes()
+    if not mins or not team.signed_in() or LAST_ACTIVE["t"] is None:
+        return False
+    if _t.time() - LAST_ACTIVE["t"] > mins * 60:
+        team.SIGNED_IN.clear()
+        LAST_ACTIVE["t"] = None
+        return True
+    return False
 
 
 @app.post("/bye")
@@ -156,6 +176,12 @@ def require_terms():
 @app.before_request
 def require_signin():
     """When the admin has made sign-in mandatory, nothing opens until the person signs in with their ID and password."""
+    if request.endpoint and request.endpoint not in OPEN_ENDPOINTS and team.signed_in():
+        import time as _t
+        if idle_locked():
+            return redirect(url_for("signin", next=request.full_path.rstrip("?"), locked=1))
+        if request.method == "POST" or LAST_ACTIVE["t"] is None:
+            LAST_ACTIVE["t"] = _t.time()
     if request.endpoint and request.endpoint not in OPEN_ENDPOINTS and team.required() and not team.signed_in():
         return redirect(url_for("signin", next=request.full_path.rstrip("?")))
 
@@ -357,6 +383,8 @@ def leads():
     direction = "asc" if a.get("dir") == "asc" else "desc"
     sql = "SELECT * FROM leads" + (" WHERE " + " AND ".join(where) if where else "")
     data = [lead_view(r) for r in rows(sql + f" ORDER BY {SORTS[sort]} {direction} LIMIT 500", *params)]
+    if len(data) >= min(team.big_list(), 500):
+        team.record_access(db(), "big_list", "leads list" + (f" search: {a['q']}" if a.get("q") else ""), len(data))
     view = a.get("view", "list")
     cols = {s: [l for l in data if l["stage"] == s] for s in STAGES}
     sources = [r["s"] for r in rows("SELECT DISTINCT json_extract(extra,'$.source') s FROM leads WHERE s IS NOT NULL ORDER BY s")]
@@ -642,8 +670,19 @@ def import_page():
     return render("import.html", result={"added": added, "skipped": skipped})
 
 
+def _denied(what):
+    team.record_access(db(), "denied", what)
+    return Response("<!doctype html><meta charset=utf-8><body style='font:15px system-ui;margin:60px auto;max-width:520px'>"
+                    "<h2>Not allowed</h2><p>Your manager has limited this to managers. Ask them if you need a copy.</p>"
+                    "<p><a href='/'>Back to BSO</a></p>", 403, mimetype="text/html")
+
+
 @app.route("/export.csv")
 def export():
+    if not team.may_export():
+        return _denied("export leads to CSV")
+    n = db().execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+    team.record_access(db(), "export", "leads.csv", n)
     out = io.StringIO()
     w = csv.writer(out)
     w.writerow(["email", "first_name", "last_name", "title", "company", "website", "fit", "stage",
@@ -1434,6 +1473,9 @@ def about():
 
 @app.post("/about/open-data-folder")
 def open_data_folder():
+    if not team.may_export():
+        return _denied("open the data folder")
+    team.record_access(db(), "open_folder", str(DATA))
     if sys.platform == "win32":
         os.startfile(str(DATA))  # noqa
     return redirect(url_for("about"))

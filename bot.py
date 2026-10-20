@@ -610,6 +610,13 @@ def render(template, lead, sender, cfg):
 
 
 def send_email(sender, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None):
+    try:
+        import team as _team
+        blocked = _team.is_trap(to) or (cc and _team.is_trap(cc))
+    except Exception:
+        blocked = False
+    if blocked:
+        raise RuntimeError("This address is on the do-not-contact list.")
     msg = EmailMessage()
     msg["From"] = f'{sender["name"]} <{sender["email"]}>'
     msg["To"] = to

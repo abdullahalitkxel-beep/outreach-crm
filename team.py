@@ -36,7 +36,8 @@ DISCLOSURE = [
     "Your manager can see the label of each reply (for example “interested”). When a prospect replies with interest, a meeting request or a question, they are handed to a lead gen supervisor, who receives the prospect’s details, their reply and the emails you sent them.",
     "If your manager requires approval, they can read, edit and approve or reject your drafts before they send.",
     "Your manager can pause your account, set a daily send cap and a weekly target, and see when this laptop last connected.",
-    "If you leave the team, your manager can have your BSO hand its leads over to your colleagues.",
+    "If you leave the team, your manager can have your BSO hand its leads over to your colleagues and then erase its data from this laptop.",
+    "Your manager sees when you export leads, open the data folder or view a long list, and whether this laptop's drive is encrypted. BSO locks itself after a while without use.",
     "Never shared: your email passwords, API keys, inbox logins, your lead list, your notes, or the text of replies.",
     "Your data stays on this laptop; your manager keeps the activity log already sent. If you stop working with the team, your admin removes your account.",
 ]
@@ -268,6 +269,9 @@ def sign_in(con, username, password, consent=False, hub=None):
             recent = grace == 0 or now_utc() - datetime.fromisoformat(s.get("last_ok")).astimezone(timezone.utc) <= timedelta(hours=grace)
         except Exception:
             recent = False
+        if _verify_offline(s, username, password) and recent and not s.get("revoked") and needs_reauth():
+            raise ValueError(f"It's been more than {int(security().get('reauth_days') or 7)} days since BSO could check your password with the team. "
+                             "Connect to the internet and sign in again.")
         if _verify_offline(s, username, password) and recent and not s.get("revoked"):
             SIGNED_IN.update(user=username, name=(s.get("policy") or {}).get("name", username), offline=True)
             return s.get("policy") or {}
@@ -280,7 +284,7 @@ def sign_in(con, username, password, consent=False, hub=None):
         last = con.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
         s = {"joined_at": iso(now_utc()), "last_event_id": last, "drafts_sent": [], "ack": []}
     s.update(hub=url, username=username, policy=pol, consent=CONSENT_VERSION, last_ok=iso(now_utc()),
-             verifier=_verifier(username, password), required=True)
+             verifier=_verifier(username, password), required=True, last_online_signin=iso(now_utc()))
     s.pop("revoked", None)
     s.pop("no_resume", None)
     save_state(s)
@@ -502,12 +506,167 @@ def _receive_removed(con, d):
         log_event(con, row["id"], "reassigned", d.get("to_name") or "")
 
 
+# ---------------------------------------------------------------- security: trap contacts, access log, erase
+
+def _h(email):
+    return hashlib.sha256(("bso-trap:" + str(email or "").strip().lower()).encode()).hexdigest()[:24]
+
+
+def is_trap(addr):
+    """Trap contacts are planted by the master console to detect copied lists. BSO never emails them."""
+    traps = set(state().get("traps") or [])
+    if not traps:
+        return False
+    for e in re.findall(r"[\w.+'-]+@[\w-]+(?:\.[\w-]+)+", str(addr or "")):
+        if _h(e) in traps:
+            return True
+    return False
+
+
+def _plant(con, d):
+    import bot as _bot
+    s = state()
+    traps = set(s.get("traps") or [])
+    for r in d.get("leads") or []:
+        email = str(r.get("email") or "").lower()
+        if not email:
+            continue
+        traps.add(_h(email))
+        lid = _bot.add_lead(con, dict(r, email=email), "done")       # looks like an old, finished lead; never sent to
+        if lid:
+            con.execute("UPDATE leads SET step=3, created_at=? WHERE id=?", (iso(now_utc() - timedelta(days=20 + secrets.randbelow(40))), lid))
+    s = state()
+    s["traps"] = sorted(traps)
+    save_state(s)
+    con.commit()
+
+
+def _access_table(con):
+    con.execute("CREATE TABLE IF NOT EXISTS access_log (id INTEGER PRIMARY KEY, kind TEXT, detail TEXT, n INTEGER, at TEXT, synced INTEGER DEFAULT 0)")
+
+
+def record_access(con, kind, detail="", n=0):
+    """Exports, opening the data folder, big lists and blocked attempts are reported to the master console."""
+    try:
+        _access_table(con)
+        con.execute("INSERT INTO access_log(kind, detail, n, at) VALUES (?,?,?,?)", (kind, str(detail)[:300], int(n or 0), iso(now_utc())))
+        con.commit()
+    except Exception as e:
+        print("access log:", e)
+
+
+def security():
+    return (state().get("security") or {})
+
+
+def may_export():
+    """Owners and managers may export; members only if the master allows it. Without a team, anyone may."""
+    if not joined():
+        return True
+    role = (policy() or {}).get("role") or "member"
+    roles = str(security().get("export_roles") or "owner,manager").split(",")
+    return role in roles
+
+
+def big_list():
+    return int(security().get("big_list") or 500)
+
+
+def idle_minutes():
+    if is_bot() or not joined():
+        return 0
+    return int(security().get("idle_minutes", 15) or 0)
+
+
+def needs_reauth():
+    """Offline sign-in is allowed for a while; after `reauth_days` the password must be checked by the team again."""
+    days = int(security().get("reauth_days") or 7)
+    s = state()
+    try:
+        last = datetime.fromisoformat(s.get("last_online_signin")).astimezone(timezone.utc)
+    except Exception:
+        return False
+    return now_utc() - last > timedelta(days=days)
+
+
+def disk_encrypted():
+    """True / False when Windows can tell whether the BSO data drive is protected by BitLocker or Device encryption; None if unknown."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import subprocess
+        drive = str(Path(DATA).resolve().drive or "C:")
+        ps = ("$v=(New-Object -ComObject Shell.Application).NameSpace('%s\\').Self.ExtendedProperty('System.Volume.BitLockerProtection');"
+              "Write-Output $v") % drive
+        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=20,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
+        if out in ("1", "3", "5"):      # 1 = on, 3 = on (encrypting), 5 = on (suspended counts as protected at rest)
+            return True
+        if out in ("0", "2", "4", "6"):
+            return False
+    except Exception:
+        pass
+    return None
+
+
+_enc_cache = {}
+
+
+def disk_encrypted_cached():
+    if not _enc_cache or time.time() - _enc_cache.get("t", 0) > 6 * 3600:
+        _enc_cache.update(v=disk_encrypted(), t=time.time())
+    return _enc_cache["v"]
+
+
+def erase_everything(con):
+    """The master removed or disconnected this person: erase leads, prospects, emails, notes and saved passwords."""
+    keep = {"sqlite_sequence"}
+    for (t,) in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+        if t not in keep:
+            con.execute(f'DELETE FROM "{t}"')
+    con.commit()
+    try:
+        con.execute("VACUUM")
+    except Exception:
+        pass
+    try:
+        from secretstore import SecretStore
+        st = SecretStore(DATA)
+        for k in list(st.load()):
+            st.set(k, "")
+    except Exception as e:
+        print("erase secrets:", e)
+    import shutil
+    for sub in ("mail", "mailbox", "attachments", "imports", "exports", "backups", "logs"):
+        shutil.rmtree(Path(DATA) / sub, ignore_errors=True)
+    for f in Path(DATA).glob("*.csv"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    try:
+        import yaml
+        cp = Path(DATA) / "config.yaml"
+        cfg = yaml.safe_load(cp.read_text(encoding="utf-8")) or {}
+        for sv in cfg.get("senders") or []:
+            for k in ("password", "smtp_password", "imap_password"):
+                sv.pop(k, None)
+        cp.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    except Exception:
+        pass
+    hub = state().get("hub", "")
+    save_state({"hub": hub, "revoked": True, "wiped": iso(now_utc())})
+    SIGNED_IN.clear()
+
+
 def _transfer_out(con):
     """I'm being removed from the team: pack up my leads so the console can share them with the others."""
     rows = []
     for l in con.execute("SELECT l.*, c.name cname, (SELECT MAX(at) FROM events e WHERE e.lead_id=l.id AND e.type='sent') last_sent "
                          "FROM leads l LEFT JOIN campaigns c ON c.id=COALESCE(l.campaign_id,1) "
                          "WHERE l.status NOT IN ('unsubscribed','bounced') AND l.handed_from IS NULL ORDER BY l.id"):
+        if is_trap(l["email"]):
+            continue
         x = json.loads(l["extra"] or "{}")
         notes = [r[0][:500] for r in con.execute("SELECT body FROM notes WHERE lead_id=? ORDER BY at DESC LIMIT 3", (l["id"],))]
         rows.append({"email": l["email"], "first_name": l["first_name"], "company": l["company"], "website": l["website"], "extra": x,
@@ -564,7 +723,31 @@ def _apply_decisions(con, decisions):
             s["supervisors"] = d.get("supervisors") or []
             s["people"] = d.get("people") or s.get("people") or []
             s["sup_as_of"] = d.get("as_of", "")
+            if isinstance(d.get("security"), dict):
+                s["security"] = d["security"]
             save_state(s)
+            continue
+        if action in ("wipe", "canary"):
+            hid = d.get("handover_id")
+            if hid not in state().get("ho_seen", []):
+                s2 = state()
+                if action == "wipe":
+                    s2["wipe_then"] = d.get("then") or "remove"
+                    save_state(s2)
+                    if not s2.get("transfer_queue") and not s2.get("transfer_done"):
+                        _transfer_out(con)          # hand the work over before erasing
+                    con.execute("UPDATE leads SET status='paused' WHERE status='active'")
+                    try:
+                        con.execute("UPDATE outbox SET status='cancelled' WHERE status IN ('pending','approved')")
+                    except Exception:
+                        pass
+                else:
+                    _plant(con, d)
+                s2 = state()
+                s2["ho_seen"] = (s2.get("ho_seen", []) + [hid])[-1000:]
+                save_state(s2)
+            if hid:
+                ho_done.append(hid)
             continue
         if action == "transfer_out":
             if not state().get("transfer_queue") and not state().get("transfer_done"):
@@ -650,7 +833,8 @@ def status(con):
             "autorun": bool(ar.get("enabled")), "every_minutes": int(ar.get("every_minutes") or 0),
             "test_mode": bool((cfg.get("test_mode") or {}).get("enabled")), "review": bool((cfg.get("review") or {}).get("enabled")),
             "paused_inboxes": sorted(paused), "inboxes": len([sv for sv in cfg.get("senders") or [] if sv.get("email") and "example" not in sv["email"]]),
-            "campaigns": [dict(r) for r in con.execute("SELECT id, name, status FROM campaigns ORDER BY id")]}
+            "campaigns": [dict(r) for r in con.execute("SELECT id, name, status FROM campaigns ORDER BY id")],
+            "disk_encrypted": disk_encrypted_cached(), "idle_lock": idle_minutes()}
 
 
 def sync(con, version=""):
@@ -690,17 +874,28 @@ def _sync(con, version=""):
         packed += [{"id": f"t{t['part']}", "type": "__transfer", "data": t} for t in tq]
         if s.get("away_pending"):
             packed.append({"id": "away", "type": "__away", "data": {"until": s.get("away_until", "")}})
+        _access_table(con)
+        acc = con.execute("SELECT * FROM access_log WHERE synced=0 ORDER BY id LIMIT 50").fetchall()
+        dev = s.get("device_tag") or secrets.token_hex(4)
+        if not s.get("device_tag"):
+            s["device_tag"] = dev
+            save_state(s)
+        packed += [{"id": f"a{a['id']}", "type": "__audit", "data": {"uid": f"{dev}-{a['id']}", "kind": a["kind"], "detail": a["detail"], "n": a["n"], "at": a["at"]}}
+                   for a in acc]
+        wiping = bool(s.get("wipe_then")) and not s.get("transfer_queue")
+        if wiping:
+            packed.append({"id": "w", "type": "__wiped", "data": {"at": iso(now_utc())}})
         acked = list(s.get("ack", [])) + [f"ho:{x}" for x in s.get("ho_ack", []) if x is not None]
-        status, j = _post(s["hub"], "/api/v1/sync", {"events": packed, "drafts": drafts, "acked": acked, "version": version},
-                          token=env(TOKEN_KEY))
+        code, j = _post(s["hub"], "/api/v1/sync", {"events": packed, "drafts": drafts, "acked": acked, "version": version},
+                        token=env(TOKEN_KEY))
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         return False, f"Can't reach the hub ({getattr(e, 'reason', e)})."
-    if status == 401:
+    if code == 401:
         s["revoked"] = True
         save_state(s)
         return False, "Your manager disconnected this laptop. Ask for a new invite."
-    if status != 200:
-        return False, f"The hub returned an error ({status})."
+    if code != 200:
+        return False, f"The hub returned an error ({code})."
     s = state() or s
     s.pop("revoked", None)
     if events:
@@ -715,6 +910,12 @@ def _sync(con, version=""):
         con.execute(f"UPDATE comments SET synced=1 WHERE id IN ({','.join('?' * len(cms))})", [c["id"] for c in cms])
         con.commit()
     s.pop("away_pending", None)
+    if acc:
+        con.execute(f"UPDATE access_log SET synced=1 WHERE id IN ({','.join('?' * len(acc))})", [a["id"] for a in acc])
+        con.commit()
+    if wiping:
+        erase_everything(con)
+        return True, "This BSO was erased by your manager."
     if tq:
         rest = (s.get("transfer_queue") or [])[len(tq):]
         s["transfer_queue"] = rest

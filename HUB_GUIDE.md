@@ -122,7 +122,21 @@ These need the Google script version 3: the console shows the update steps (copy
 
 If a laptop can't reach the hub for the grace period (default 72 hours, adjustable in Settings), it pauses sending.
 
-## 5. Security notes
+## 5. Security page (owner)
+
+Master Console → **Security**. Everything here reaches every BSO at its next check-in.
+
+- **2-step sign-in** (top bar → *2-step sign-in*): set it up first, then it switches on. Click *Set up*, add the key to Google or Microsoft Authenticator, type the 6-digit code, and save the 8 recovery codes it shows (each works once). From then on the console asks for your password and a code. Lost your phone and your codes? On the console computer run `"BSO Master Console.exe" --reset-owner-2fa`.
+- **Idle lock**: BSO goes back to the sign-in screen after this many minutes without use (default 15; the BSO Bot account is never locked).
+- **Re-check every N days**: when the internet is down a person can still sign in on their own laptop, but only for this many days since their last online sign-in (default 7).
+- **Exports**: only owners and managers can export leads to CSV or open the data folder. Members get a "not allowed" screen, and the attempt is logged. Every export, every opened data folder and every list bigger than the "big list" number shows in the **Data access log**, with an alert for the last 7 days.
+- **Trap contacts**: enter a domain you own that has a catch-all mailbox (a cheap spare domain is ideal). The console gives every sending account 2 fake leads at that domain, different for each person. They look like old finished leads; BSO will never email them. If one ever receives mail, that person's list was copied out, and the alert names whose. Add the catch-all mailbox's IMAP details to have it checked every 30 minutes, or paste a suspicious address into *Check* by hand.
+- **Laptops**: shows whether each laptop's drive is encrypted (BitLocker or Device encryption). An unencrypted drive is an alert: if that laptop is stolen, its BSO data can be read.
+- **Sign-in guessing**: 5 wrong passwords lock that ID for 15 minutes, then 1 hour, then 6 hours. Repeated failures and current lockouts show as alerts. (Needs the version 4 Google script: Settings shows a button to update it.)
+
+**Erasing a laptop.** Removing a person now also erases their copy: at its next check-in their BSO hands over its leads (shared equally among the others), erases its leads, prospects, emails, notes and saved passwords, confirms, and only then is the account removed. *Erase laptop and disconnect* on a user's page does the same but keeps the account (for a lost laptop or a role change). *Remove now* skips the wait if the laptop is never coming back online.
+
+## 6. Security notes
 
 Passwords and device tokens are stored hashed (the hub never keeps a readable password); sign-in and invite attempts are rate-limited; forms are CSRF-protected; sessions expire after 12 hours. The hub never receives anyone's inbox passwords, API keys, lead lists or reply text. Tell your team before you switch this on: the Privacy Policy section 7 covers it, but your own employment rules may add duties.
 

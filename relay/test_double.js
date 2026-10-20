@@ -29,6 +29,7 @@ const PropertiesService = {
   getScriptProperties: () => ({
     getProperty: (k) => (k in props ? props[k] : null),
     setProperty: (k, v) => { props[k] = String(v); },
+    deleteProperty: (k) => { delete props[k]; },
     getProperties: () => ({ ...props }),
   }),
 };
@@ -78,7 +79,7 @@ const ContentService = {
 };
 
 const code = fs.readFileSync(path.join(__dirname, 'Code.gs'), 'utf8').replace('__ADMIN_KEY_HASH__', adminHash);
-const ctx = vm.createContext({ Utilities, PropertiesService, CacheService, LockService, DriveApp, ContentService, JSON, Date, Math, Number, String, Error, parseInt });
+const ctx = vm.createContext({ Utilities, PropertiesService, CacheService, LockService, DriveApp, ContentService, JSON, Date, Math, Number, String, Error, parseInt, Object });
 vm.runInContext(code, ctx, { filename: 'Code.gs' });
 
 const pending = {};

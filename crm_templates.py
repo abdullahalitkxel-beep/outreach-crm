@@ -203,7 +203,8 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
 <button class="btn sm" id="tour-skip">Skip</button><button class="btn sm" id="tour-back">Back</button><button class="btn brand sm" id="tour-next">Next</button></div></div></div>
 <script>
 // ---- tell the app this window is open; it quits about a minute after the last window is closed (unless auto-run is on)
-function beat(){ try{ fetch('/heartbeat',{method:'POST',keepalive:true}); }catch(e){} }
+var _act=Date.now();['mousemove','keydown','mousedown','wheel','touchstart'].forEach(function(e){document.addEventListener(e,function(){_act=Date.now();},{passive:true});});
+function beat(){ try{ fetch('/heartbeat'+(Date.now()-_act<15000?'?active=1':''),{method:'POST',keepalive:true}).then(function(r){ if(r.status===200) return r.json(); }).then(function(j){ if(j&&j.locked) location.href='/signin?locked=1&next='+encodeURIComponent(location.pathname+location.search); }).catch(function(){}); }catch(e){} }
 beat(); setInterval(beat, 10000);
 document.addEventListener('visibilitychange', function(){ if(!document.hidden) beat(); });
 window.addEventListener('focus', beat);
@@ -1094,7 +1095,7 @@ details{margin-top:14px;font-size:13px;color:#3e3e3c}summary{cursor:pointer;colo
 </style></head><body>
 <div class="box">
  <div class="hd">{{ logo(72, tile=True, uid="si", animated=True, label="BSO")|safe }}<h1>BlacSwanken Outreach</h1><span>Sign in with the ID and password from your admin</span></div>
- {% if err %}<div class="err">{{ err }}</div>{% endif %}
+ {% if err %}<div class="err">{{ err }}</div>{% elif request.args.get('locked') %}<div class="err" style="background:#fff8e6;border-color:#f0d27a;color:#704100">BSO locked itself after a while without use. Sign in again to carry on.</div>{% endif %}
  <form method="post" action="{{ url_for('signin') }}"><input type="hidden" name="next" value="{{ nxt }}">
   <label for="u">ID</label><input id="u" type="text" name="username" value="{{ last_user }}" autocomplete="username" autocapitalize="none" spellcheck="false" required {{ '' if last_user else 'autofocus' }}>
   <label for="p">Password</label><input id="p" type="password" name="password" autocomplete="current-password" required {{ 'autofocus' if last_user else '' }}>

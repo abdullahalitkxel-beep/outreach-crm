@@ -17,7 +17,8 @@ if len(sys.argv) > 1 and sys.argv[1] == "--laptop":
     import bot, team, crm  # noqa: E401
     team.built_in_hub = lambda: URL
     con = bot.db_connect("outreach.db")
-    team.sign_in(con, user, pw, consent=True)
+    if task != "wipe":                 # a laptop already signed in keeps checking in in the background
+        team.sign_in(con, user, pw, consent=True)
     team.sync(con)
     crm.write_settings({"legal_acceptance": {"version": str(crm.cfg().get("legal", {}).get("version", "1.0"))}})
     w = crm.app.test_client()
@@ -25,6 +26,12 @@ if len(sys.argv) > 1 and sys.argv[1] == "--laptop":
         w.post("/settings/away", data={"away": "on", "until": arg})
         time.sleep(1)
         team.sync(con)
+    elif task == "wipe":
+        for _ in range(3):
+            team.sync(con)
+        n_left = con.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+        print("RESULT " + json.dumps({"leads_left": n_left, "joined": team.joined(), "secrets": sorted(team.SECRETS.load())}))
+        sys.exit(0)
     elif task == "comment":
         lid = con.execute("SELECT id FROM leads WHERE email=?", (arg,)).fetchone()[0]
         w.post("/comments/add", data={"lead_id": lid, "text": "@Omar they asked for 20% off, is that OK?", "back": "/"})
@@ -65,7 +72,8 @@ def check(cond, what):
         sys.exit(1)
     n += 1
 def laptop(home, user, pw, task="check", arg=""):
-    r = subprocess.run([sys.executable, __file__, "--laptop", str(tmp / home), user, pw, task, arg], capture_output=True, text=True, timeout=180)
+    envc = {k: v for k, v in os.environ.items() if k != "BSO_TEAM_TOKEN"}      # each laptop has its own saved sign-in
+    r = subprocess.run([sys.executable, __file__, "--laptop", str(tmp / home), user, pw, task, arg], capture_output=True, text=True, timeout=180, env=envc)
     line = next((l for l in r.stdout.splitlines() if l.startswith("RESULT ")), None)
     if not line:
         print(r.stdout[-1500:], r.stderr[-3000:])
@@ -93,7 +101,7 @@ try:
     c.post("/settings", data={"_csrf": tok("/settings"), "action": "relay_url", "relay_url": URL})
     check(hub.relay_v3(hub.sqlite3.connect(str(hub.DB_PATH))) is True or True, "console connected")
     hcon = hub.sqlite3.connect(str(hub.DB_PATH)); hcon.row_factory = hub.sqlite3.Row
-    check(hub._m_get(hcon, "relay_version") == "3", "console detects the Google script is version 3")
+    check(hub._m_get(hcon, "relay_version") == str(hub.RELAY_LATEST), "console detects the Google script is the latest version")
 
     team.built_in_hub = lambda: URL
     con = bot.db_connect("outreach.db")
@@ -174,7 +182,12 @@ try:
     moved_to = [r_[0] for r_ in hcon.execute("SELECT supervisor_id FROM handovers")]
     check(open_before == 3 and moved_to.count(nora_id) == 3 and "shared equally" in r.get_data(as_text=True),
           "removing a supervisor shares their open prospects with the others (not with Ali, who is away)")
-    check(hcon.execute("SELECT status FROM users WHERE id=?", (sara["id"],)).fetchone()[0] == "removed", "the supervisor's account is removed")
+    check(hcon.execute("SELECT status FROM users WHERE id=?", (sara["id"],)).fetchone()[0] == "removing", "the supervisor's account waits for her laptop to erase its copy")
+    hub.relay_cycle()
+    sw = laptop("sara", "sara", "sara-pass-1234", "wipe")
+    check(sw["leads_left"] == 0 and not sw["joined"] and not sw["secrets"], "her BSO erases its leads, prospects and saved passwords")
+    hub.relay_cycle()
+    check(hcon.execute("SELECT status FROM users WHERE id=?", (sara["id"],)).fetchone()[0] == "removed", "then the supervisor's account is removed")
     try:
         team.leave(); team.sign_in(con, "sara", "sara-pass-1234")
         check(False, "a removed person can't sign in")
@@ -197,6 +210,10 @@ try:
     team.sync(con)                                      # gets the instruction, stops sending, packs up
     check(not team.policy().get("enabled") and not con.execute("SELECT 1 FROM leads WHERE status='active'").fetchone(), "his BSO stops sending at once")
     team.sync(con)                                      # uploads its leads
+    hub.relay_cycle()
+    check(hcon.execute("SELECT wipe FROM users WHERE id=?", (cole["id"],)).fetchone()[0] == "pending:remove", "with his leads in, the console asks his BSO to erase itself")
+    team.sync(con); team.sync(con)                      # erases, and confirms
+    check(con.execute("SELECT COUNT(*) FROM leads").fetchone()[0] == 0, "his BSO is erased")
     hub.relay_cycle()
     check(hcon.execute("SELECT status FROM users WHERE id=?", (cole["id"],)).fetchone()[0] == "removed", "once the leads are in, the account is removed")
     d1, e1 = laptop("dan", "dan", "dan-pass-1234"), None

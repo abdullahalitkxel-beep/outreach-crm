@@ -94,7 +94,7 @@ try:
     check(any(f["name"] == "BSO Team Data" for f in files) and any(f["name"].startswith("ayesha_") for f in files),
           "report stored in the master's Drive folder")
     ok, msg = hub.relay_cycle()
-    check(ok and "1 report" in msg, "master console collects it: " + msg)
+    check(ok and re.search(r"[12] reports? collected", msg), "master console collects it: " + msg)
     act = c.get("/activity").get_data(as_text=True)
     check("l1@acme.com" in act and "interested" in act, "activity visible in the console")
     check("Online" in c.get("/").get_data(as_text=True), "laptop shows as online")
