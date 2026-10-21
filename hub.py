@@ -2102,6 +2102,7 @@ CSS = """
 :root{--bg:#f3f3f3;--card:#fff;--ink:#181818;--muted:#5c5c5c;--line:#dddbda;--brand:#0176d3;--ok:#2e844a;--warn:#dd7a01;--bad:#ba0517}
 *{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui,'Segoe UI',sans-serif;background:var(--bg);color:var(--ink)}
 a{color:var(--brand);text-decoration:none}a:hover{text-decoration:underline}
+.pgbtn{display:flex;align-items:center;gap:6px;max-width:240px;padding:5px 12px;border:1px solid var(--line);border-radius:16px;background:#fff;color:var(--ink);text-decoration:none;font-size:13px;white-space:nowrap}.pgbtn span{overflow:hidden;text-overflow:ellipsis}.pgbtn:hover{background:#f3f3f3}
 .top{background:#1B1F24;color:#fff;display:flex;align-items:center;gap:14px;padding:10px 20px}.top b{font-size:16px}.top .sp{flex:1}.top small{color:#b9c3c9}
 .nav{background:#fff;border-bottom:1px solid var(--line);padding:0 20px;display:flex;gap:4px;overflow-x:auto}.nav a{padding:12px 14px;color:var(--ink);border-bottom:3px solid transparent;white-space:nowrap}
 .nav a.on{border-color:var(--brand);font-weight:600}.wrap{max-width:1200px;margin:20px auto;padding:0 16px}
@@ -2123,19 +2124,20 @@ BASE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name=
 {% if me %}<div class="top">{{ logo(30, tile=True, uid='tp', weight='b', label='BSO')|safe }}<b>BSO Master console</b><small>{{ org }}</small><span class="sp"></span>
 <small>{{ me.name }} · {{ me.role }}</small><a href="{{ url_for('twofa') }}" style="color:#b9c3c9;font-size:12px">2-step sign-in</a><form method="post" action="{{ url_for('logout') }}" style="margin:0"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" style="padding:4px 10px">Sign out</button></form></div>
 <div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('users','Users','users'),('approvals','Approvals','approvals'),('board','Prospect board','board'),('handovers','Handovers','handovers_page'),('activity','Activity','activity')] + ([('bso_setup','BSO setup','bso_setup'),('security','Security','security_page'),('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
-<div class="wrap">{% if me %}<div style="display:flex;align-items:center;margin:0 0 12px"><a id="backname" href="#" style="display:none;align-items:center;gap:6px;padding:5px 12px;border:1px solid var(--line);border-radius:16px;background:#fff;color:var(--ink);font-size:13px;white-space:nowrap;max-width:260px;text-decoration:none"><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg><span style="overflow:hidden;text-overflow:ellipsis"></span></a><span style="flex:1"></span>
-<button type="button" class="btn" title="Back" aria-label="Back" style="padding:6px 9px;border-radius:50%;display:flex;align-items:center" onclick="history.length>1?history.back():location.href='/'"><svg width="16" height="16" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg></button></div>{% endif %}{% if request.args.get('err') %}<div class="err">{{ request.args.get('err') }}</div>{% endif %}{% if request.args.get('ok') %}<div class="note">{{ request.args.get('ok') }}</div>{% endif %}{% block body %}{% endblock %}</div><script src="/hub.js"></script><script>(function(){ /* left 'back to <page>' link: remembers the pages opened in this window */
- var name=(document.title||'').split(' · ')[0].trim()||'Back', here=location.pathname+location.search, st=[];
- try{ st=JSON.parse(sessionStorage.getItem('bso_trail')||'[]'); }catch(e){}
- if(st.length && st[st.length-1].u===here){ st[st.length-1].n=name; }
- else if(st.length>1 && st[st.length-2].u===here){ st.pop(); }
- else { st.push({u:here,n:name}); if(st.length>30) st=st.slice(-30); }
- try{ sessionStorage.setItem('bso_trail', JSON.stringify(st)); }catch(e){}
- var a=document.getElementById('backname'); if(!a) return;
- var prev=st.length>1?st[st.length-2]:null;
- if(!prev){ a.style.display='none'; return; } a.style.display='flex';
- a.querySelector('span').textContent=prev.n; a.title='Back to '+prev.n; a.href=prev.u;
- a.addEventListener('click',function(e){ e.preventDefault(); if(history.length>1) history.back(); else location.href=prev.u; });
+<div class="wrap">{% if me %}<nav class="pgnav" style="display:flex;align-items:center;gap:8px;margin:0 0 12px;min-height:32px" aria-label="Page history"><a id="nav-back" class="pgbtn" href="#" title="Back (Alt + Left arrow)" style="display:none"><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg><span></span></a><a id="nav-fwd" class="pgbtn" href="#" title="Forward (Alt + Right arrow)" style="display:none"><span></span><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M4 11h12.2l-5.6-5.6L12 4l8 8-8 8-1.4-1.4 5.6-5.6H4z"/></svg></a></nav>{% endif %}{% if request.args.get('err') %}<div class="err">{{ request.args.get('err') }}</div>{% endif %}{% if request.args.get('ok') %}<div class="note">{{ request.args.get('ok') }}</div>{% endif %}{% block body %}{% endblock %}</div><script src="/hub.js"></script><script>(function(){ /* back / forward through the pages opened in this window, each labelled with the page's name */
+ var name=(document.title||'').split(' · ')[0].trim()||'Page', here=location.pathname+location.search, t={l:[],i:-1};
+ try{ t=JSON.parse(sessionStorage.getItem('bso_hist')||'') || t; }catch(e){}
+ var l=t.l, i=t.i;
+ if(i>=0 && l[i] && l[i].u===here){ }
+ else if(i>0 && l[i-1].u===here){ i--; }
+ else if(l[i+1] && l[i+1].u===here){ i++; }
+ else { l=l.slice(0,i+1); l.push({u:here,n:name}); if(l.length>40){ l=l.slice(-40); } i=l.length-1; }
+ l[i].n=name;
+ try{ sessionStorage.setItem('bso_hist', JSON.stringify({l:l,i:i})); }catch(e){}
+ function set(id, it, go){ var a=document.getElementById(id); if(!a) return; if(!it){ a.style.display='none'; return; }
+  a.style.display='flex'; a.querySelector('span').textContent=it.n; a.title=(go<0?'Back to ':'Forward to ')+it.n; a.href=it.u;
+  a.addEventListener('click',function(e){ e.preventDefault(); history.go(go); setTimeout(function(){ if(location.pathname+location.search===here) location.href=it.u; },400); }); }
+ set('nav-back', i>0?l[i-1]:null, -1); set('nav-fwd', l[i+1]||null, 1);
 })();</script></body></html>"""
 
 T = {}

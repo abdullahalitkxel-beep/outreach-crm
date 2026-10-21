@@ -24,9 +24,7 @@ h1,h2,h3{margin:0;font-weight:700}
 .gsearch input{width:100%;height:32px;border:1px solid #c9c9c9;border-radius:var(--r);padding:0 10px 0 32px;font:inherit;background:#fff}
 .gsearch svg{position:absolute;left:10px;top:9px;fill:var(--muted)}
 .gh .tools{display:flex;gap:6px;align-items:center}
-.backname{display:flex;align-items:center;gap:6px;max-width:260px;padding:5px 12px;border:1px solid var(--line);border-radius:16px;background:#fff;color:inherit;text-decoration:none;font-size:13px;white-space:nowrap;flex:none}.backname span{overflow:hidden;text-overflow:ellipsis}.backname:hover{background:#f3f3f3}
-.backbar{display:flex;align-items:center;gap:8px;margin:0 0 10px}
-.backbtn{width:32px;height:32px;border-radius:50%;border:1px solid var(--line);background:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;color:inherit;font:inherit;padding:0}.backbtn:hover{background:#f3f3f3}.backbtn svg{fill:currentColor}.backbtn[disabled]{opacity:.35;cursor:default}
+.pgnav{display:flex;align-items:center;gap:8px;margin:0 0 10px;min-height:32px}.pgbtn{display:flex;align-items:center;gap:6px;max-width:240px;padding:5px 12px;border:1px solid var(--line);border-radius:16px;background:#fff;color:inherit;text-decoration:none;font-size:13px;white-space:nowrap}.pgbtn span{overflow:hidden;text-overflow:ellipsis}.pgbtn:hover{background:#f3f3f3}
 .iconbtn{width:32px;height:32px;border-radius:50%;border:1px solid var(--line);background:#fff;display:grid;place-items:center;cursor:pointer;color:var(--muted);font-weight:700;position:relative}
 .menu{position:absolute;right:0;top:38px;background:#fff;border:1px solid var(--line);border-radius:var(--r);box-shadow:0 2px 8px rgba(0,0,0,.16);min-width:220px;z-index:30;display:none;text-align:left}
 .menu a,.menu button{display:block;width:100%;padding:9px 14px;color:var(--ink);background:none;border:0;font:inherit;text-align:left;cursor:pointer}
@@ -199,8 +197,7 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
  {% endfor %}
 </nav>{% endif %}
 <main>
-{% if request.endpoint not in ('welcome', 'signin') %}<div class="backbar"><a id="backname" class="backname" href="#" style="display:none"><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg><span></span></a><span style="flex:1"></span>
-<button type="button" class="backbtn" id="backbtn" title="Back (Alt + Left arrow)" aria-label="Back" onclick="goBack()"><svg width="16" height="16" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg></button></div>{% endif %}
+{% if request.endpoint not in ('welcome', 'signin') %}<nav class="pgnav" aria-label="Page history"><a id="nav-back" class="pgbtn" href="#" title="Back (Alt + Left arrow)" style="display:none"><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg><span></span></a><a id="nav-fwd" class="pgbtn" href="#" title="Forward (Alt + Right arrow)" style="display:none"><span></span><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M4 11h12.2l-5.6-5.6L12 4l8 8-8 8-1.4-1.4 5.6-5.6H4z"/></svg></a></nav>{% endif %}
 {% if request.args.get('msg') %}<div class="toast {{ 'err' if request.args.get('err') }}">{{ request.args.get('msg') }}</div>{% endif %}
 {% block body %}{% endblock %}
 </main>
@@ -209,22 +206,21 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
 <script>
 // ---- tell the app this window is open; it quits about a minute after the last window is closed (unless auto-run is on)
 var _act=Date.now();['mousemove','keydown','mousedown','wheel','touchstart'].forEach(function(e){document.addEventListener(e,function(){_act=Date.now();},{passive:true});});
-(function(){ /* left 'back to <page>' link: remembers the pages opened in this window */
- var name=(document.title||'').split(' · ')[0].trim()||'Back', here=location.pathname+location.search, st=[];
- try{ st=JSON.parse(sessionStorage.getItem('bso_trail')||'[]'); }catch(e){}
- if(st.length && st[st.length-1].u===here){ st[st.length-1].n=name; }
- else if(st.length>1 && st[st.length-2].u===here){ st.pop(); }
- else { st.push({u:here,n:name}); if(st.length>30) st=st.slice(-30); }
- try{ sessionStorage.setItem('bso_trail', JSON.stringify(st)); }catch(e){}
- var a=document.getElementById('backname'); if(!a) return;
- var prev=st.length>1?st[st.length-2]:null;
- if(!prev){ a.style.display='none'; return; } a.style.display='flex';
- a.querySelector('span').textContent=prev.n; a.title='Back to '+prev.n; a.href=prev.u;
- a.addEventListener('click',function(e){ e.preventDefault(); if(history.length>1) history.back(); else location.href=prev.u; });
+(function(){ /* back / forward through the pages opened in this window, each labelled with the page's name */
+ var name=(document.title||'').split(' · ')[0].trim()||'Page', here=location.pathname+location.search, t={l:[],i:-1};
+ try{ t=JSON.parse(sessionStorage.getItem('bso_hist')||'') || t; }catch(e){}
+ var l=t.l, i=t.i;
+ if(i>=0 && l[i] && l[i].u===here){ }
+ else if(i>0 && l[i-1].u===here){ i--; }
+ else if(l[i+1] && l[i+1].u===here){ i++; }
+ else { l=l.slice(0,i+1); l.push({u:here,n:name}); if(l.length>40){ l=l.slice(-40); } i=l.length-1; }
+ l[i].n=name;
+ try{ sessionStorage.setItem('bso_hist', JSON.stringify({l:l,i:i})); }catch(e){}
+ function set(id, it, go){ var a=document.getElementById(id); if(!a) return; if(!it){ a.style.display='none'; return; }
+  a.style.display='flex'; a.querySelector('span').textContent=it.n; a.title=(go<0?'Back to ':'Forward to ')+it.n; a.href=it.u;
+  a.addEventListener('click',function(e){ e.preventDefault(); history.go(go); setTimeout(function(){ if(location.pathname+location.search===here) location.href=it.u; },400); }); }
+ set('nav-back', i>0?l[i-1]:null, -1); set('nav-fwd', l[i+1]||null, 1);
 })();
-// ---- one step back (the app window has no browser toolbar)
-function goBack(){ if(history.length>1){ history.back(); } else { location.href='/'; } }
-(function(){ var t=[]; try{ t=JSON.parse(sessionStorage.getItem('bso_trail')||'[]'); }catch(e){} var b=document.getElementById('backbtn'); if(b && t.length<2 && history.length<=1) b.style.visibility='hidden'; })();
 function beat(){ try{ fetch('/heartbeat'+(Date.now()-_act<15000?'?active=1':''),{method:'POST',keepalive:true}).then(function(r){ if(r.status===200) return r.json(); }).then(function(j){ if(j&&j.locked) location.href='/signin?locked=1&next='+encodeURIComponent(location.pathname+location.search); }).catch(function(){}); }catch(e){} }
 beat(); setInterval(beat, 10000);
 document.addEventListener('visibilitychange', function(){ if(!document.hidden) beat(); });
