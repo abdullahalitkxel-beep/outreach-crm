@@ -144,8 +144,8 @@ try:
     check(line is not None, "supervisor laptop ran" + ("" if line else ": " + r.stdout[-800:] + r.stderr[-1500:]))
     res = json.loads(line[7:])
     p = {x["email"]: x for x in res["prospects"]}
-    check(set(p) == {"sarah@acme.com", "kim@umbrella.com"} and p["sarah@acme.com"]["handed_from"] == "Cole Reed" and p["sarah@acme.com"]["status"] == "replied",
-          "Ali's prospects appear in his BSO, handed over by Cole Reed (Tom went to Sara)")
+    check(set(p) == {"sarah@acme.com"} and p["sarah@acme.com"]["handed_from"] == "Cole Reed" and p["sarah@acme.com"]["status"] == "replied",
+          "Ali's prospects appear in his BSO, handed over by Cole Reed (Tom went to Sara; the test-mode one stays on the sender's computer)")
     check(sum("Sounds interesting. Can we set up" in x for x in res["notes"]) == 1 and sum("Contact Sarah" in t for t in res["tasks"]) == 1,
           "each prospect arrives once, even if it's delivered twice")
     check(any("Can we set up a quick call" in x and "our first email" in x for x in res["notes"]), "supervisor sees the reply and the whole conversation")

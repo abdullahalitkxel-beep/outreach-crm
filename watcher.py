@@ -34,6 +34,7 @@ def check_now(config_path, email):
     with _inbox_lock(email.lower()):
         con = bot.db_connect(cfg.get("database", "outreach.db"))
         try:
+            bot.sync_mode(con, cfg)
             n = bot.process_inbox(cfg, con, s)
             if n:
                 after_new_mail(con)

@@ -333,7 +333,8 @@ def _collect_events(con, after):
     out = []
     for e in con.execute(
             "SELECT e.id, e.type, e.detail, e.sender, e.at, e.variant, l.email, l.company FROM events e "
-            "LEFT JOIN leads l ON l.id=e.lead_id WHERE e.id>? AND e.type IN (%s) ORDER BY e.id LIMIT 500"
+            "LEFT JOIN leads l ON l.id=e.lead_id WHERE e.id>? AND e.type IN (%s) "
+            "AND CAST(e.id AS TEXT) NOT IN (SELECT rid FROM test_rows WHERE tbl='events') ORDER BY e.id LIMIT 500"
             % ",".join("?" * len(SHARED_TYPES)), (after, *sorted(SHARED_TYPES))):
         detail = e["detail"] or ""
         if e["type"] == "error":

@@ -772,7 +772,10 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
 <div class="card"><div class="card-h"><h2>Safety &amp; automation</h2></div><div class="card-b"><form method="post" action="{{ url_for('save_safety') }}">
  <label class="switch"><input type="checkbox" name="test_mode" {{ 'checked' if (c.test_mode or {}).enabled }}><span></span><b>Test mode</b> &mdash; send every email to me instead of the lead</label>
  <div style="max-width:420px"><label>My test address</label><input name="redirect_to" type="email" value="{{ (c.test_mode or {}).redirect_to or '' }}" placeholder="you@gmail.com"></div>
- <p class="hint">Keep this on while your inboxes warm up. Subjects show who each email was meant for. Turn it off to go live.</p>
+ <p class="hint">Keep this on while your inboxes warm up. Subjects show who each email was meant for. Turn it off to go live.
+ Test mode is kept apart from live: anything a test does to a lead (emails, replies, closing it, handovers) is undone when you switch test mode off, so every lead starts live exactly as it was. Test handovers stay on this computer and never reach supervisors.</p>
+ {% if test_info and test_info.leads %}<div class="help" style="margin:6px 0 10px">🧪 Test mode has changed <b>{{ test_info.leads }}</b> lead(s) so far ({{ test_info.events }} test event(s)). They go back to how they were when you go live.
+ <button class="btn sm" formaction="{{ url_for('clear_test') }}" formnovalidate onclick="return confirm('Undo all test results now? Every lead goes back to how it was before testing.')">Clear test results now</button></div>{% endif %}
  <label class="switch"><input type="checkbox" name="review" {{ 'checked' if (c.review or {}).enabled }}><span></span><b>Review before sending</b> &mdash; every email waits for my approval</label>
  <p class="hint">Recommended for at least the first few weeks.</p>
  <label class="switch"><input type="checkbox" name="autorun" {{ 'checked' if (c.autorun or {}).enabled }}><span></span><b>Run automatically</b> and keep running in the background</label>

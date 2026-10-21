@@ -80,6 +80,9 @@ jobs:
       - name: Test live replies (IMAP IDLE watcher)
         run: python tests/watcher_test.py
 
+      - name: Test that test mode is kept apart from live
+        run: python tests/test_mode_test.py
+
       - name: Test the AI line with thinking models
         run: python tests/llm_test.py
 

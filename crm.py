@@ -22,6 +22,7 @@ from jinja2 import DictLoader
 import brand
 import team
 import mailbox
+import bot
 from bot import campaign_cfg, find_avoid, template_avoid_hits
 
 from bot import (DATA, HUMAN_STAGES, env, LEAD_OPEN_STAGES, OPP_OPEN_STAGES, OPP_STAGES, ROOT, STAGES, settings_path,
@@ -232,6 +233,10 @@ def legal_docs_version():
 
 
 def render(name, **ctx):
+    try:
+        bot.sync_mode(db(), cfg())          # keeps test-mode results apart from live ones
+    except Exception as e:
+        print("mode:", e)
     tm = cfg().get("test_mode") or {}
     review_count = one("SELECT COUNT(*) FROM outbox WHERE status='pending'")
     overdue = one("SELECT COUNT(*) FROM tasks WHERE status='open' AND due_date<=?", today())
@@ -1687,7 +1692,7 @@ def settings():
                   dsc_recent=rows("SELECT * FROM discovered ORDER BY at DESC LIMIT 8"), ai_key=bool(env("ANTHROPIC_API_KEY")), inbox_emails=[x.get("email") for x in (c.get("senders") or []) if x.get("email") and "example" not in x.get("email", "")],
                   startup_ok=startup_supported(), startup_on=startup_enabled(), is_bot=team.is_bot(),
                   ho=dict(c.get("handover") or {}), pm=dict(c.get("prospect_mailbox") or {}), pm_pw=mask(env(mailbox.PW_KEY)), ho_default=bot_default_intro(), team_sups=team.supervisors() if team.joined() else [],
-                  live=_live_summary(),
+                  live=_live_summary(), test_info=bot.test_counts(db()),
                   team=dict(team.state(), joined=team.joined(), policy=team.policy(), disclosure=team.DISCLOSURE, locked=team.locked_in(), signed=team.signed_in()))
 
 
@@ -1830,16 +1835,26 @@ def save_safety():
     redirect_to = f.get("redirect_to", "").strip()
     if tm and "@" not in redirect_to:
         return redirect(url_for("settings", tab="safety", result="Test mode needs your own email address to send tests to."))
+    was_test = bot.test_on(cfg())
+    n_test = bot.test_counts(db())["leads"]
     write_settings({"test_mode": {"enabled": tm, "redirect_to": redirect_to},
                     "review": {"enabled": bool(f.get("review"))},
                     "autorun": {"enabled": bool(f.get("autorun")), "every_minutes": int(f.get("every_minutes") or 60)}})
-    msg = "Saved." + ("" if tm else " Test mode is OFF: approved emails now go to real leads.")
+    bot.sync_mode(db(), cfg())
+    msg = "Saved." + ("" if tm else " Test mode is OFF: approved emails now go to real leads.") + \
+          (f" Test results cleared: {n_test} lead(s) are back as they were before testing." if was_test and not tm and n_test else "")
     if startup_supported() and bool(f.get("start_with_windows")) != startup_enabled():
         try:
             set_startup(bool(f.get("start_with_windows")))
         except OSError as e:
             msg += f" Couldn't change 'start with Windows' ({e})."
     return redirect(url_for("settings", tab="safety", result=msg, ok=1))
+
+
+@app.post("/settings/test/clear")
+def clear_test():
+    n = bot.clear_test_results(db())
+    return redirect(url_for("settings", tab="safety", result=f"Test results cleared: {n} lead(s) are back as they were before testing.", ok=1))
 
 
 @app.post("/settings/keys")

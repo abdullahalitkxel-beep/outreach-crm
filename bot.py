@@ -275,9 +275,102 @@ def db_connect(path):
         con.execute("INSERT OR IGNORE INTO campaigns(id, name, status, created_at) VALUES (1, 'Main campaign', 'active', ?)", (iso(now_utc()),))
         con.execute("UPDATE leads SET stage='qualified' WHERE stage IN ('meeting','proposal','won')")
         con.execute("UPDATE leads SET stage='unqualified' WHERE stage='lost'")
+        _test_triggers(con)
         con.commit()
         _migrated.add(str(full))
     return con
+
+
+# ---------------------------------------------------------------- test mode kept apart from live
+# While test mode is on, every change to a lead is recorded: the lead as it was before the first change, and every
+# event, draft, note, task, handover and do-not-contact entry added. Going live (or "Clear test results") puts the
+# leads back exactly as they were and removes what the test added, so test replies never close a real lead.
+
+TEST_TRACKED = ("events", "outbox", "notes", "tasks", "handover_out", "suppression")
+# what a test run changes on a lead; edits you make yourself (name, company, notes on the lead itself) are kept
+TEST_PROGRESS = {"step", "status", "stage", "next_send_at", "sender", "first_msg_id", "first_subject", "handed_to", "handed_at", "prospect_stage"}
+
+
+def _test_triggers(con):
+    con.executescript("""
+CREATE TABLE IF NOT EXISTS app_mode (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS test_snapshot (lead_id INTEGER PRIMARY KEY, data TEXT, at TEXT);
+CREATE TABLE IF NOT EXISTS test_rows (tbl TEXT, rid TEXT, PRIMARY KEY (tbl, rid));
+""")
+    cols = [r[1] for r in con.execute("PRAGMA table_info(leads)") if r[1] != "id"]
+    snap = "json_object(" + ", ".join(f"'{c}', OLD.{c}" for c in cols) + ")"
+    on = "(SELECT v FROM app_mode WHERE k='test')='1'"
+    con.execute("DROP TRIGGER IF EXISTS test_snap_leads")
+    con.execute(f"CREATE TRIGGER test_snap_leads BEFORE UPDATE ON leads WHEN {on} BEGIN "
+                f"INSERT OR IGNORE INTO test_snapshot(lead_id, data, at) VALUES (OLD.id, {snap}, strftime('%Y-%m-%dT%H:%M:%SZ','now')); END")
+    for t in TEST_TRACKED:
+        key = "NEW.email" if t == "suppression" else "NEW.rowid"
+        con.execute(f"DROP TRIGGER IF EXISTS test_rows_{t}")
+        con.execute(f"CREATE TRIGGER test_rows_{t} AFTER INSERT ON {t} WHEN {on} BEGIN "
+                    f"INSERT OR IGNORE INTO test_rows(tbl, rid) VALUES ('{t}', {key}); END")
+
+
+def test_on(cfg):
+    tm = cfg.get("test_mode") or {}
+    return bool(tm.get("enabled"))
+
+
+def sync_mode(con, cfg):
+    """Tell the database which mode we're in. Switching from test to live clears the test results."""
+    want = "1" if test_on(cfg) else "0"
+    row = con.execute("SELECT v FROM app_mode WHERE k='test'").fetchone()
+    if row and row[0] == want:
+        return
+    if row and row[0] == "1" and want == "0":
+        clear_test_results(con)
+    if not row:
+        _adopt_old_tests(con)
+    con.execute("INSERT INTO app_mode(k, v) VALUES ('test', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (want,))
+    con.commit()
+
+
+def _adopt_old_tests(con):
+    """Tests sent before this version weren't recorded. Leads whose only emails so far were test emails are
+    marked to start fresh at go-live, and those test emails are removed with the other test results."""
+    for l in con.execute("SELECT * FROM leads WHERE id IN (SELECT lead_id FROM events WHERE type='sent' AND detail LIKE '%(test)%') "
+                         "AND id NOT IN (SELECT lead_id FROM events WHERE type='sent' AND detail NOT LIKE '%(test)%')").fetchall():
+        fresh = {"step": 0, "status": "active" if l["status"] in ("active", "done", "paused") else l["status"], "next_send_at": None, "sender": None,
+                 "first_msg_id": None, "first_subject": None, "stage": "new" if l["stage"] == "contacted" else l["stage"]}
+        con.execute("INSERT OR IGNORE INTO test_snapshot(lead_id, data, at) VALUES (?,?,?)", (l["id"], json.dumps(fresh), iso(now_utc())))
+    con.execute("INSERT OR IGNORE INTO test_rows(tbl, rid) SELECT 'events', CAST(id AS TEXT) FROM events WHERE type='sent' AND detail LIKE '%(test)%'")
+
+
+def test_counts(con):
+    return {"leads": con.execute("SELECT COUNT(*) FROM test_snapshot").fetchone()[0],
+            "events": con.execute("SELECT COUNT(*) FROM test_rows WHERE tbl='events'").fetchone()[0]}
+
+
+def clear_test_results(con):
+    """Put every lead back as it was before test mode touched it and remove what the test added. Returns leads restored."""
+    was = con.execute("SELECT v FROM app_mode WHERE k='test'").fetchone()
+    con.execute("UPDATE app_mode SET v='0' WHERE k='test'")      # so the restore itself isn't recorded
+    cols = {r[1] for r in con.execute("PRAGMA table_info(leads)")}
+    n = 0
+    for r in con.execute("SELECT lead_id, data FROM test_snapshot").fetchall():
+        data = {k: v for k, v in json.loads(r["data"] or "{}").items() if k in cols and k in TEST_PROGRESS}
+        if data:
+            con.execute(f"UPDATE leads SET {', '.join(k + '=?' for k in data)} WHERE id=?", (*data.values(), r["lead_id"]))
+            n += 1
+    for t in TEST_TRACKED:
+        if t == "suppression":
+            con.execute("DELETE FROM suppression WHERE email IN (SELECT rid FROM test_rows WHERE tbl='suppression')")
+        else:
+            con.execute(f"DELETE FROM {t} WHERE rowid IN (SELECT CAST(rid AS INTEGER) FROM test_rows WHERE tbl=?)", (t,))
+    con.execute("DELETE FROM test_snapshot")
+    con.execute("DELETE FROM test_rows")
+    if was:
+        con.execute("UPDATE app_mode SET v=? WHERE k='test'", (was[0],))
+    con.commit()
+    return n
+
+
+def is_test_row(con, tbl, rid):
+    return con.execute("SELECT 1 FROM test_rows WHERE tbl=? AND rid=?", (tbl, str(rid))).fetchone() is not None
 
 
 def add_task(con, subject, due_date=None, lead_id=None, opp_id=None):
@@ -1331,7 +1424,8 @@ def handover(cfg, con, lead, sender, msg, body, label):
                "lead": {"email": lead["email"], "first_name": lead.get("first_name"), "last_name": x.get("last_name"), "title": x.get("title"),
                         "company": company, "website": lead.get("website"), "linkedin": x.get("linkedin"), "city": x.get("city"), "country": x.get("country")},
                "reply": body.strip()[:4000], "intro": intro_text, "thread": thread, "from_inbox": sender["email"], "from_name": sender["name"]}
-    con.execute("INSERT INTO handover_out(lead_id, supervisor, payload, at) VALUES (?,?,?,?)", (lead["id"], sup["id"], json.dumps(payload), at))
+    con.execute("INSERT INTO handover_out(lead_id, supervisor, payload, at, synced) VALUES (?,?,?,?,?)",
+                (lead["id"], sup["id"], json.dumps(payload), at, 1 if redirect else 0))   # a test handover stays on this computer
     con.commit()
     notify(f"🤝 Handed over {name} ({company}) to {sup['name']}: {label.replace('_', ' ')} reply in {sender['email']}", cfg)
     return True
@@ -1683,6 +1777,7 @@ def main(argv=None):
                         format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_config(args.config)
     con = db_connect(cfg.get("database", "outreach.db"))
+    sync_mode(con, cfg)
     lock = acquire_lock() if args.cmd in ("run", "check") else None
 
     {"import": cmd_import, "run": cmd_run, "check": cmd_check,
