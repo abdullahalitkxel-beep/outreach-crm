@@ -24,6 +24,7 @@ h1,h2,h3{margin:0;font-weight:700}
 .gsearch input{width:100%;height:32px;border:1px solid #c9c9c9;border-radius:var(--r);padding:0 10px 0 32px;font:inherit;background:#fff}
 .gsearch svg{position:absolute;left:10px;top:9px;fill:var(--muted)}
 .gh .tools{display:flex;gap:6px;align-items:center}
+.backbtn{border:1px solid var(--line);background:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;color:inherit;font:inherit;padding:0}.backbtn svg{fill:currentColor}.backbtn[disabled]{opacity:.35;cursor:default}
 .iconbtn{width:32px;height:32px;border-radius:50%;border:1px solid var(--line);background:#fff;display:grid;place-items:center;cursor:pointer;color:var(--muted);font-weight:700;position:relative}
 .menu{position:absolute;right:0;top:38px;background:#fff;border:1px solid var(--line);border-radius:var(--r);box-shadow:0 2px 8px rgba(0,0,0,.16);min-width:220px;z-index:30;display:none;text-align:left}
 .menu a,.menu button{display:block;width:100%;padding:9px 14px;color:var(--ink);background:none;border:0;font:inherit;text-align:left;cursor:pointer}
@@ -187,6 +188,7 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
     <form method="post" action="{{ url_for('quit_app') }}" onsubmit="return confirm('Stop BSO? Automatic runs stop until you open it again.')"><button>Quit the app</button></form>
    </div>
   </div>
+  <button type="button" class="iconbtn backbtn" id="backbtn" title="Back (Alt + Left arrow)" aria-label="Back" onclick="goBack()"><svg width="18" height="18" viewBox="0 0 24 24"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg></button>
  </div>
 </div>
 {% if request.endpoint not in ('welcome', 'signin') %}<nav class="nav">
@@ -204,6 +206,9 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
 <script>
 // ---- tell the app this window is open; it quits about a minute after the last window is closed (unless auto-run is on)
 var _act=Date.now();['mousemove','keydown','mousedown','wheel','touchstart'].forEach(function(e){document.addEventListener(e,function(){_act=Date.now();},{passive:true});});
+// ---- one step back (the app window has no browser toolbar)
+function goBack(){ if(history.length>1){ history.back(); } else { location.href='/'; } }
+(function(){ var b=document.getElementById('backbtn'); if(b && history.length<=1 && location.pathname==='/') b.disabled=true; })();
 function beat(){ try{ fetch('/heartbeat'+(Date.now()-_act<15000?'?active=1':''),{method:'POST',keepalive:true}).then(function(r){ if(r.status===200) return r.json(); }).then(function(j){ if(j&&j.locked) location.href='/signin?locked=1&next='+encodeURIComponent(location.pathname+location.search); }).catch(function(){}); }catch(e){} }
 beat(); setInterval(beat, 10000);
 document.addEventListener('visibilitychange', function(){ if(!document.hidden) beat(); });
