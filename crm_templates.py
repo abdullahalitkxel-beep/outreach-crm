@@ -24,6 +24,7 @@ h1,h2,h3{margin:0;font-weight:700}
 .gsearch input{width:100%;height:32px;border:1px solid #c9c9c9;border-radius:var(--r);padding:0 10px 0 32px;font:inherit;background:#fff}
 .gsearch svg{position:absolute;left:10px;top:9px;fill:var(--muted)}
 .gh .tools{display:flex;gap:6px;align-items:center}
+.backname{display:flex;align-items:center;gap:6px;max-width:220px;padding:5px 10px;border:1px solid var(--line);border-radius:16px;color:inherit;text-decoration:none;font-size:13px;white-space:nowrap;flex:none}.backname span{overflow:hidden;text-overflow:ellipsis}.backname:hover{background:#f3f3f3}
 .backbtn{border:1px solid var(--line);background:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;color:inherit;font:inherit;padding:0}.backbtn svg{fill:currentColor}.backbtn[disabled]{opacity:.35;cursor:default}
 .iconbtn{width:32px;height:32px;border-radius:50%;border:1px solid var(--line);background:#fff;display:grid;place-items:center;cursor:pointer;color:var(--muted);font-weight:700;position:relative}
 .menu{position:absolute;right:0;top:38px;background:#fff;border:1px solid var(--line);border-radius:var(--r);box-shadow:0 2px 8px rgba(0,0,0,.16);min-width:220px;z-index:30;display:none;text-align:left}
@@ -172,6 +173,7 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
 {% elif test_mode_broken %}<div class="testbar">TEST MODE is on but has no test address, so the bot won't send anything. <a href="{{ url_for('setup') }}">Fix in Getting Started</a></div>{% endif %}
 <div class="gh">
  <span style="flex:none;display:flex">{{ logo(32, tile=True, uid="hd", weight="b", label="BSO")|safe }}</span>
+ <a id="backname" class="backname" href="#" style="display:none"><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg><span></span></a>
  {% if request.endpoint != 'welcome' %}<form class="gsearch" action="{{ url_for('search') }}" id="t-search">
   <svg width="14" height="14" viewBox="0 0 24 24"><path d="M15.5 14h-.8l-.3-.3A6.5 6.5 0 1 0 9.5 16a6.5 6.5 0 0 0 4.2-1.6l.3.3v.8l5 5 1.5-1.5-5-5zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></svg>
   <input name="q" placeholder="Search leads, prospects, emails, comments, campaigns…" value="{{ request.args.get('q','') if request.endpoint=='search' else '' }}">
@@ -206,6 +208,19 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
 <script>
 // ---- tell the app this window is open; it quits about a minute after the last window is closed (unless auto-run is on)
 var _act=Date.now();['mousemove','keydown','mousedown','wheel','touchstart'].forEach(function(e){document.addEventListener(e,function(){_act=Date.now();},{passive:true});});
+(function(){ /* left 'back to <page>' link: remembers the pages opened in this window */
+ var name=(document.title||'').split(' · ')[0].trim()||'Back', here=location.pathname+location.search, st=[];
+ try{ st=JSON.parse(sessionStorage.getItem('bso_trail')||'[]'); }catch(e){}
+ if(st.length && st[st.length-1].u===here){ st[st.length-1].n=name; }
+ else if(st.length>1 && st[st.length-2].u===here){ st.pop(); }
+ else { st.push({u:here,n:name}); if(st.length>30) st=st.slice(-30); }
+ try{ sessionStorage.setItem('bso_trail', JSON.stringify(st)); }catch(e){}
+ var a=document.getElementById('backname'); if(!a) return;
+ var prev=st.length>1?st[st.length-2]:null;
+ if(!prev){ a.style.display='none'; return; } a.style.display='flex';
+ a.querySelector('span').textContent=prev.n; a.title='Back to '+prev.n; a.href=prev.u;
+ a.addEventListener('click',function(e){ e.preventDefault(); if(history.length>1) history.back(); else location.href=prev.u; });
+})();
 // ---- one step back (the app window has no browser toolbar)
 function goBack(){ if(history.length>1){ history.back(); } else { location.href='/'; } }
 (function(){ var b=document.getElementById('backbtn'); if(b && history.length<=1 && location.pathname==='/') b.disabled=true; })();
