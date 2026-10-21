@@ -77,6 +77,9 @@ jobs:
       - name: Test setting up a BSO from the console
         run: python tests/setup_test.py
 
+      - name: Test live replies (IMAP IDLE watcher)
+        run: python tests/watcher_test.py
+
       - name: Test the AI line with thinking models
         run: python tests/llm_test.py
 

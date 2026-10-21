@@ -726,7 +726,7 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
 <div class="spanel">
 
 {% if tab == 'inbox' %}
-<div class="card"><div class="card-h"><h2>Email inboxes</h2></div><div class="card-b">
+<div class="card"><div class="card-h"><h2>Email inboxes</h2>{% if live %}<span class="badge {{ 'b-ok' if live.live == live.total else '' }}" title="Replies are read the moment they arrive">⚡ Live replies: {{ live.live }} of {{ live.total }} inboxes</span>{% endif %}</div><div class="card-b">
 <p class="muted" style="margin-top:0">The addresses your emails are sent from. One is enough to start; add up to {{ max_inboxes }} (choose which ones each campaign uses on its page). Use your <b>outreach domains</b>, not your main company inbox. To add many at once, use <a href="#bulk">Add several inboxes</a> below.</p>
 <form method="post" action="{{ url_for('save_inbox') }}">
 {% for ib in inboxes %}{% set s = ib.s %}{% set n = ib.n %}

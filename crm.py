@@ -1687,7 +1687,19 @@ def settings():
                   dsc_recent=rows("SELECT * FROM discovered ORDER BY at DESC LIMIT 8"), ai_key=bool(env("ANTHROPIC_API_KEY")), inbox_emails=[x.get("email") for x in (c.get("senders") or []) if x.get("email") and "example" not in x.get("email", "")],
                   startup_ok=startup_supported(), startup_on=startup_enabled(), is_bot=team.is_bot(),
                   ho=dict(c.get("handover") or {}), pm=dict(c.get("prospect_mailbox") or {}), pm_pw=mask(env(mailbox.PW_KEY)), ho_default=bot_default_intro(), team_sups=team.supervisors() if team.joined() else [],
+                  live=_live_summary(),
                   team=dict(team.state(), joined=team.joined(), policy=team.policy(), disclosure=team.DISCLOSURE, locked=team.locked_in(), signed=team.signed_in()))
+
+
+def _live_summary():
+    try:
+        import watcher
+        st = watcher.STATUS
+        if not st:
+            return None
+        return {"live": sum(1 for v in st.values() if v["state"] == "live"), "total": len(st)}
+    except Exception:
+        return None
 
 
 @app.post("/settings/team/leave")

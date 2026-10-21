@@ -1139,6 +1139,9 @@ def capture_referral(cfg, con, lead, sender, body):
     return new
 
 
+TEST_TAG_RE = re.compile(r"\[TEST for ([^\],\s]+@[^\],\s]+)")
+
+
 def handle_message(cfg, con, sender, msg):
     if intake_message(cfg, con, sender, msg):
         return
@@ -1158,6 +1161,14 @@ def handle_message(cfg, con, sender, msg):
         return
 
     lead = con.execute("SELECT * FROM leads WHERE email=?", (frm,)).fetchone()
+    tm = cfg.get("test_mode") or {}
+    if not lead and tm.get("enabled") and not msg.get("X-BSO-Kind"):
+        # test mode: our emails went to your own inbox as "[TEST for lead@x] ...", so your reply stands in for the lead's
+        subj = re.sub(r"\s+", " ", msg.get("Subject", "") or "").strip()
+        m_ = TEST_TAG_RE.search(subj)
+        if m_ and re.match(r"^(re|aw|antw|sv|r)\s*:", subj, re.I):
+            lead = con.execute("SELECT * FROM leads WHERE email=?", (m_.group(1).lower(),)).fetchone()
+            frm = lead["email"] if lead else frm
     if lead and lead["handed_to"] and lead["status"] not in ("unsubscribed", "bounced"):
         forward_to_supervisor(cfg, con, dict(lead), sender, msg, body)   # nothing slips through after a handover
         return
@@ -1346,6 +1357,8 @@ def forward_to_supervisor(cfg, con, lead, sender, msg, body):
 
 
 def process_inbox(cfg, con, sender):
+    """Read new messages in one inbox. Returns how many were new."""
+    n_new = 0
     since = (datetime.now() - timedelta(days=cfg.get("reply_lookback_days", 14))).strftime("%d-%b-%Y")
     M = imaplib.IMAP4_SSL(sender["imap_host"], sender.get("imap_port", 993))
     try:
@@ -1354,23 +1367,27 @@ def process_inbox(cfg, con, sender):
         _, data = M.uid("search", None, f'(SINCE "{since}")')
         for uid in data[0].split():
             # cheap header fetch first; full body only for new messages
-            _, hdr = M.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
-            head = email.message_from_bytes(hdr[0][1]) if hdr and hdr[0] else {}
+            _, hdr = M.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT)])")
+            head = email.message_from_bytes(hdr[0][1]) if hdr and hdr[0] and isinstance(hdr[0], tuple) else {}
             key = (head.get("Message-ID") or "").strip() or f"{sender['email']}:{uid.decode()}"
-            if con.execute("SELECT 1 FROM seen_messages WHERE msg_id=?", (key,)).fetchone():
+            if "[TEST for" in str(head.get("Subject") or ""):
+                key = "t:" + key                 # test replies are matched differently since v1.0.45: look at them once more
+            # claim it first, so the live reply watcher and a run never handle the same message twice
+            claimed = con.execute("INSERT OR IGNORE INTO seen_messages VALUES (?)", (key,)).rowcount
+            con.commit()                         # always end the transaction, or other readers of this inbox would wait
+            if not claimed:
                 continue
             _, full = M.uid("fetch", uid, "(BODY.PEEK[])")
             msg = email.message_from_bytes(full[0][1])
-            try:
-                handle_message(cfg, con, sender, msg)
-            finally:
-                con.execute("INSERT OR IGNORE INTO seen_messages VALUES (?)", (key,))
-                con.commit()
+            handle_message(cfg, con, sender, msg)
+            con.commit()
+            n_new += 1
     finally:
         try:
             M.logout()
         except Exception:
             pass
+    return n_new
 
 
 def cmd_check(cfg, con, args):

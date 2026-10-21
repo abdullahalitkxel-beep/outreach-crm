@@ -171,6 +171,11 @@ def main():
     tray_ref = {}
     threading.Thread(target=crm._autorun_loop, daemon=True).start()
     threading.Thread(target=crm._team_loop, daemon=True).start()
+    try:
+        import watcher                       # replies are picked up the moment they arrive
+        watcher.start(crm.CONFIG_PATH, allowed=lambda: not (crm.team.required() and not crm.team.signed_in()) and crm.terms_accepted())
+    except Exception as e:
+        print("reply watcher:", e)
     threading.Thread(target=crm._mailbox_loop, daemon=True).start()
     threading.Thread(target=watchdog, args=(crm, tray_ref), daemon=True).start()
     server = threading.Thread(target=lambda: crm.app.run(host="127.0.0.1", port=PORT, threaded=True, use_reloader=False),
