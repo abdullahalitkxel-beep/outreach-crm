@@ -204,4 +204,15 @@ check("Others in the conversation" in lp and "xyz@acme.com" in lp and "Every ema
 w.post(f"/lead/{abc}/temperature", data={"temperature": "warm"})
 check(row("abc@acme.com")["temperature"] == "warm" and con.execute("SELECT by FROM temp_log ORDER BY id DESC").fetchone()[0] == "person",
       "a person can change the temperature, and the change is logged")
+# ---- emailing a client back from the lead's page
+os.environ["SENDER1_PASSWORD"] = "pw"
+lp = w.get(f"/lead/{abc}").get_data(as_text=True)
+check('id="compose"' in lp and "Email Abc" in lp and "Re: Quick question" in lp, "every lead page has an Email box, with the thread's subject filled in")
+before = len(sent)
+r = w.post(f"/lead/{abc}/email", data={"from": INBOX, "to": "abc@acme.com", "subject": "Re: Quick question", "body": "Hi Abc, Tuesday 3pm works.", "stop": "1"})
+check(len(sent) == before + 1 and sent[-1]["to"] == "abc@acme.com" and "Tuesday 3pm" in sent[-1]["body"], "Send emails the client from the inbox that's been writing to them")
+check(con.execute("SELECT COUNT(*) FROM sent_log WHERE lead_id=? AND kind='manual'", (abc,)).fetchone()[0] == 1, "and it's kept in the conversation")
+before = len(sent)
+r = w.post(f"/lead/{abc}/email", data={"from": INBOX, "to": "abc@acme.com", "subject": "x", "body": "copying my friend", "bcc": "me@gmail.com"}, follow_redirects=True)
+check(len(sent) == before and "Not sent" in r.get_data(as_text=True), "a BCC outside the company and the client is refused")
 print(f"\nAll {n} conversation checks passed.")

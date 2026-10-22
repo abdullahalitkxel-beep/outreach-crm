@@ -83,6 +83,15 @@ jobs:
       - name: Test that test mode is kept apart from live
         run: python tests/test_mode_test.py
 
+      - name: Test conversation following, temperature and replying from BSO
+        run: python tests/conversation_test.py
+
+      - name: Test full visibility in the Master Console (sealed reports, incidents, archive)
+        run: python tests/visibility_test.py
+
+      - name: Test AI writing from the brief and the learning engine
+        run: python tests/learning_test.py
+
       - name: Test the AI line with thinking models
         run: python tests/llm_test.py
 

@@ -272,6 +272,8 @@ def db_connect(path):
         _add_column(con, "leads", "campaign_id", "INTEGER DEFAULT 1")
         _add_column(con, "inbox_health", "resumed_at", "TEXT")
         _add_column(con, "instantly_pulls", "campaign_id", "INTEGER DEFAULT 1")
+        _add_column(con, "campaigns", "brief", "TEXT")
+        _add_column(con, "campaigns", "writing", "TEXT")
         con.execute("INSERT OR IGNORE INTO campaigns(id, name, status, created_at) VALUES (1, 'Main campaign', 'active', ?)", (iso(now_utc()),))
         con.execute("UPDATE leads SET stage='qualified' WHERE stage IN ('meeting','proposal','won')")
         con.execute("UPDATE leads SET stage='unqualified' WHERE stage='lost'")
@@ -518,14 +520,59 @@ def _reply_text(msg):
     return "".join(getattr(b, "text", "") for b in (msg.content or []) if getattr(b, "type", "") == "text").strip()
 
 
+AI_RATES = {"haiku": (1.0, 5.0), "sonnet": (3.0, 15.0), "opus": (5.0, 25.0)}   # approximate USD per million tokens; editable in Settings
+
+
+def ai_spend_path():
+    return DATA / "ai_spend.json"
+
+
+def ai_spend(month=None):
+    try:
+        d = json.loads(ai_spend_path().read_text(encoding="utf-8"))
+    except Exception:
+        d = {}
+    return d.get(month or date.today().strftime("%Y-%m"), {"usd": 0.0, "in": 0, "out": 0, "calls": 0})
+
+
+def _record_spend(cfg, model, usage):
+    try:
+        rates = dict(AI_RATES, **((cfg.get("ai_budget") or {}).get("rates") or {}))
+        rin, rout = next((v for k, v in rates.items() if k in (model or "").lower()), (3.0, 15.0))
+        tin, tout = int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0)
+        p = ai_spend_path()
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            d = {}
+        m = date.today().strftime("%Y-%m")
+        cur = d.get(m) or {"usd": 0.0, "in": 0, "out": 0, "calls": 0}
+        cur.update(usd=round(cur["usd"] + tin / 1e6 * float(rin) + tout / 1e6 * float(rout), 4), calls=cur["calls"] + 1,
+                   **{"in": cur["in"] + tin, "out": cur["out"] + tout})
+        d[m] = cur
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception as e:
+        log.warning("AI spend not recorded: %s", e)
+
+
+def ai_over_budget(cfg):
+    cap = float((cfg.get("ai_budget") or {}).get("monthly_usd") or 0)
+    return bool(cap) and ai_spend()["usd"] >= cap
+
+
 def llm(cfg, model_key, prompt, max_tokens=200):
-    """Call Claude; returns text or None if unavailable/failing."""
+    """Call Claude; returns text or None if unavailable/failing (or over this month's AI budget)."""
     if not env("ANTHROPIC_API_KEY"):
+        return None
+    if ai_over_budget(cfg):
+        log.warning("Monthly AI budget reached: using templates and keyword rules until next month (Settings → AI & Apollo keys).")
         return None
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=env("ANTHROPIC_API_KEY"))
-        model = cfg["models"][model_key]
+        model = (cfg.get("models") or {}).get(model_key) or (cfg.get("models") or {}).get("personalize")
         try:
             # short, simple writing: no thinking needed (Haiku accepts this; others may refuse it)
             msg = client.messages.create(model=model, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}],
@@ -533,6 +580,7 @@ def llm(cfg, model_key, prompt, max_tokens=200):
         except anthropic.BadRequestError:
             # model can't switch thinking off: leave room for it, keep only the answer
             msg = client.messages.create(model=model, max_tokens=max_tokens + 4000, messages=[{"role": "user", "content": prompt}])
+        _record_spend(cfg, model, getattr(msg, "usage", None))
         text = _reply_text(msg)
         return text or None
     except Exception as e:  # network, quota, etc. -> fall back gracefully
@@ -851,7 +899,25 @@ def pick_variant(cfg, lead, idx, force_name=None):
 
 
 def compose(cfg, con, lead, sender, idx, fresh_opener=False, variant_name=None):
-    """Build (subject, body-without-footer, variant name) for sequence step idx."""
+    """Build (subject, body-without-footer, variant name) for sequence step idx.
+    With the AI on, each email is written fresh from the campaign brief (writer.py); otherwise from the templates."""
+    if not isinstance(lead, dict):
+        lead = dict(lead)
+    if not variant_name and not json.loads(lead.get("extra") or "{}").get("referred_by"):
+        try:
+            import writer
+            if writer.enabled(cfg, con, lead.get("campaign_id")):
+                prof = {}
+                try:
+                    import team
+                    prof = team.state().get("strategy") or {}
+                except Exception:
+                    pass
+                got = writer.write_step(cfg, con, lead, sender, idx, prof, len(cfg["sequence"]))
+                if got:
+                    return got
+        except Exception as e:
+            log.warning("AI writing unavailable, using the template: %s", e)
     v = pick_variant(cfg, lead, idx, variant_name)
     if idx == 0 and (fresh_opener or not lead["personal_line"]):
         lead["personal_line"] = personalize(cfg, lead)
@@ -947,10 +1013,20 @@ def cmd_run(cfg, con, args):
     if cap_left is not None:
         draft_budget = min(draft_budget, max(0, cap_left - queued))
 
+    try:                                     # lead scoring from the approved strategy: the most promising new leads go first
+        import learn
+        import writer
+        weights = ((team_mod.state() if team_mod else {}).get("strategy") or {}).get("scoring")
+        if weights:
+            for r in con.execute("SELECT id, extra FROM leads WHERE status='active' AND step=0 AND fit_score IS NULL LIMIT 5000").fetchall():
+                con.execute("UPDATE leads SET fit_score=? WHERE id=?", (learn.lead_score(weights, r["extra"], writer.segment(dict(r))), r["id"]))
+            con.commit()
+    except Exception as e:
+        log.warning("Lead scoring skipped: %s", e)
     due = con.execute(
         "SELECT l.* FROM leads l LEFT JOIN campaigns c ON c.id=COALESCE(l.campaign_id,1) "
         "WHERE l.status='active' AND l.next_send_at<=? AND COALESCE(c.status,'active')='active' "
-        "ORDER BY l.step DESC, l.id LIMIT ?",  # finish running sequences before starting new ones; paused campaigns wait
+        "ORDER BY l.step DESC, COALESCE(l.fit_score, 50) DESC, l.id LIMIT ?",  # running sequences first, then the likeliest new leads; paused campaigns wait
         (iso(now_utc()), args.limit),
     ).fetchall()
     all_senders, ccache = senders, {}
@@ -1062,7 +1138,7 @@ def cmd_run(cfg, con, args):
             continue
 
         convo.record_sent(con, msg_id, lead, "step", sender["email"], to, shown_subject, full_body, step=idx, variant=variant,
-                          test=bool(redirect), angle=(draft["angle"] if draft and "angle" in draft.keys() else None))
+                          test=bool(redirect), angle=variant if "|" in (variant or "") else None)
         sent += 1
         capacity[sender["email"]] -= 1
         if not args.dry_run:
@@ -1642,8 +1718,14 @@ def handover(cfg, con, lead, sender, msg, body, label, temp="warm", reason=""):
     log_event(con, lead["id"], "handover", sup["id"], sender["email"])
     j = convo.journey(con, lead["id"])
     first = j["first"] or {}
+    suggestion = ""
+    try:
+        import writer
+        suggestion = writer.suggest_reply(cfg, lead, body, temp)
+    except Exception as e:
+        log.warning("Suggested reply unavailable: %s", e)
     payload = {"lead_local_id": lead["id"], "supervisor": sup["id"], "label": label, "at": at, "temperature": temp, "reason": reason,
-               "respond_hours": convo.playbook(cfg).get(temp, {}).get("respond_hours"),
+               "respond_hours": convo.playbook(cfg).get(temp, {}).get("respond_hours"), "suggested_reply": suggestion,
                "first_touch": {"campaign": first.get("campaign"), "at": first.get("at"), "step": first.get("step"), "variant": first.get("variant"),
                                "subject": first.get("subject"), "sender": first.get("sender")},
                "related": [dict(r) for r in con.execute("SELECT email, name, role FROM related_contacts WHERE lead_id=?", (lead["id"],))],

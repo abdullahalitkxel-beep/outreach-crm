@@ -29,8 +29,8 @@ from bot import add_task, DATA, SECRETS, env, log_event, now_utc, iso, set_stage
 TOKEN_KEY = "BSO_TEAM_TOKEN"
 STATE = Path(DATA) / "team.json"
 CONSENT_VERSION = "2"
-SHARED_TYPES = {"sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "handover", "handover_in", "prospect_stage"}
-PROSPECT_STAGES = ["new", "contacted", "meeting", "proposal", "won", "lost"]
+SHARED_TYPES = {"sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "handover", "handover_in", "prospect_stage", "deal", "incident", "temperature"}
+PROSPECT_STAGES = ["new", "contacted", "meeting", "met", "proposal", "negotiation", "won", "lost"]
 DISCLOSURE = [
     "All leads and all conversations with clients are company property. Your company sees everything BSO handles, in full.",
     "That includes every email sent and received in a lead's conversation (text, To, CC and BCC), lead lists by campaign, notes, tasks, "
@@ -455,6 +455,8 @@ def _receive_handover(con, d, restoring=False):
         ft = d["first_touch"]
         con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",
                     (lid, f"First reached {str(ft.get('at', ''))[:10]} by campaign \"{ft.get('campaign')}\" (subject \"{ft.get('subject', '')}\") from {ft.get('sender', '')}.", at))
+    if d.get("suggested_reply"):
+        con.execute("UPDATE leads SET extra=json_set(COALESCE(extra,'{}'), '$.suggested_reply', ?) WHERE id=?", (str(d["suggested_reply"])[:3000], lid))
     for r in d.get("related") or []:
         if r.get("email"):
             con.execute("INSERT OR IGNORE INTO related_contacts(email, lead_id, name, role, at) VALUES (?,?,?,?,?)",
@@ -908,6 +910,14 @@ def _apply_decisions(con, decisions):
             if isinstance(d.get("security"), dict):
                 s["security"] = d["security"]
             save_state(s)
+            continue
+        if action == "strategy":
+            if isinstance(d.get("arms"), dict) or d.get("version"):
+                s2 = state()
+                if s2.get("strategy", {}).get("version") != d.get("version") and (d.get("arms") is not None or d.get("lessons") is not None):
+                    s2["strategy"] = {k: d.get(k) for k in ("version", "arms", "explore", "examples", "lessons", "scoring")}
+                    save_state(s2)
+                    con.execute("UPDATE leads SET fit_score=NULL WHERE status='active' AND step=0")      # re-scored at the next run
             continue
         if action == "vis_state":
             s2 = state()

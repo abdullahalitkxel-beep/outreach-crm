@@ -223,6 +223,7 @@ function openMail(url){
    h+='<div class="msg '+(m.dir==='in'?'in':'')+(i===j.focus?' focus':'')+'" id="mp'+i+'"><div class="meta">'+(m.dir==='in'?'Received':'Sent')+' '+esc((m.at||'').slice(0,16).replace('T',' '))+(m.test?' · <b>TEST</b>':'')+(m.via?' · '+esc(m.via):'')+(m.temperature?' · '+esc(m.temperature):'')+(m.label?' · '+esc(m.label.replace('_',' ')):'')+'</div>'
      +'<div><b>From:</b> '+esc(m.from)+(m.to?' &nbsp; <b>To:</b> '+esc(m.to):'')+(m.cc?' &nbsp; <b>CC:</b> '+esc(m.cc):'')+(m.bcc?' &nbsp; <b>BCC:</b> '+esc(m.bcc):'')+'</div>'
      +'<div><b>'+esc(m.subject)+'</b></div><pre>'+esc(m.body)+'</pre></div>'; });
+  if(j.lead&&j.lead.id){ h+='<div style="margin:6px 16px 12px"><a class="btn brand" href="/lead/'+j.lead.id+'#compose">✉ Reply to '+esc(j.lead.name||j.lead.email)+'</a></div>'; }
   b.innerHTML=h||'<p style="margin:16px" class="muted">No emails saved for this lead yet.</p>';
   if(j.focus!=null){ var f=document.getElementById('mp'+j.focus); if(f) f.scrollIntoView({block:'center'}); }
  }).catch(function(){ b.innerHTML='<p style="margin:16px">Couldn\'t load the email.</p>'; });
@@ -468,7 +469,8 @@ LEAD = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block titl
  <div><small>Source</small>{{ x.source or 'Manual' }}</div>
  {% if l.temperature %}<div><small>Temperature</small>{{ temp_badge(l.temperature) }}</div>{% endif %}</div>{% endset %}
 {% call m.header('t-lead', 'L', 'Lead', l.name, hl) %}
- {% if l.stage not in ('converted','unqualified') %}<a class="btn brand" href="#close">Convert</a>{% endif %}
+ {% if l.status not in ('unsubscribed','bounced') %}<a class="btn brand" href="{{ '#convo' if l.handed_from and mailbox_ok else '#compose' }}">✉ Email {{ l.first_name or 'them' }}</a>{% endif %}
+ {% if l.stage not in ('converted','unqualified') %}<a class="btn" href="#close">Convert</a>{% endif %}
  <form method="post" action="{{ url_for('sequence_action', lead_id=l.id) }}" style="display:inline">
  {% if l.status == 'active' %}<button class="btn" name="action" value="pause">Pause emails</button>{% endif %}
  {% if l.status in ('paused','done') and l.step < n_steps %}<button class="btn" name="action" value="resume">Resume emails</button>{% endif %}
@@ -479,7 +481,7 @@ LEAD = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block titl
 {% if l.handed_from %}
 <div class="card" id="convo"><div class="card-h"><div class="tile t-opp">★</div><h2>Conversation with {{ l.first_name or l.email }}</h2>
  <span class="muted" style="margin-left:6px">handed over by {{ l.handed_from }}</span><span style="flex:1"></span>
- <form method="post" action="{{ url_for('prospect_stage', lead_id=l.id) }}" style="margin:0"><input type="hidden" name="back" value="{{ url_for('lead', lead_id=l.id) }}"><select name="stage" onchange="this.form.submit()">{% for k, lbl in prospect_labels.items() %}<option value="{{ k }}" {{ 'selected' if (l.prospect_stage or 'new') == k }}>{{ lbl }}</option>{% endfor %}</select></form>
+ <form method="post" action="{{ url_for('prospect_stage', lead_id=l.id) }}" style="margin:0"><input type="hidden" name="back" value="{{ url_for('lead', lead_id=l.id) }}"><input type="hidden" name="value"><input type="hidden" name="reason"><select name="stage" onchange="if(this.value==='won'){var v=prompt('Deal value, for the reports:','');if(v===null){this.form.reset();return}this.form.value.value=v}if(this.value==='lost'){var r=prompt('Main reason it was lost?','');if(r===null){this.form.reset();return}this.form.reason.value=r}this.form.submit()">{% for k, lbl in prospect_labels.items() %}<option value="{{ k }}" {{ 'selected' if (l.prospect_stage or 'new') == k }}>{{ lbl }}</option>{% endfor %}</select></form>
  {% if mailbox_ok %}<form method="post" action="{{ url_for('mailbox_check') }}" style="margin:0 0 0 6px"><input type="hidden" name="back" value="{{ url_for('lead', lead_id=l.id) }}"><button class="btn sm">↻ Check mailbox</button></form>{% endif %}</div>
  <div class="card-b">
  {% if not mailbox_ok %}<div class="help" style="margin-top:0">Connect your mailbox in <a href="{{ url_for('settings', tab='handover') }}#mailbox">Settings → Handover</a> to see and send this prospect's emails here.</div>{% endif %}
@@ -494,7 +496,8 @@ LEAD = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block titl
  <textarea name="text" style="min-height:60px" placeholder="e.g. @Omar they asked for a 20% discount, OK?" required></textarea>{% if people %}<div class="muted" style="font-size:12px">{% for p in people %}@{{ p.name.split()[0] }}{{ ', ' if not loop.last }}{% endfor %}</div>{% endif %}<button class="btn sm" style="margin-top:4px">Add comment</button></form>{% endif %}</div>
   {% if mailbox_ok %}<form method="post" action="{{ url_for('prospect_reply', lead_id=l.id) }}" onsubmit="this.querySelector('button').disabled=true">
   <label>Reply to {{ l.email }} <span class="muted">(from your mailbox, in the same thread)</span></label>
-  <textarea name="body" style="min-height:140px" required placeholder="Hi {{ l.first_name or '' }},">{{ request.args.get('draft', '') }}</textarea>
+  {% if x.suggested_reply and not request.args.get('draft') %}<div class="muted" style="font-size:12px">✨ Suggested reply, written for a {{ l.temperature or 'warm' }} lead: edit it before sending.</div>{% endif %}
+  <textarea name="body" style="min-height:140px" required placeholder="Hi {{ l.first_name or '' }},">{{ request.args.get('draft', '') or x.suggested_reply or '' }}</textarea>
   <div style="display:flex;gap:8px;align-items:end;margin-top:8px"><div style="flex:1"><label>CC (optional)</label><input name="cc" placeholder="colleague@company.com"></div><div style="flex:1"><label>BCC (optional)</label><input name="bcc" placeholder="only our company or the client's"></div><button class="btn brand">Send reply</button></div></form>{% endif %}
  </div></div>
 {% endif %}
@@ -513,7 +516,7 @@ LEAD = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block titl
   <div><label>Email</label><div class="ro">{{ l.email }}</div></div>
   <div><label>LinkedIn</label><input name="x_linkedin" value="{{ x.linkedin or '' }}"></div>
   <div><label>Country</label><input name="x_country" value="{{ x.country or '' }}"></div>
-  {% for k, v in x.items() if k not in ('last_name','title','linkedin','country','fit','source','apollo_id') %}
+  {% for k, v in x.items() if k not in ('last_name','title','linkedin','country','fit','source','apollo_id','suggested_reply','handover_label','previously_contacted','company_contacted_before') %}
   <div><label>{{ k.replace('_',' ')|capitalize }}</label><input name="x_{{ k }}" value="{{ v }}"></div>{% endfor %}
  </div><button class="btn brand" style="margin-top:12px">Save</button></form></div></div>
  <div class="card"><div class="card-h"><div class="tile t-rev">✉</div><h2>Emails ({{ emails|length }})</h2></div>
@@ -561,6 +564,19 @@ LEAD = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block titl
   {% else %}<p class="muted" style="margin:0">Nothing sent yet.</p>{% endfor %}
   {% if l.status in ('nurture', 'paused', 'done', 'replied') and l.status not in ('unsubscribed','bounced') %}<form method="post" action="{{ url_for('lead_reconnect', lead_id=l.id) }}" style="margin-top:10px"><button class="btn">Write a reconnect email (for review)</button></form>{% endif %}
  </div></div>
+ {% if not (l.handed_from and mailbox_ok) %}<div class="card" id="compose"><div class="card-h"><div class="tile t-rev">✉</div><h2>Email {{ l.first_name or l.email }}</h2></div><div class="card-b">
+ {% if email_froms %}<form method="post" action="{{ url_for('lead_email', lead_id=l.id) }}" onsubmit="this.querySelector('button.brand').disabled=true">
+  <div class="grid2"><div><label>From</label><select name="from">{% for o in email_froms %}<option value="{{ o.value }}">{{ o.label }}</option>{% endfor %}</select></div>
+  <div><label>To</label><select name="to"><option>{{ l.email }}</option>{% for e in email_others %}<option>{{ e }}</option>{% endfor %}</select></div></div>
+  <label>Subject</label><input name="subject" value="{{ email_subject }}">
+  {% if x.suggested_reply %}<div class="muted" style="font-size:12px;margin-top:6px">✨ Suggested reply for a {{ l.temperature or 'warm' }} lead: edit it before sending.</div>{% endif %}
+  <textarea name="body" style="min-height:160px" required placeholder="Hi {{ l.first_name or '' }},">{{ x.suggested_reply or '' }}</textarea>
+  <div class="grid2"><div><label>CC (optional)</label><input name="cc" placeholder="someone at {{ l.email.split('@')[-1] }}"></div><div><label>BCC (optional)</label><input name="bcc" placeholder="our company only"></div></div>
+  <label style="display:flex;gap:6px;align-items:center;color:var(--ink);margin-top:8px"><input type="checkbox" name="stop" value="1" checked style="width:auto"> Stop the automatic emails to this lead (you're taking over)</label>
+  <label style="display:flex;gap:6px;align-items:center;color:var(--ink)"><input type="checkbox" name="footer" value="1" style="width:auto"> Add the usual footer</label>
+  <button class="btn brand" style="margin-top:10px">Send</button> <span class="hint">Goes in the same thread as your earlier emails{{ ', to your test address while test mode is on' if test_redirect }}. Copies outside the company and the client are blocked.</span>
+ </form>{% else %}<p class="muted" style="margin:0">Add an inbox in <a href="{{ url_for('settings', tab='inbox') }}">Settings → Email inboxes</a> (or connect your mailbox in Settings → Handover) to email leads from here.</p>{% endif %}
+ </div></div>{% endif %}
  {% with lead_id=l.id, opp_id=None %}""" + COMPOSER + r"""{% endwith %}
  <div class="card"><div class="card-h"><h2>Activity</h2></div><div class="card-b">""" + TIMELINE + r"""</div></div>
 </div></div>
@@ -890,6 +906,11 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <input name="SLACK_WEBHOOK_URL" type="password" autocomplete="off" placeholder="https://hooks.slack.com/services/…">
  <p class="hint">Get a Slack message whenever someone replies with interest.</p>
  <button class="btn brand" style="margin-top:12px">Save keys</button></form></div></div>
+<div class="card" id="budget"><div class="card-h"><h2>AI spending</h2></div><div class="card-b"><form method="post" action="{{ url_for('save_budget') }}">
+ <p style="margin-top:0">This month so far: <b>${{ '%.2f'|format(spend.usd) }}</b> <span class="muted">({{ spend.calls }} AI calls, {{ '{:,}'.format(spend['in'] + spend['out']) }} tokens; an estimate from approximate prices, check console.anthropic.com for the exact bill)</span></p>
+ <div class="grid2"><div><label>Monthly limit in USD (0 = no limit)</label><input name="monthly_usd" type="number" min="0" step="1" value="{{ budget.monthly_usd or 0 }}"></div></div>
+ <p class="hint">When the limit is reached, BSO keeps working: emails come from the templates and replies are sorted with keyword rules until next month.</p>
+ <button class="btn brand">Save</button></form></div></div>
 
 {% elif tab == 'emails' %}
 <div class="card"><div class="card-h"><h2>Your offer &amp; emails</h2></div><div class="card-b">
@@ -1143,6 +1164,18 @@ CAMPAIGN = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <label>Send from these inboxes <span class="muted">(none ticked = all inboxes)</span></label><div class="checks">{% for e in inboxes %}<label><input type="checkbox" name="inboxes" value="{{ e }}" {{ 'checked' if e in picked }}> {{ e }}</label>{% endfor %}</div>
  {% if c.id != 1 %}<label>What we offer, for the AI-written first line <span class="muted">(empty = same as the Main campaign)</span></label><textarea name="offer" style="min-height:70px" placeholder="{{ main_offer }}">{{ c.offer or '' }}</textarea>{% endif %}
 </div></div>
+<div class="card" id="brief"><div class="card-h"><h2>✨ Brief: how the AI writes this campaign's emails</h2>{% if not ai_on %}<span class="badge">add an AI key to use it</span>{% endif %}</div><div class="card-b">
+<form method="post" action="{{ url_for('campaign_brief', cid=c.id) }}">
+ <p class="muted" style="margin-top:0">With this on, every email is written fresh for each lead from these ingredients, so no two emails repeat the same words. Numbers and claims may only come from the proof points. Which angle, subject style and call to action work best is learned from what leads to meetings and deals (Master Console → Insights).</p>
+ <label class="switch"><input type="checkbox" name="writing_on" value="1" {{ 'checked' if writing != 'templates' }}><span></span><b>Write each email fresh with AI</b> (off: use the templates)</label>
+ <label>What we offer</label><textarea name="offer" style="min-height:70px">{{ brief.offer }}</textarea>
+ <label>Ideal customer</label><input name="ideal_customer" value="{{ brief.ideal_customer }}">
+ <label>Proof points: the only facts and numbers the AI may use (one per line: case studies, client types, numbers)</label><textarea name="proof_points" style="min-height:100px">{{ brief.proof_points|join('\n') }}</textarea>
+ <label>Angles to try</label><div class="checks">{% for k, v in angles.items() %}<label title="{{ v }}"><input type="checkbox" name="angles" value="{{ k }}" {{ 'checked' if k in brief.angles }}> {{ k }}</label>{% endfor %}</div>
+ <label>What each email is for (one line per step)</label><textarea name="step_purposes" style="min-height:80px">{{ brief.step_purposes|join('\n') }}</textarea>
+ <div class="grid2"><div><label>Tone</label><input name="tone" value="{{ brief.tone }}"></div><div><label>Most words per email</label><input name="max_words" type="number" min="40" max="250" value="{{ brief.max_words }}"></div></div>
+ <label>Rules</label><input name="rules" value="{{ brief.rules }}">
+ <button class="btn brand" style="margin-top:10px">Save brief</button></form></div></div>
 {% if c.id == 1 %}<div class="card"><div class="card-b">The Main campaign's emails (with A/B variants) are edited in <a href="{{ url_for('settings', tab='emails') }}">Settings → Your offer &amp; emails</a>.</div></div>
 {% else %}<div class="card" id="emails"><div class="card-h"><h2>Emails</h2><span class="muted">{first_name}, {company}, {personal_line}, {sender_name} are filled in for each lead</span></div><div class="card-b">
  {% for st in steps %}{% set i = loop.index0 %}<fieldset class="ibox"><legend>{{ 'First email' if i == 0 else 'Follow-up ' ~ i }}</legend>
@@ -1174,7 +1207,7 @@ PROSPECTS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block
 {% for p in items if (p.prospect_stage or 'new') == k %}<div class="kcard" draggable="true" data-id="{{ p.id }}" style="background:#fff;border:1px solid var(--line);{{ 'border-left:4px solid #2e844a;' if p.unseen or p.new_comments else ('border-left:4px solid #ba0517;' if k == 'new' and p.age >= 2 else '') }}border-radius:6px;padding:8px 10px;margin-bottom:8px;cursor:grab">
 <a href="{{ url_for('lead', lead_id=p.id) }}"><b>{{ p.name }}</b></a> {{ temp_badge(p.temperature) }}<br><small class="muted">{{ p.company or '' }}</small><br>
 <small>{{ p.age }}d{% if p.unseen %} · <b style="color:#2e844a">● {{ p.unseen }} new</b>{% endif %}{% if p.ncomments %} · 💬 {{ p.ncomments }}{% if p.new_comments %} <b style="color:#2e844a">new</b>{% endif %}{% endif %}</small></div>{% endfor %}</div>{% endfor %}</div>
-<form id="mv" method="post" style="display:none"><input type="hidden" name="stage"><input type="hidden" name="back" value="{{ url_for('prospects', view='board') }}"></form>
+<form id="mv" method="post" style="display:none"><input type="hidden" name="stage"><input type="hidden" name="value"><input type="hidden" name="reason"><input type="hidden" name="back" value="{{ url_for('prospects', view='board') }}"></form>
 <p class="muted">Drag a card to another column to change its stage. Red edge: not contacted for 2+ days. Green edge: new reply or comment.</p>
 <script>
 var drag=null;document.querySelectorAll('.kcard').forEach(function(c){c.addEventListener('dragstart',function(){drag=c;c.style.opacity=.5});c.addEventListener('dragend',function(){c.style.opacity=1})});
@@ -1182,7 +1215,10 @@ document.querySelectorAll('#board .col').forEach(function(col){col.addEventListe
 col.addEventListener('dragleave',function(){col.style.background='#eef1f4'});
 col.addEventListener('drop',function(e){e.preventDefault();col.style.background='#eef1f4';if(!drag)return;var st=col.dataset.stage;
 if((st==='won'||st==='lost')&&!confirm('Move this prospect to '+(st==='won'?'Won':'Lost')+'?'))return;
-var f=document.getElementById('mv');f.action='/prospects/'+drag.dataset.id+'/stage';f.stage.value=st;f.submit()})});
+var f=document.getElementById('mv');f.action='/prospects/'+drag.dataset.id+'/stage';f.stage.value=st;
+if(st==='won'){var v=prompt('Won! Deal value (e.g. 12000), for the reports:','');if(v===null)return;f.value.value=v;}
+if(st==='lost'){var r=prompt('Lost: what was the main reason? (price, timing, went with another vendor, no budget, no reply…)','');if(r===null)return;f.reason.value=r;}
+f.submit()})});
 </script>
 {% else %}
 <div class="card">{% if items %}<table class="tbl"><thead><tr><th>Prospect</th><th>Company</th><th>Conversation</th><th>Handed over by</th><th>Stage</th></tr></thead>

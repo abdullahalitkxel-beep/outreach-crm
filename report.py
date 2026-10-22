@@ -36,7 +36,10 @@ def ensure(con, add_column):
 CREATE TABLE IF NOT EXISTS incidents (            -- blocked or leaked emails, deletions: reported to the console, kept forever
     id INTEGER PRIMARY KEY, at TEXT, kind TEXT, lead_email TEXT, detail TEXT, how TEXT, msg TEXT, vis INTEGER DEFAULT 0
 );
-CREATE TRIGGER IF NOT EXISTS leads_vis_dirty AFTER UPDATE ON leads WHEN NEW.vis_dirty = 0 AND OLD.vis_dirty = 0
+DROP TRIGGER IF EXISTS leads_vis_dirty;
+CREATE TRIGGER leads_vis_dirty AFTER UPDATE OF status, stage, step, temperature, temp_reason, check_back, prospect_stage, handed_to,
+    handed_from, deal_status, deal_value, lost_reason, came_back, campaign_id, first_name, company, extra ON leads
+    WHEN NEW.vis_dirty = 0 AND OLD.vis_dirty = 0
 BEGIN UPDATE leads SET vis_dirty = 1 WHERE id = NEW.id; END;
 CREATE TRIGGER IF NOT EXISTS tasks_vis_dirty AFTER UPDATE ON tasks WHEN NEW.vis_dirty = 0 AND OLD.vis_dirty = 0
 BEGIN UPDATE tasks SET vis_dirty = 1 WHERE id = NEW.id; END;

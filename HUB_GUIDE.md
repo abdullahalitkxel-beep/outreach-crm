@@ -144,7 +144,24 @@ Master Console → **Security**. Everything here reaches every BSO at its next c
 
 **Erasing a laptop.** Removing a person now also erases their copy: at its next check-in their BSO hands over its leads (shared equally among the others), erases its leads, prospects, emails, notes and saved passwords, confirms, and only then is the account removed. *Erase laptop and disconnect* on a user's page does the same but keeps the account (for a lost laptop or a role change). *Remove now* skips the wait if the laptop is never coming back online.
 
-## 6. Security notes
+## 7. Replies: following the conversation
+
+BSO decides whose conversation an email belongs to by the **thread** first (the hidden IDs every mail app keeps), then the sender and the lead's other addresses, the **reference code** under each email (Settings → Safety → Replies), our original quoted inside a forwarded email, and finally the company (flagged "please confirm"). So a reply from a colleague in CC, from the lead's personal Gmail, or from a decision maker the email was forwarded to all land in the right place; forwards show their path (abc → def → xyz). When anyone at a company replies, the other leads at that company stop getting cold emails.
+
+Every reply is sorted 🔥 hot / ☀ warm / ❄ cold / ⛔ closed, with deadlines (hot 2 working hours, warm 1 working day; change them in Settings → Safety). Cold leads go to Nurture and come back on the date they mentioned with a check-back email for review. Each inbox has an **activity log** (Settings → Email inboxes) showing what BSO did with every email, a **Re-check** button, and Spam folders are read for replies to our own threads.
+
+**Emailing a client:** every lead page has an **✉ Email** button (top) and an Email box: it sends in the same thread from the inbox that has been writing to them (or your own mailbox), stops the automatic emails, and blocks copies outside the company and the client.
+
+## 8. Full visibility (Master Console → Conversations, Insights, Security)
+
+- **Conversations**: every lead of every person, by campaign, with every email sent and received (CC and BCC included), supervisors' emails with prospects, notes, tasks and temperatures. Everything each BSO held before this version is in the **Archive**.
+- Reports from each BSO are sealed with a key only that BSO and this console have; Google Drive only carries ciphertext. Handovers, comments and lead transfers are sealed too.
+- **Security → Incidents**: client emails copied outside (CC/BCC/forward), blocked attempts, deleted client emails, and emails seen only in the company archive mailbox. Entries are permanent and chained; review them and export to CSV. Set the retention period and partner domains there.
+- **Google Workspace**: Security → Company archive mailbox links to a step-by-step guide (copy of every supervisor email to an archive mailbox, quarantine for outside copies, Vault).
+- **Insights**: the funnel from lead to sale (log scale), results by campaign, person, supervisor, angle, kind of lead and inbox, next best step for open deals, and the weekly **strategy** for the bots: which angle / subject / ask works for which leads, lessons for the writer, and lead scoring. Nothing changes in the bots until you approve it (or allow small changes automatically).
+- **AI writing**: each campaign has a **Brief** (Campaign page): with an AI key, every email is written fresh from it; figures may only come from its proof points, and emails too similar to recent ones are rewritten. Settings → AI & Apollo keys shows the month's AI spending and takes a monthly limit.
+
+## 9. Security notes
 
 Passwords and device tokens are stored hashed (the hub never keeps a readable password); sign-in and invite attempts are rate-limited; forms are CSRF-protected; sessions expire after 12 hours. The hub never receives anyone's inbox passwords, API keys, lead lists or reply text. Tell your team before you switch this on: the Privacy Policy section 7 covers it, but your own employment rules may add duties.
 

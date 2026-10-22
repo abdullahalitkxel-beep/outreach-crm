@@ -152,6 +152,10 @@ def init_db():
         con.execute("ALTER TABLE users ADD COLUMN username TEXT")
         con.execute("UPDATE users SET username=lower(email) WHERE username IS NULL")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username)")
+    hcols = {r[1] for r in con.execute("PRAGMA table_info(handovers)")}
+    for col, decl in (("deal_value", "REAL"), ("lost_reason", "TEXT")):
+        if col not in hcols:
+            con.execute(f"ALTER TABLE handovers ADD COLUMN {col} {decl}")
     for col, decl in (("relay_pw", "TEXT"), ("tv", "INTEGER DEFAULT 1"), ("bot_status", "TEXT"), ("away_until", "TEXT"),
                       ("totp_secret", "TEXT"), ("recovery_codes", "TEXT"), ("wipe", "TEXT"),
                       ("setup_sent", "TEXT"), ("setup_applied", "TEXT")):
@@ -803,6 +807,83 @@ def conversation():
                   tab="conversations", icons=TEMP_ICON, kinds=__import__("vis").INCIDENT_KINDS)
 
 
+# ------------------------------------------------------------------ insights and the strategy profile
+
+def _learn_cfg(con):
+    """The AI key and models for the console's own analysis: the key from BSO setup, if one is set."""
+    t = team_setup()
+    if t.get("anthropic_key"):
+        os.environ.setdefault("ANTHROPIC_API_KEY", t["anthropic_key"])
+    return {"models": {"personalize": "claude-haiku-5-5", "write": "claude-sonnet-5-5"}}
+
+
+def strategy_cycle(con, force=False):
+    """Once a week (or on request): rebuild the strategy profile and propose it; auto-approve small changes if allowed."""
+    import learn
+    last = float(_m_get(con, "strategy_ts", "0") or 0)
+    if not force and time.time() - last < 7 * 86400:
+        return None
+    _m_set(con, "strategy_ts", str(time.time()))
+    active = json.loads(_m_get(con, "strategy_active", "") or "{}")
+    new = learn.build(con, _learn_cfg(con), active)
+    lines, small = learn.diff(active, new)
+    if not lines and active:
+        return None
+    if small and _m_get(con, "strategy_auto_small", "0") == "1" and active:
+        new["approved_by"], new["approved_at"] = "auto (small changes)", iso()
+        _m_set(con, "strategy_active", json.dumps(new))
+        _m_set(con, "strategy_pending", "")
+        con.execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)", (iso(), "system", "strategy_auto_approved", "; ".join(lines)[:300]))
+    else:
+        _m_set(con, "strategy_pending", json.dumps(dict(new, changes=lines)))
+    con.commit()
+    return new
+
+
+@app.route("/insights", methods=["GET", "POST"])
+@need()
+def insights():
+    import learn
+    con, msg = db(), None
+    if request.method == "POST":
+        act = request.form.get("action")
+        if act == "recompute":
+            strategy_cycle(con, force=True)
+            msg = "Recomputed from the latest results."
+        elif act in ("approve", "reject") and g.me["role"] == "owner":
+            pend = json.loads(meta_get("strategy_pending", "") or "{}")
+            if pend and act == "approve":
+                pend["approved_by"], pend["approved_at"] = g.me["name"], iso()
+                meta_set("strategy_active", json.dumps(pend))
+                audit("strategy_approved", "; ".join(pend.get("changes") or [])[:300])
+                threading.Thread(target=relay_cycle, daemon=True).start()
+                msg = "Approved: every BSO uses the new strategy from its next check-in."
+            else:
+                audit("strategy_rejected")
+                msg = "Kept the current strategy."
+            meta_set("strategy_pending", "")
+        elif act == "auto" and g.me["role"] == "owner":
+            meta_set("strategy_auto_small", "1" if request.form.get("auto") else "0")
+            msg = "Saved."
+    period = request.args.get("period", "all")
+    since = {"30d": iso(now() - timedelta(days=30)), "90d": iso(now() - timedelta(days=90))}.get(period)
+    js = learn.journeys(con, since)
+    fun = learn.funnel(js)
+    by = request.args.get("by", "campaign")
+    users_ = {u["id"]: u["name"] for u in con.execute("SELECT id, name FROM users")}
+    for j in js:
+        j["person"] = users_.get(j["user_id"], "?")
+        j["strategy"] = (j.get("arm") or "template").replace("|", " / ")
+    keymap = {"campaign": "campaign", "person": "person", "supervisor": "supervisor", "strategy": "strategy", "segment": "segment", "inbox": "inbox"}
+    rows_ = learn.breakdown(js, keymap.get(by, "campaign"))
+    active = json.loads(meta_get("strategy_active", "") or "{}")
+    pending = json.loads(meta_get("strategy_pending", "") or "{}")
+    return render("insights.html", tab="insights", msg=msg, fun=fun, svg=learn.svg_funnel(fun), rows=rows_, by=by, period=period,
+                  timings=learn.timings(js), active=active, pending=pending, steps=learn.next_steps(con, js)[:60],
+                  won_value=sum(j["deal_value"] or 0 for j in js if "won" in j["stages"]), auto=meta_get("strategy_auto_small", "0") == "1",
+                  weights=sorted(((k, v) for k, v in (active.get("scoring") or {}).items() if k != "bias"), key=lambda x: -abs(x[1]))[:12])
+
+
 @app.route("/archive")
 @need()
 def archive_page():
@@ -1313,7 +1394,8 @@ def approval_action(did):
     return redirect(url_for("approvals") + f"#d{did}" if action == "save" else url_for("approvals"))
 
 
-STAGES_BOARD = [("new", "New"), ("contacted", "Contacted"), ("meeting", "Meeting booked"), ("proposal", "Proposal sent"), ("won", "Won"), ("lost", "Lost")]
+STAGES_BOARD = [("new", "New"), ("contacted", "Contacted"), ("meeting", "Meeting booked"), ("met", "Meeting held"), ("proposal", "Proposal sent"),
+                ("negotiation", "Negotiation"), ("won", "Won"), ("lost", "Lost")]
 
 
 def _ho_rows(where="", args=()):
@@ -1439,7 +1521,7 @@ def handovers_page():
     items = [dict(r, wait=hours(r["at"], r["status_at"]) if r["status"] != "new" else None) for r in rows]
     sups = db().execute("SELECT u.id, u.name, u.status, u.away_until, (SELECT COUNT(*) FROM handovers h WHERE h.supervisor_id=u.id) n, "
                         "(SELECT COUNT(*) FROM handovers h WHERE h.supervisor_id=u.id AND h.status='new') open_n, "
-                        "(SELECT COUNT(*) FROM handovers h WHERE h.supervisor_id=u.id AND h.status IN ('meeting','proposal','won')) good "
+                        "(SELECT COUNT(*) FROM handovers h WHERE h.supervisor_id=u.id AND h.status IN ('meeting','met','proposal','negotiation','won')) good "
                         "FROM users u WHERE u.role='supervisor' ORDER BY u.name").fetchall()
     return render("handovers.html", items=items, sups=sups, sid=sid, tab="handovers", today=now().strftime("%Y-%m-%d"))
 
@@ -1918,6 +2000,13 @@ def ingest(con, uid, j):
             n_ev += 1
             if e.get("type") == "handover_in" and e.get("lead_email"):
                 con.execute("UPDATE handovers SET delivered=1 WHERE supervisor_id=? AND lead_email=?", (uid, str(e["lead_email"]).lower()))
+            if e.get("type") == "deal" and e.get("lead_email"):
+                try:
+                    dd = json.loads(e.get("detail") or "{}")
+                except ValueError:
+                    dd = {}
+                con.execute("UPDATE handovers SET deal_value=COALESCE(?, deal_value), lost_reason=? WHERE supervisor_id=? AND lead_email=?",
+                            (dd.get("value") or None, dd.get("reason") if dd.get("status") == "lost" else None, uid, str(e["lead_email"]).lower()))
             if e.get("type") == "prospect_stage" and e.get("lead_email"):
                 con.execute("UPDATE handovers SET status=?, status_at=? WHERE supervisor_id=? AND lead_email=?",
                             (str(e.get("detail", ""))[:30], str(e.get("at", iso()))[:25], uid, str(e["lead_email"]).lower()))
@@ -2219,6 +2308,10 @@ def decisions_for(con, uid, handovers=True):
         out.append(item)
     except Exception:
         vk = None
+    act = json.loads(_m_get(con, "strategy_active", "") or "{}")
+    if act and vk:                                       # the approved strategy, sealed (it contains real example emails)
+        out.append({"action": "strategy", "local_id": None, "version": act.get("version"),
+                    "sealed": seal_team({k: act.get(k) for k in ("version", "arms", "explore", "examples", "lessons", "scoring")})})
     for nt in con.execute("SELECT * FROM notices WHERE user_id=? AND delivered=0 ORDER BY id LIMIT 50", (uid,)).fetchall():
         it = json.loads(nt["item"])
         if vk and it.get("action") in ("leads_in", "comment", "removed", "transfer_out", "canary"):     # sealed for this person's BSO
@@ -2375,6 +2468,10 @@ def _relay_loop():
                     archive_box_cycle(con)
                 except Exception as e:
                     print("archive mailbox:", e)
+                try:
+                    strategy_cycle(con)
+                except Exception as e:
+                    print("strategy:", e)
                 if time.time() - float(_m_get(con, "purge_ts", "0") or 0) > 86400:
                     import vis as _vis
                     _vis.purge(con, security_cfg(con)["retention_months"])
@@ -2440,7 +2537,7 @@ BASE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name=
 <title>{% block title %}Master console{% endblock %} · BSO</title><style>""" + CSS + """{{ logo_css|safe }}</style></head><body>
 {% if me %}<div class="top">{{ logo(30, tile=True, uid='tp', weight='b', label='BSO')|safe }}<b>BSO Master console</b><small>{{ org }}</small><span class="sp"></span>
 <small>{{ me.name }} · {{ me.role }}</small><a href="{{ url_for('twofa') }}" style="color:#b9c3c9;font-size:12px">2-step sign-in</a><form method="post" action="{{ url_for('logout') }}" style="margin:0"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" style="padding:4px 10px">Sign out</button></form></div>
-<div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('conversations','Conversations','conversations'),('users','Users','users'),('approvals','Approvals','approvals'),('board','Prospect board','board'),('handovers','Handovers','handovers_page'),('activity','Activity','activity')] + ([('bso_setup','BSO setup','bso_setup'),('security','Security','security_page'),('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
+<div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('conversations','Conversations','conversations'),('insights','Insights','insights'),('users','Users','users'),('approvals','Approvals','approvals'),('board','Prospect board','board'),('handovers','Handovers','handovers_page'),('activity','Activity','activity')] + ([('bso_setup','BSO setup','bso_setup'),('security','Security','security_page'),('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
 <div class="wrap">{% if me %}<nav class="pgnav" style="display:flex;align-items:center;gap:8px;margin:0 0 12px;min-height:32px" aria-label="Page history"><a id="nav-back" class="pgbtn" href="#" title="Back (Alt + Left arrow)" style="display:none"><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg><span></span></a><a id="nav-fwd" class="pgbtn" href="#" title="Forward (Alt + Right arrow)" style="display:none"><span></span><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M4 11h12.2l-5.6-5.6L12 4l8 8-8 8-1.4-1.4 5.6-5.6H4z"/></svg></a></nav>{% endif %}{% if request.args.get('err') %}<div class="err">{{ request.args.get('err') }}</div>{% endif %}{% if request.args.get('ok') %}<div class="note">{{ request.args.get('ok') }}</div>{% endif %}{% block body %}{% endblock %}</div><script src="/hub.js"></script><script>(function(){ /* back / forward through the pages opened in this window, each labelled with the page's name */
  var name=(document.title||'').split(' · ')[0].trim()||'Page', here=location.pathname+location.search, t={l:[],i:-1};
  try{ t=JSON.parse(sessionStorage.getItem('bso_hist')||'') || t; }catch(e){}
@@ -2597,7 +2694,7 @@ T["handovers.html"] = """{% extends 'base.html' %}{% block title %}Handovers{% e
 <table><tr><th>When</th><th>Prospect</th><th>Reply</th><th>From</th><th>Supervisor</th><th>Stage</th><th class="r">Hours to first update</th></tr>
 {% for h in items %}<tr><td class="muted">{{ h.at|dt }}</td><td><a href="{{ url_for('handover_detail', hid=h.id) }}"><b>{{ h.lead_name }}</b></a><br><span class="muted">{{ h.title }}{{ ', ' if h.title and h.company }}{{ h.company }}<br>{{ h.lead_email }}</span></td>
 <td>{{ (h.label or '').replace('_', ' ') }}</td><td>{{ h.fromname or '–' }}</td><td>{{ h.supname or '–' }}{% if not h.delivered %}<br><span class="muted">waiting for their BSO</span>{% endif %}</td>
-<td><span class="badge {{ 'b-ok' if h.status in ('meeting','proposal','won') else 'b-bad' if h.status == 'lost' else 'b-warn' if h.status == 'new' else '' }}">{{ h.status }}</span></td><td class="r">{{ h.wait if h.wait is not none else '–' }}</td></tr>
+<td><span class="badge {{ 'b-ok' if h.status in ('meeting','met','proposal','negotiation','won') else 'b-bad' if h.status == 'lost' else 'b-warn' if h.status == 'new' else '' }}">{{ h.status }}</span></td><td class="r">{{ h.wait if h.wait is not none else '–' }}</td></tr>
 {% else %}<tr><td colspan="7" class="muted">No prospects handed over yet.</td></tr>{% endfor %}</table></div>{% endblock %}"""
 T["board.html"] = """{% extends 'base.html' %}{% block title %}Prospect board{% endblock %}{% block body %}
 <form method="get" class="card"><div class="card-b" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end">
@@ -2732,6 +2829,26 @@ T["workspace.html"] = """{% extends 'base.html' %}{% block title %}Google Worksp
 <h3>5. Google Vault (if your plan includes it)</h3><p>Business Plus, Enterprise and some Education plans include Vault (vault.google.com). Create a <b>Retention rule</b> for Gmail covering the supervisors' group ("retain indefinitely"): Vault then keeps every message even after a supervisor permanently deletes it, and you can search and export them for legal needs. Check your plan under <b>Billing → Subscriptions</b>.</p>
 <h3>6. Tell the team</h3><p>Monitoring company mailboxes is generally allowed when staff are clearly told beforehand. BSO shows each person the updated notice and they confirm it once. Your local employment and privacy rules may add requirements; take local advice.</p>
 </div></div>{% endblock %}"""
+T["insights.html"] = """{% extends 'base.html' %}{% block title %}Insights{% endblock %}{% block body %}{% if msg %}<div class="note">{{ msg }}</div>{% endif %}
+<div class="card"><div class="card-h"><h2>From lead to sale</h2><span class="muted">log scale, so every step stays readable</span><span style="flex:1"></span>
+<form style="margin:0"><select name="period" onchange="this.form.submit()">{% for k, l in [('all','All time'),('90d','Last 90 days'),('30d','Last 30 days')] %}<option value="{{ k }}" {{ 'selected' if period == k }}>{{ l }}</option>{% endfor %}</select><input type="hidden" name="by" value="{{ by }}"></form></div>
+<div class="card-b">{{ svg|safe }}<p class="muted">Won so far: {{ '{:,.0f}'.format(won_value) }} in deal value.{% for k, t in timings.items() %} · {{ k }}: {{ t.median_days if t.median_days is not none else '–' }} days (median of {{ t.n }}){% endfor %}</p></div></div>
+<div class="card"><div class="card-h"><h2>Where it works</h2><span style="flex:1"></span>{% for k, l in [('campaign','Campaign'),('person','Person'),('supervisor','Supervisor'),('strategy','Angle / subject / ask'),('segment','Kind of lead'),('inbox','Inbox')] %}<a class="btn {{ 'brand' if by == k }}" style="padding:4px 10px;margin-left:4px" href="{{ url_for('insights', by=k, period=period) }}">{{ l }}</a>{% endfor %}</div>
+<table><tr><th>{{ by|capitalize }}</th><th class="r">Leads</th><th class="r">Emailed</th><th class="r">Replied</th><th class="r">Positive</th><th class="r">Meetings</th><th class="r">Won</th><th class="r">Value</th><th class="r">Reply %</th><th class="r">Positive %</th><th class="r">Meeting %</th></tr>
+{% for r in rows %}<tr><td>{{ r.key }}</td><td class="r">{{ r.leads }}</td><td class="r">{{ r.emailed }}</td><td class="r">{{ r.replied }}</td><td class="r">{{ r.positive }}</td><td class="r">{{ r.meetings }}</td><td class="r">{{ r.won }}</td><td class="r">{{ '{:,.0f}'.format(r.value) }}</td><td class="r">{{ r.reply_rate }}</td><td class="r">{{ r.positive_rate }}</td><td class="r">{{ r.meeting_rate }}</td></tr>{% else %}<tr><td colspan="11" class="muted">No results reported yet.</td></tr>{% endfor %}</table></div>
+<div class="card" id="strategy"><div class="card-h"><h2>Strategy for the bots</h2>{% if active.version %}<span class="muted">in use since {{ active.approved_at|dt if active.approved_at else '' }} ({{ active.approved_by or '' }})</span>{% else %}<span class="muted">none approved yet: bots try every angle evenly</span>{% endif %}
+<span style="flex:1"></span><form method="post" style="margin:0"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" name="action" value="recompute">Recompute now</button></form></div><div class="card-b">
+{% if pending.version %}<div class="note"><b>Proposed changes</b> (from {{ pending.data.emailed }} emails, {{ pending.data.positive }} positive replies, {{ pending.data.meetings }} meetings, {{ pending.data.won }} won):<ul>{% for c in pending.changes or [] %}<li>{{ c }}</li>{% else %}<li>First strategy from your results.</li>{% endfor %}</ul>
+{% if pending.lessons %}<b>Lessons the writer will use:</b><ul>{% for l in pending.lessons %}<li>{{ l }}</li>{% endfor %}</ul>{% endif %}
+{% if me.role == 'owner' %}<form method="post" style="display:inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn brand" name="action" value="approve">Approve: send to every BSO</button> <button class="btn" name="action" value="reject">Keep the current one</button></form>{% endif %}</div>
+{% elif active.lessons %}<b>Lessons in use:</b><ul>{% for l in active.lessons %}<li>{{ l }}</li>{% endfor %}</ul>{% endif %}
+<p class="muted">The bots keep about 20% of emails for trying other angles, so they never stop learning. Results are judged on meetings and deals, not opens. Until there's enough data (roughly 1,000–2,000 emails and a few dozen replies), they use the defaults.</p>
+{% if weights %}<b>What makes a lead likely to respond</b> (lead scoring, used to email the most promising first):<ul>{% for k, v in weights %}<li>{{ k.replace(':', ': ') }} <span class="{{ 'b-ok' if v > 0 else 'b-bad' }} badge">{{ '+' if v > 0 }}{{ '%.2f'|format(v) }}</span></li>{% endfor %}</ul>{% endif %}
+{% if me.role == 'owner' %}<form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="auto"><label style="display:flex;gap:6px;color:inherit"><input type="checkbox" name="auto" value="1" style="width:auto" {{ 'checked' if auto }} onchange="this.form.submit()"> Approve small weekly changes automatically (no change bigger than 10 points of volume)</label></form>{% endif %}
+</div></div>
+<div class="card"><div class="card-h"><h2>Next best step for open deals</h2></div><table><tr><th>Prospect</th><th>Supervisor</th><th>Stage</th><th class="r">Days in stage</th><th>Suggested next step</th></tr>
+{% for x in steps %}<tr><td><a href="{{ url_for('conversation', email=x.email) }}">{{ x.name or x.email }}</a> <span class="muted">{{ x.company or '' }}</span></td><td>{{ x.sup or '—' }}</td><td>{{ x.stage }}</td><td class="r">{{ x.days }}</td><td>{{ x.step }}</td></tr>{% else %}<tr><td colspan="5" class="muted">No open deals.</td></tr>{% endfor %}</table></div>
+{% endblock %}"""
 T["security.html"] = """{% extends 'base.html' %}{% block title %}Security{% endblock %}{% block body %}
 {% if msg %}<div class="note">{{ msg }}</div>{% endif %}
 <div class="card" id="incidents"><div class="card-h"><h2>Incidents</h2><span class="badge {{ 'b-ok' if chain_ok else 'b-bad' }}">{{ 'log intact' if chain_ok else 'log altered at #' ~ chain_bad }}</span>

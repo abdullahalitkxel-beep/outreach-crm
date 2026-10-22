@@ -463,11 +463,11 @@ def lead(lead_id):
         pending_draft=(rows("SELECT id FROM outbox WHERE lead_id=? AND status='pending'", lead_id) or [None])[0],
         opps=rows("SELECT * FROM opportunities WHERE lead_id=?", lead_id),
         open_tasks=rows("SELECT * FROM tasks WHERE lead_id=? AND status='open' ORDER BY due_date", lead_id),
-        timeline=timeline_for(lead_id), opp_open=OPP_OPEN_STAGES, **tracking_ctx(lead_id),
+        timeline=timeline_for(lead_id), opp_open=OPP_OPEN_STAGES, **tracking_ctx(lead_id), **email_ctx(lead_id, l),
         default_close=(date.today() + timedelta(days=30)).isoformat(), **prospect_ctx(lead_id, l))
 
 
-KIND_LABELS = {"step": "email", "intro": "warm intro", "reconnect": "check-back", "supervisor": "supervisor email"}
+KIND_LABELS = {"step": "email", "intro": "warm intro", "reconnect": "check-back", "supervisor": "supervisor email", "manual": "written in BSO"}
 
 
 def tracking_ctx(lead_id):
@@ -662,6 +662,87 @@ def convert_lead(lead_id):
         add_task(con, f["next_step"], lead_id=lead_id, opp_id=opp_id)
     con.commit()
     return redirect(url_for("opp", opp_id=opp_id, msg="Lead converted. Account and opportunity created."))
+
+
+def email_ctx(lead_id, l):
+    """For the Email tab on a lead's page: which inboxes can write, and the thread to answer."""
+    senders = [x for x in (cfg().get("senders") or []) if x.get("email") and "example" not in x.get("email", "")]
+    mbox = mailbox.conf(cfg())
+    froms = []
+    if l.get("handed_from") and mbox:
+        froms.append({"value": "mailbox", "label": f"{mbox['email']} (your mailbox)"})
+    own = (l.get("sender") or "").lower()
+    for x in sorted(senders, key=lambda x: x["email"].lower() != own):
+        froms.append({"value": x["email"], "label": x["email"] + (" (has been emailing this lead)" if x["email"].lower() == own else "")})
+    if mbox and not l.get("handed_from"):
+        froms.append({"value": "mailbox", "label": f"{mbox['email']} (your mailbox)"})
+    last_in = (rows("SELECT subject FROM received WHERE lead_id=? ORDER BY id DESC LIMIT 1", lead_id) or [None])[0]
+    last_out = (rows("SELECT subject FROM sent_log WHERE lead_id=? ORDER BY id DESC LIMIT 1", lead_id) or [None])[0]
+    subj = (last_in["subject"] if last_in else None) or (last_out["subject"] if last_out else None) or l.get("first_subject") or ""
+    subj = re.sub(r"^\[TEST for [^\]]+\]\s*", "", subj)
+    subj = subj if not subj or subj.lower().startswith("re:") else "Re: " + subj
+    others = [r["email"] for r in rows("SELECT email FROM lead_addresses WHERE lead_id=?", lead_id)]
+    return {"email_froms": froms, "email_subject": subj, "email_others": others}
+
+
+@app.post("/lead/<int:lead_id>/email")
+def lead_email(lead_id):
+    """Write to a lead from BSO, in the same thread: from the inbox that has been emailing them, or your own mailbox."""
+    import convo
+    l = dict(get_lead(lead_id))
+    f = request.form
+    body = (f.get("body") or "").strip()
+    to = (f.get("to") or l["email"]).strip().lower()
+    cc, bcc = (f.get("cc") or "").strip(), (f.get("bcc") or "").strip()
+    subject = (f.get("subject") or "").strip() or ("Re: " + (l.get("first_subject") or "following up"))
+    back = url_for("lead", lead_id=lead_id) + "#compose"
+    if not body:
+        return redirect(url_for("lead", lead_id=lead_id, msg="Write the email first.", err=1) + "#compose")
+    allowed_to = {l["email"].lower()} | {r["email"].lower() for r in rows("SELECT email FROM lead_addresses WHERE lead_id=?", lead_id)}
+    if to not in allowed_to and convo.company_domain(to) != convo.company_domain(l["email"]):
+        return redirect(url_for("lead", lead_id=lead_id, msg=f"{to} isn't this lead or someone at their company.", err=1) + "#compose")
+    if f.get("from") == "mailbox" and l.get("handed_from"):
+        ok, msg = mailbox.send_reply(cfg(), db(), lead_id, body, cc, bcc)
+        return redirect(url_for("lead", lead_id=lead_id, msg=msg, err=None if ok else 1) + ("#convo" if ok else "#compose"))
+    c = cfg()
+    pick = f.get("from") or ""
+    if pick == "mailbox":
+        m = mailbox.conf(c)
+        sender = {"email": m["email"], "name": m["name"], "smtp_host": m["smtp_host"], "smtp_port": m["smtp_port"], "password": m["password"],
+                  "username": m.get("username") or m["email"]} if m else None
+    else:
+        sender = next((x for x in bot.load_senders(c) if x["email"].lower() == pick.lower()), None)
+    if not sender or not sender.get("password"):
+        return redirect(url_for("lead", lead_id=lead_id, msg="That inbox has no saved password (Settings → Email inboxes).", err=1) + "#compose")
+    extra = [a.strip().lower() for a in re.split(r"[,;\s]+", f"{cc},{bcc}") if "@" in a]
+    bad = mailbox.outside(c, db(), lead_id, l["email"], sender["email"], extra)
+    if bad:
+        import report
+        report.incident(db(), "blocked", l["email"], f"{sender['email']} tried to copy {', '.join(bad)} on an email to {to}: not sent",
+                        "blocked in BSO before sending", {"from": sender["email"], "to": to, "cc": cc, "bcc": bcc, "subject": subject, "body": body[:20000]})
+        db().commit()
+        return redirect(url_for("lead", lead_id=lead_id, msg=f"Not sent: {', '.join(bad)} is outside the company and this client.", err=1) + "#compose")
+    last = (rows("SELECT msg_id FROM received WHERE lead_id=? AND msg_id IS NOT NULL ORDER BY id DESC LIMIT 1", lead_id) or [None])[0]
+    in_reply = (last["msg_id"] if last else None) or l.get("first_msg_id")
+    redirect_to = test_redirect()
+    full = body + ("\n\n" + bot.render(c.get("footer") or "", l, sender, c) if f.get("footer") else "")
+    try:
+        if redirect_to:
+            mid = bot.send_email(sender, redirect_to, f"[TEST for {to}] {subject}", full, in_reply)
+        else:
+            mid = bot.send_email(sender, to, subject, full, in_reply, cc=cc or None, headers={"Bcc": bcc} if bcc else None)
+    except Exception as e:
+        return redirect(url_for("lead", lead_id=lead_id, msg=f"Couldn't send: {e}", err=1) + "#compose")
+    convo.record_sent(db(), mid, l, "manual", sender["email"], redirect_to or to, subject, full, cc=cc or None, bcc=bcc or None, test=bool(redirect_to))
+    log_event(db(), lead_id, "sent", "email written in BSO" + (" (test)" if redirect_to else ""), sender["email"])
+    db().execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'email')",
+                 (lead_id, f"Email sent from {sender['email']} to {to}{' (CC ' + cc + ')' if cc else ''}\nSubject: {subject}\n\n{body}", iso(now_utc())))
+    if f.get("stop") and l["status"] == "active":
+        db().execute("UPDATE leads SET status='paused' WHERE id=?", (lead_id,))
+        cancel_drafts(db(), lead_id)
+    db().execute("UPDATE tasks SET status='done', done_at=? WHERE lead_id=? AND status='open' AND kind='respond'", (today(), lead_id))
+    db().commit()
+    return redirect(url_for("lead", lead_id=lead_id, msg=("Sent to your test address (test mode)." if redirect_to else f"Sent to {to}.")) + "#tracking")
 
 
 @app.post("/lead/<int:lead_id>/note")
@@ -1080,7 +1161,7 @@ def conversation_json(lead_id, focus=None):
         fidx = next((i for i, x in enumerate(items) if x.get("_sid") == focus), None)
     l = get_lead(lead_id)
     team.record_access(db(), "view_conversation", l["email"] if l else str(lead_id), len(items))
-    return {"items": items, "focus": fidx, "lead": {"email": l["email"], "name": lead_view(l)["name"], "company": l["company"]} if l else {}}
+    return {"items": items, "focus": fidx, "lead": {"id": l["id"], "email": l["email"], "name": lead_view(l)["name"], "company": l["company"]} if l else {}}
 
 
 def campaign_sequence(c):
@@ -1159,8 +1240,23 @@ def campaign(cid):
         msg = "Saved." + (f" ⚠ Your emails use words on the avoid list: {', '.join(hits)}." if hits else "")
         return redirect(url_for("campaign", cid=cid, msg=msg, _anchor="emails" if action == "add_step" else None))
     inboxes = [x.get("email") for x in (cfg().get("senders") or []) if x.get("email") and "example" not in x.get("email", "")]
+    import writer
     return render("campaign.html", c=c, st=campaign_stats(cid), steps=campaign_sequence(c), inboxes=inboxes,
-                  picked=json.loads(c["inboxes"] or "[]"), main_offer=cfg().get("offer", ""))
+                  picked=json.loads(c["inboxes"] or "[]"), main_offer=cfg().get("offer", ""), brief=writer.brief(cfg(), db(), cid),
+                  angles=writer.ANGLE_TEXT, ai_on=bool(env("ANTHROPIC_API_KEY")), writing=(c["writing"] or "ai") if "writing" in c.keys() else "ai")
+
+
+@app.post("/campaigns/<int:cid>/brief")
+def campaign_brief(cid):
+    import writer
+    f = request.form
+    lines = lambda k: [x.strip() for x in f.get(k, "").replace("\r", "").split("\n") if x.strip()]
+    b = {"offer": " ".join(f.get("offer", "").split()), "ideal_customer": f.get("ideal_customer", "").strip(), "proof_points": lines("proof_points"),
+         "angles": [a for a in f.getlist("angles") if a in writer.ANGLE_TEXT] or list(writer.ANGLES), "step_purposes": lines("step_purposes"),
+         "tone": f.get("tone", "").strip(), "rules": f.get("rules", "").strip(), "max_words": max(40, min(250, int(f.get("max_words") or 110)))}
+    db().execute("UPDATE campaigns SET brief=?, writing=? WHERE id=?", (json.dumps(b), "ai" if f.get("writing_on") else "templates", cid))
+    db().commit()
+    return redirect(url_for("campaign", cid=cid, msg="Brief saved. New emails are written from it.") + "#brief")
 
 
 @app.post("/lead/<int:lead_id>/campaign")
@@ -1173,8 +1269,8 @@ def lead_campaign(lead_id):
 
 # ---------------------------------------------------------------- my prospects (lead gen supervisor)
 
-PROSPECT_LABELS = {"new": "New: not contacted yet", "contacted": "Contacted", "meeting": "Meeting booked",
-                   "proposal": "Proposal sent", "won": "Won", "lost": "Lost"}
+PROSPECT_LABELS = {"new": "New: not contacted yet", "contacted": "Contacted", "meeting": "Meeting booked", "met": "Meeting held",
+                   "proposal": "Proposal sent", "negotiation": "Negotiation", "won": "Won", "lost": "Lost"}
 
 
 @app.route("/prospects")
@@ -1243,6 +1339,14 @@ def prospect_stage(lead_id):
     con.execute("UPDATE leads SET prospect_stage=? WHERE id=? AND handed_from IS NOT NULL", (st, lead_id))
     log_event(con, lead_id, "prospect_stage", st)
     if st in ("won", "lost"):
+        try:
+            value = float(re.sub(r"[^\d.]", "", request.form.get("value", "") or "0") or 0)
+        except ValueError:
+            value = 0
+        reason = (request.form.get("reason") or "").strip()[:200]
+        con.execute("UPDATE leads SET deal_status=?, deal_value=CASE WHEN ?>0 THEN ? ELSE deal_value END, lost_reason=? WHERE id=?",
+                    (st, value, value, reason if st == "lost" else None, lead_id))
+        log_event(con, lead_id, "deal", json.dumps({"status": st, "value": value, "reason": reason}))
         con.execute("UPDATE tasks SET status='done', done_at=? WHERE lead_id=? AND status='open'", (today(), lead_id))
     con.commit()
     return redirect(request.form.get("back") or url_for("prospects"))
@@ -1879,7 +1983,7 @@ def settings():
                   dsc_recent=rows("SELECT * FROM discovered ORDER BY at DESC LIMIT 8"), ai_key=bool(env("ANTHROPIC_API_KEY")), inbox_emails=[x.get("email") for x in (c.get("senders") or []) if x.get("email") and "example" not in x.get("email", "")],
                   startup_ok=startup_supported(), startup_on=startup_enabled(), is_bot=team.is_bot(),
                   ho=dict(c.get("handover") or {}), pm=dict(c.get("prospect_mailbox") or {}), pm_pw=mask(env(mailbox.PW_KEY)), ho_default=bot_default_intro(), team_sups=team.supervisors() if team.joined() else [],
-                  live=_live_summary(), test_info=bot.test_counts(db()), pb=_convo.playbook(cfg()), **_activity_ctx(),
+                  live=_live_summary(), test_info=bot.test_counts(db()), spend=bot.ai_spend(), budget=dict(cfg().get("ai_budget") or {}), pb=_convo.playbook(cfg()), **_activity_ctx(),
                   team=dict(team.state(), joined=team.joined(), is_bot=team.is_bot(), idle=team.idle_minutes(),
                             idle_mine=team.state().get("my_idle_minutes") is not None, idle_default=int(team.security().get("idle_minutes", 15) or 0), policy=team.policy(), disclosure=team.DISCLOSURE, locked=team.locked_in(), signed=team.signed_in()))
 
@@ -2087,6 +2191,16 @@ def save_replies():
 def clear_test():
     n = bot.clear_test_results(db())
     return redirect(url_for("settings", tab="safety", result=f"Test results cleared: {n} lead(s) are back as they were before testing.", ok=1))
+
+
+@app.post("/settings/budget")
+def save_budget():
+    try:
+        v = max(0.0, float(request.form.get("monthly_usd") or 0))
+    except ValueError:
+        v = 0.0
+    write_settings({"ai_budget": dict(cfg().get("ai_budget") or {}, monthly_usd=v)})
+    return redirect(url_for("settings", tab="keys", result="Saved.", ok=1) + "#budget")
 
 
 @app.post("/settings/keys")

@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS temp_log (                  -- every temperature deci
 
 LEAD_COLUMNS = (("temperature", "TEXT"), ("temp_reason", "TEXT"), ("check_back", "TEXT"), ("ref", "TEXT"),
                 ("came_back", "TEXT"), ("journey", "TEXT"), ("deal_status", "TEXT"), ("lost_reason", "TEXT"),
-                ("score", "REAL"))
+                ("score", "REAL"), ("fit_score", "REAL"))
 
 
 def ensure(con, add_column):
