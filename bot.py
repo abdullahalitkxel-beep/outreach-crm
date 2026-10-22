@@ -277,6 +277,8 @@ def db_connect(path):
         con.execute("UPDATE leads SET stage='unqualified' WHERE stage='lost'")
         import convo
         convo.ensure(con, _add_column)
+        import report
+        report.ensure(con, _add_column)
         con.execute("CREATE INDEX IF NOT EXISTS sent_log_email ON sent_log(lead_email)")
         _test_triggers(con)
         con.commit()

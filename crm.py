@@ -204,7 +204,7 @@ def signin():
     st = team.state()
     return render("signin.html", err=err, nxt=nxt, hub=team.hub_url(), hub_fixed=bool(team.defaults().get("hub")),
                   hub_known=bool(team.hub_url()),
-                  first=not st.get("username"), disclosure=team.DISCLOSURE, last_user=st.get("username", ""),
+                  first=not st.get("username") or str(st.get("consent") or "1") != team.CONSENT_VERSION, disclosure=team.DISCLOSURE, last_user=st.get("username", ""),
                   optional=not team.required())
 
 
@@ -547,7 +547,7 @@ def prospect_ctx(lead_id, l):
 
 @app.post("/lead/<int:lead_id>/reply")
 def prospect_reply(lead_id):
-    ok, msg = mailbox.send_reply(cfg(), db(), lead_id, request.form.get("body", ""), request.form.get("cc", ""))
+    ok, msg = mailbox.send_reply(cfg(), db(), lead_id, request.form.get("body", ""), request.form.get("cc", ""), request.form.get("bcc", ""))
     return redirect(url_for("lead", lead_id=lead_id, msg=msg, _anchor="convo") if ok else
                     url_for("lead", lead_id=lead_id, msg=msg, draft=request.form.get("body", "")[:4000], _anchor="convo"))
 
@@ -579,10 +579,10 @@ def _mailbox_loop():
     """While BSO is open: check the supervisor's mailbox for prospect emails every few minutes."""
     import time as _t
     while True:
-        _t.sleep(180)
+        _t.sleep(60)
         try:
-            if team.required() and not team.signed_in():
-                continue
+            if team.required() and not team.joined():
+                continue           # keeps watching the prospects' conversations even while BSO is locked
             c = load_config(CONFIG_PATH)
             if not mailbox.conf(c):
                 continue

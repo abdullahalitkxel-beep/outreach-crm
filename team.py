@@ -28,18 +28,20 @@ from bot import add_task, DATA, SECRETS, env, log_event, now_utc, iso, set_stage
 
 TOKEN_KEY = "BSO_TEAM_TOKEN"
 STATE = Path(DATA) / "team.json"
-CONSENT_VERSION = "1"
+CONSENT_VERSION = "2"
 SHARED_TYPES = {"sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "handover", "handover_in", "prospect_stage"}
 PROSPECT_STAGES = ["new", "contacted", "meeting", "proposal", "won", "lost"]
 DISCLOSURE = [
-    "Your manager can see how many emails you send, which leads they go to (email address and company), which step, and from which of your inboxes.",
-    "Your manager can see the label of each reply (for example “interested”). When a prospect replies with interest, a meeting request or a question, they are handed to a lead gen supervisor, who receives the prospect’s details, their reply and the emails you sent them.",
-    "If your manager requires approval, they can read, edit and approve or reject your drafts before they send.",
-    "Your manager can pause your account, set a daily send cap and a weekly target, and see when this laptop last connected.",
-    "If you leave the team, your manager can have your BSO hand its leads over to your colleagues and then erase its data from this laptop.",
-    "Your manager sees when you export leads, open the data folder or view a long list, and whether this laptop's drive is encrypted. BSO locks itself after a while without use.",
-    "Never shared: your email passwords, API keys, inbox logins, your lead list, your notes, or the text of replies.",
-    "Your data stays on this laptop; your manager keeps the activity log already sent. If you stop working with the team, your admin removes your account.",
+    "All leads and all conversations with clients are company property. Your company sees everything BSO handles, in full.",
+    "That includes every email sent and received in a lead's conversation (text, To, CC and BCC), lead lists by campaign, notes, tasks, "
+    "reply temperatures and run summaries. What was already on this computer is copied once into the company archive.",
+    "If you are a lead gen supervisor: your work mailbox is connected so that every conversation with a prospect (in any thread, with any of "
+    "their addresses or colleagues) is tracked, including emails sent from other apps. Copying a client email to an address outside the "
+    "company and the client is blocked in BSO and reported; deleting a client email is reported (the company keeps its copy).",
+    "Your manager can approve, edit or reject drafts, pause your account, set limits, and see when this computer last connected, "
+    "when you export or view large lists, and whether its drive is encrypted.",
+    "If you leave the team, BSO hands its leads over to your colleagues and then erases its data from this computer.",
+    "Never shared: your email passwords, API keys and inbox logins. Everything sent to the company is encrypted on the way.",
 ]
 
 
@@ -247,7 +249,7 @@ def sign_in(con, username, password, consent=False, hub=None):
         raise ValueError("Enter your ID and password.")
     s = state()
     first_time = s.get("username") != username
-    if first_time and not consent:
+    if (first_time or str(s.get("consent") or "1") != CONSENT_VERSION) and not consent:
         raise ValueError("Tick the box to confirm you've read what your manager will be able to see.")
     target = hub or hub_url()
     if not target and _local_hub_running():
@@ -496,7 +498,7 @@ def restore(con):
     n = 0
     for item in r.get("items") or []:
         try:
-            _receive_handover(con, item, restoring=True)
+            _receive_handover(con, unseal_item(item), restoring=True)
             n += 1
         except Exception as e:
             print("restore item:", e)
@@ -506,6 +508,63 @@ def restore(con):
     s["restored"] = True
     save_state(s)
     return n
+
+
+# ---------------------------------------------------------------- sealing team items (Google only carries ciphertext)
+
+SEAL_PREFIX = "BSOSEAL:"
+TEAM_KEY = "BSO_TEAM_SEAL"
+
+
+def _team_key():
+    k = SECRETS.load().get(TEAM_KEY)
+    return bytes.fromhex(k) if k else None
+
+
+def seal_team(obj):
+    import sealbox
+    k = _team_key()
+    return SEAL_PREFIX + sealbox.seal(k, json.dumps(obj, default=str)) if k else None
+
+
+def open_team(v):
+    import sealbox
+    if not (isinstance(v, str) and v.startswith(SEAL_PREFIX)):
+        return None
+    k = _team_key()
+    if not k:
+        return None
+    try:
+        return json.loads(sealbox.open_(k, v[len(SEAL_PREFIX):]))
+    except Exception:
+        return None
+
+
+def unseal_item(d):
+    """Team items arrive sealed: as {'sealed': ...} from the console, or in 'reply' / 'text' when the Google script built them."""
+    if isinstance(d.get("sealed"), str):
+        inner = open_team(d["sealed"])
+        if inner is not None:
+            d = dict(inner, **{k: v for k, v in d.items() if k in ("handover_id", "local_id", "action")})
+    for f in ("reply", "text"):
+        inner = open_team(d.get(f))
+        if isinstance(inner, dict):
+            keep = {k: d[k] for k in ("handover_id", "local_id", "action", "uid", "author", "author_name", "at", "from", "stage") if k in d}
+            d = dict(d, **inner, **keep)
+    return d
+
+
+def _seal_handover(h):
+    k = _team_key()
+    if not k:
+        return h
+    lead = h.get("lead") or {}
+    outer = {f: h.get(f) for f in ("lead_local_id", "supervisor", "label", "at", "out_id", "from_name", "campaign") if f in h}
+    outer["lead"] = {"email": lead.get("email")}
+    outer["reply"] = seal_team(h)
+    outer["intro"] = ""
+    outer["thread"] = []
+    return outer
 
 
 def _receive_comment(con, d):
@@ -836,8 +895,10 @@ def _leads_in(con, d):
 def _apply_decisions(con, decisions):
     """Apply what the master console sent. Returns (draft ids done, handover ids received)."""
     done, ho_done = [], []
-    decisions = sorted(decisions, key=lambda d: 0 if d.get("action") == "setup_key" else 1)
+    decisions = sorted(decisions, key=lambda d: 0 if d.get("action") in ("setup_key", "vis_state") else 1)
     for d in decisions:
+        if isinstance(d, dict) and (d.get("sealed") or str(d.get("reply") or "").startswith(SEAL_PREFIX) or str(d.get("text") or "").startswith(SEAL_PREFIX)):
+            d = unseal_item(d)
         action = d.get("action")
         if action == "config":
             s = state()
@@ -847,6 +908,20 @@ def _apply_decisions(con, decisions):
             if isinstance(d.get("security"), dict):
                 s["security"] = d["security"]
             save_state(s)
+            continue
+        if action == "vis_state":
+            s2 = state()
+            s2["vis_key_ok"] = bool(d.get("key_ok"))
+            save_state(s2)
+            if d.get("team_key"):
+                try:
+                    import report
+                    import sealbox
+                    tk = sealbox.open_(report.my_key(SECRETS), d["team_key"]).decode()
+                    if SECRETS.load().get(TEAM_KEY) != tk:
+                        SECRETS.set(TEAM_KEY, tk)
+                except Exception as e:
+                    print("team key:", e)
             continue
         if action in ("setup_key", "setup"):
             try:
@@ -934,6 +1009,14 @@ def _apply_decisions(con, decisions):
     return done, ho_done
 
 
+def _mailbox_on(cfg):
+    try:
+        import mailbox as _mb
+        return bool(_mb.conf(cfg))
+    except Exception:
+        return False
+
+
 def status(con):
     """How this BSO is doing (shown on the Master Console, mainly for the BSO Bot)."""
     import bot as _bot
@@ -965,6 +1048,8 @@ def status(con):
             "paused_inboxes": sorted(paused), "inboxes": len([sv for sv in cfg.get("senders") or [] if sv.get("email") and "example" not in sv["email"]]),
             "campaigns": [dict(r) for r in con.execute("SELECT id, name, status FROM campaigns ORDER BY id")],
             "disk_encrypted": disk_encrypted_cached(), "idle_lock": idle_minutes(),
+            "mailbox_connected": _mailbox_on(cfg), "mailbox_checked": state().get("mailbox_checked"),
+            "prospects": q("SELECT COUNT(*) FROM leads WHERE handed_from IS NOT NULL"),
             "overdue": [dict(r) for r in con.execute(
                 "SELECT l.email lead_email, l.company, t.subject, t.due_at, t.priority FROM tasks t JOIN leads l ON l.id=t.lead_id "
                 "WHERE t.status='open' AND t.kind='respond' AND t.due_at IS NOT NULL AND t.due_at<? ORDER BY t.due_at LIMIT 50",
@@ -985,7 +1070,7 @@ def _sync(con, version=""):
         events = _collect_events(con, s.get("last_event_id", 0))
         drafts = _collect_drafts(con, set(s.get("drafts_sent", [])))
         hos = con.execute("SELECT id, payload FROM handover_out WHERE synced=0 ORDER BY id LIMIT 50").fetchall()
-        handovers = [dict(json.loads(h["payload"]), out_id=h["id"]) for h in hos]
+        handovers = [_seal_handover(dict(json.loads(h["payload"]), out_id=h["id"])) for h in hos]
         # handovers travel inside the existing fields, so an already-deployed Google relay passes them on unchanged
         packed = events + [{"id": f"h{h['out_id']}", "type": "__handover", "data": h} for h in handovers]
         st_now, st_extra = None, []
@@ -1002,10 +1087,25 @@ def _sync(con, version=""):
             print("status:", e)
         packed += st_extra
         cms = con.execute("SELECT * FROM comments WHERE mine=1 AND synced=0 ORDER BY id LIMIT 50").fetchall()
-        packed += [{"id": f"c{c['id']}", "type": "__comment", "data": {"uid": c["uid"], "lead_email": c["lead_email"], "lead_name": c["lead_name"],
-                                                                       "company": c["company"], "text": c["text"], "at": c["at"], "to": json.loads(c["to_"] or "[]")}} for c in cms]
+        def _cm(c):
+            d = {"uid": c["uid"], "lead_email": c["lead_email"], "lead_name": c["lead_name"], "company": c["company"], "text": c["text"], "at": c["at"],
+                 "to": json.loads(c["to_"] or "[]")}
+            sealed = seal_team({"text": (c["text"] or "")[:2500], "lead_name": c["lead_name"], "company": c["company"]}) if _team_key() else None
+            if sealed and len(sealed) <= 4000:
+                d.update(text=sealed, lead_name="", company="")
+            return d
+        packed += [{"id": f"c{c['id']}", "type": "__comment", "data": _cm(c)} for c in cms]
         tq = (s.get("transfer_queue") or [])[:2]
-        packed += [{"id": f"t{t['part']}", "type": "__transfer", "data": t} for t in tq]
+        def _tr(t):
+            try:
+                import report
+                import sealbox
+                if s.get("vis_key_ok"):
+                    return {"part": t["part"], "last": t.get("last"), "box": sealbox.seal(report.my_key(SECRETS), json.dumps(t))}
+            except Exception:
+                pass
+            return t
+        packed += [{"id": f"t{t['part']}", "type": "__transfer", "data": _tr(t)} for t in tq]
         if s.get("away_pending"):
             packed.append({"id": "away", "type": "__away", "data": {"until": s.get("away_until", "")}})
         _access_table(con)
@@ -1018,6 +1118,13 @@ def _sync(con, version=""):
                    for a in acc]
         if s.get("setup_ack"):
             packed.append({"id": "setup", "type": "__setup", "data": {"v": s["setup_ack"]}})
+        vis_marks, vis_archive_done = [], False
+        try:
+            import report
+            vis_evs, vis_marks, vis_archive_done = report.events(con, s, SECRETS)
+            packed += vis_evs
+        except Exception as e:
+            print("visibility:", e)
         wiping = bool(s.get("wipe_then")) and not s.get("transfer_queue")
         if wiping:
             packed.append({"id": "w", "type": "__wiped", "data": {"at": iso(now_utc())}})
@@ -1048,6 +1155,14 @@ def _sync(con, version=""):
     s.pop("away_pending", None)
     if s.get("setup_ack") and any(p.get("type") == "__setup" for p in packed):
         s.pop("setup_ack", None)
+    if vis_marks or vis_archive_done:
+        try:
+            import report
+            report.mark_done(con, s, vis_marks)
+            if vis_archive_done:
+                s["vis_archive_done"] = True
+        except Exception as e:
+            print("visibility marks:", e)
     if acc:
         con.execute(f"UPDATE access_log SET synced=1 WHERE id IN ({','.join('?' * len(acc))})", [a["id"] for a in acc])
         con.commit()

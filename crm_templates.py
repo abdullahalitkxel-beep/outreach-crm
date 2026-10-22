@@ -495,7 +495,7 @@ LEAD = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block titl
   {% if mailbox_ok %}<form method="post" action="{{ url_for('prospect_reply', lead_id=l.id) }}" onsubmit="this.querySelector('button').disabled=true">
   <label>Reply to {{ l.email }} <span class="muted">(from your mailbox, in the same thread)</span></label>
   <textarea name="body" style="min-height:140px" required placeholder="Hi {{ l.first_name or '' }},">{{ request.args.get('draft', '') }}</textarea>
-  <div style="display:flex;gap:8px;align-items:end;margin-top:8px"><div style="flex:1"><label>CC (optional)</label><input name="cc" placeholder="colleague@company.com"></div><button class="btn brand">Send reply</button></div></form>{% endif %}
+  <div style="display:flex;gap:8px;align-items:end;margin-top:8px"><div style="flex:1"><label>CC (optional)</label><input name="cc" placeholder="colleague@company.com"></div><div style="flex:1"><label>BCC (optional)</label><input name="bcc" placeholder="only our company or the client's"></div><button class="btn brand">Send reply</button></div></form>{% endif %}
  </div></div>
 {% endif %}
 {% if pending_draft %}{% call m.help('lead-draft-'~pending_draft.id, 'A draft email is waiting for your review.') %} <a href="{{ url_for('review') }}#d{{ pending_draft.id }}">Review it now →</a>{% endcall %}{% endif %}

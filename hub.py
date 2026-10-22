@@ -157,6 +157,13 @@ def init_db():
                       ("setup_sent", "TEXT"), ("setup_applied", "TEXT")):
         if col not in {r[1] for r in con.execute("PRAGMA table_info(users)")}:
             con.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+    import vis as _vis
+    _vis.ensure(con)
+    con.row_factory = sqlite3.Row
+    try:            # the console's key pair, for the sealed reports from every BSO (made once, ~2 seconds)
+        _vis.keypair(_secret_store(), lambda k, d=None: _m_get(con, k, d), lambda k, v: _m_set(con, k, v))
+    except Exception as e:
+        print("visibility key:", e)
     con.commit()
     con.close()
 
@@ -662,7 +669,150 @@ def dashboard():
         for e in st.get("paused_inboxes") or []:
             warn.append(f"Inbox {e} was paused by the deliverability guard (bounces or failed logins). Check it in BSO → Settings → Email inboxes.")
         bots.append(dict(u=dict(u), st=st, warn=warn, online=is_online(u["last_seen"]), last_run=ago(iso(lr)) if lr else "never"))
-    return render("dashboard.html", bots=bots, stats=stats, totals=totals, series=series, mx=mx, tab="dashboard")
+    hot = [h for h in hot_leads(db()) if not h["answered"]][:30]
+    watch = [w for w in supervisor_watch(db()) if w["warn"]]
+    return render("dashboard.html", bots=bots, stats=stats, totals=totals, series=series, mx=mx, tab="dashboard", hot=hot, watch=watch, icons=TEMP_ICON,
+                  open_incidents=db().execute("SELECT COUNT(*) FROM incidents i LEFT JOIN incident_reviews r ON r.incident_id=i.id WHERE r.incident_id IS NULL").fetchone()[0])
+
+
+# ------------------------------------------------------------------ full visibility: conversations, archive, hot leads
+
+TEMP_ICON = {"hot": "🔥", "warm": "☀", "cold": "❄", "closed": "⛔"}
+
+
+def hot_leads(con, days=30):
+    """Hot and warm handovers, who has them, and whether they've been answered in time."""
+    import convo
+    pb_escalate = {"hot": 4, "warm": 18}
+    out = []
+    since = iso(now() - timedelta(days=days))
+    for h in con.execute("SELECT h.*, s.name sup_name, s.email sup_email FROM handovers h LEFT JOIN users s ON s.id=h.supervisor_id "
+                         "WHERE h.at>=? ORDER BY h.at DESC", (since,)).fetchall():
+        p = json.loads(h["payload"] or "{}")
+        temp = p.get("temperature") or ("hot" if h["label"] == "meeting_request" else "warm")
+        if temp not in ("hot", "warm"):
+            continue
+        first = con.execute("SELECT MIN(at) FROM vis_messages WHERE lead_email=? AND direction='out' AND user_id=? AND at>=?",
+                            (h["lead_email"], h["supervisor_id"], h["at"])).fetchone()[0]
+        moved = (h["status"] or "new") != "new"
+        try:
+            t0 = datetime.fromisoformat(h["at"].replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
+        except Exception:
+            t0 = datetime.now()
+        deadline = convo.add_working_hours(t0, int(p.get("respond_hours") or {"hot": 2, "warm": 9}[temp]))
+        escalate = convo.add_working_hours(t0, pb_escalate[temp])
+        answered = first or (h["status_at"] if moved else None)
+        late = not answered and datetime.now() > escalate
+        out.append({"h": dict(h), "temp": temp, "reason": p.get("reason") or "", "answered": answered, "deadline": deadline, "late": late,
+                    "overdue": not answered and datetime.now() > deadline})
+    return out
+
+
+def supervisor_watch(con):
+    """Supervisors whose prospect conversations BSO can't see right now."""
+    out = []
+    for u in con.execute("SELECT * FROM users WHERE role='supervisor' AND status NOT IN ('removed') ORDER BY name").fetchall():
+        st = json.loads(u["bot_status"] or "{}")
+        warn = []
+        if not st:
+            warn.append("hasn't reported yet (BSO not opened since this version)")
+        elif not st.get("mailbox_connected"):
+            warn.append("work mailbox not connected in BSO: their prospect emails aren't tracked")
+        else:
+            chk = st.get("mailbox_checked")
+            if not chk or chk < iso(now() - timedelta(days=1)):
+                warn.append(f"mailbox not checked since {ago(chk) if chk else 'ever'} (BSO closed or laptop off)")
+        if u["last_seen"] and u["last_seen"] < iso(now() - timedelta(days=3)):
+            warn.append(f"no check-in since {ago(u['last_seen'])}")
+        for o in (st.get("overdue") or [])[:5]:
+            warn.append(f"overdue: {o.get('subject', '')}")
+        out.append({"u": dict(u), "st": st, "warn": warn})
+    return out
+
+
+@app.route("/conversations")
+@need()
+def conversations():
+    con, a = db(), request.args
+    users_ = {u["id"]: u for u in con.execute("SELECT id, name, role FROM users").fetchall()}
+    camps = con.execute("SELECT l.user_id, COALESCE(l.campaign, 'Main campaign') campaign, COUNT(*) leads, "
+                        "SUM(l.temperature='hot') hot, SUM(l.temperature='warm') warm, SUM(l.temperature='cold') cold, "
+                        "SUM(l.handed_to IS NOT NULL) handed, SUM(l.status='replied' OR l.status='nurture') replied, "
+                        "(SELECT COUNT(*) FROM vis_sent s WHERE s.user_id=l.user_id AND s.kind='step' AND s.lead_email IN "
+                        " (SELECT email FROM vis_leads x WHERE x.user_id=l.user_id AND COALESCE(x.campaign,'Main campaign')=COALESCE(l.campaign,'Main campaign'))) sent "
+                        "FROM vis_leads l GROUP BY l.user_id, COALESCE(l.campaign, 'Main campaign') ORDER BY l.user_id").fetchall()
+    where, args = ["1=1"], []
+    if a.get("user", type=int):
+        where.append("l.user_id=?")
+        args.append(a.get("user", type=int))
+    if a.get("campaign"):
+        where.append("COALESCE(l.campaign,'Main campaign')=?")
+        args.append(a["campaign"])
+    what = a.get("what", "")
+    cond = {"sent": "EXISTS (SELECT 1 FROM vis_sent s WHERE s.lead_email=l.email AND s.user_id=l.user_id)",
+            "replied": "EXISTS (SELECT 1 FROM vis_received r WHERE r.lead_email=l.email)", "hot": "l.temperature='hot'", "warm": "l.temperature='warm'",
+            "cold": "l.temperature='cold'", "handed": "l.handed_to IS NOT NULL", "nurture": "l.status='nurture'",
+            "flagged": "EXISTS (SELECT 1 FROM incidents i WHERE i.lead_email=l.email)"}.get(what)
+    if cond:
+        where.append(cond)
+    if a.get("q"):
+        where.append("(l.email LIKE ? OR l.company LIKE ? OR l.first_name LIKE ? OR EXISTS (SELECT 1 FROM vis_received r WHERE r.lead_email=l.email AND r.body LIKE ?) "
+                     "OR EXISTS (SELECT 1 FROM vis_messages m WHERE m.lead_email=l.email AND m.body LIKE ?))")
+        args += [f"%{a['q']}%"] * 5
+    page = max(1, a.get("page", 1, type=int))
+    sql = ("SELECT l.*, (SELECT MAX(at) FROM (SELECT at FROM vis_sent WHERE lead_email=l.email UNION ALL SELECT at FROM vis_received WHERE lead_email=l.email "
+           "UNION ALL SELECT at FROM vis_messages WHERE lead_email=l.email)) last_at, "
+           "(SELECT COUNT(*) FROM incidents i WHERE i.lead_email=l.email) flags FROM vis_leads l WHERE " + " AND ".join(where))
+    total = con.execute(f"SELECT COUNT(*) FROM ({sql})", args).fetchone()[0]
+    items = con.execute(sql + f" ORDER BY flags>0 DESC, last_at DESC LIMIT 100 OFFSET {(page - 1) * 100}", args).fetchall()
+    return render("conversations.html", camps=camps, users_=users_, items=items, total=total, page=page, pages=max(1, (total + 99) // 100),
+                  what=what, tab="conversations", icons=TEMP_ICON,
+                  ulist=con.execute("SELECT id, name FROM users WHERE status!='removed' ORDER BY name").fetchall(),
+                  clist=[r[0] for r in con.execute("SELECT DISTINCT COALESCE(campaign,'Main campaign') FROM vis_leads ORDER BY 1")])
+
+
+@app.route("/conversation")
+@need()
+def conversation():
+    con = db()
+    e = request.args.get("email", "").strip().lower()
+    if not e:
+        return redirect(url_for("conversations"))
+    users_ = {u["id"]: u["name"] for u in con.execute("SELECT id, name FROM users")}
+    items = []
+    for r in con.execute("SELECT * FROM vis_sent WHERE lead_email=?", (e,)):
+        items.append(dict(dir="out", who=users_.get(r["user_id"], "?"), at=r["at"], frm=r["sender"], to=r["to_"], cc=r["cc"], bcc=r["bcc"], subject=r["subject"],
+                          body=r["body"], tag=("email " + str((r["step"] or 0) + 1)) if r["kind"] == "step" else r["kind"], extra=f"campaign {r['campaign_id']}"
+                          + (f" · version {r['variant']}" if r["variant"] else "")))
+    for r in con.execute("SELECT * FROM vis_received WHERE lead_email=?", (e,)):
+        items.append(dict(dir="in", who=users_.get(r["user_id"], "?"), at=r["at"], frm=r["frm"], to=r["to_"] or r["inbox"], cc=r["cc"], bcc="", subject=r["subject"],
+                          body=r["body"], tag=f"{TEMP_ICON.get(r['temperature'], '')} {r['temperature'] or ''} {(r['label'] or '').replace('_', ' ')}",
+                          extra=f"matched by {r['how']}" + (f" · reached via {' → '.join(json.loads(r['path']))}" if r["path"] else "")))
+    for r in con.execute("SELECT * FROM vis_messages WHERE lead_email=?", (e,)):
+        items.append(dict(dir=r["direction"], who=users_.get(r["user_id"], "?"), at=r["at"], frm=r["frm"], to=r["to_"], cc=r["cc"], bcc=r["bcc"], subject=r["subject"],
+                          body=r["body"], tag="supervisor mailbox" if r["via"] != "archive" else "company archive mailbox",
+                          extra=(f"{'moved to Trash' if r['deleted_how'] == 'trashed' else 'DELETED'} by the supervisor {ago(r['deleted_at'])}" if r["deleted_at"] else "")))
+    items.sort(key=lambda x: x["at"] or "")
+    leads_ = con.execute("SELECT * FROM vis_leads WHERE email=?", (e,)).fetchall()
+    notes = con.execute("SELECT * FROM vis_notes WHERE lead_email=? ORDER BY at", (e,)).fetchall()
+    tasks_ = con.execute("SELECT * FROM vis_tasks WHERE lead_email=? ORDER BY due_date", (e,)).fetchall()
+    temps = con.execute("SELECT * FROM vis_temps WHERE lead_email=? ORDER BY at", (e,)).fetchall()
+    incs = con.execute("SELECT * FROM incidents WHERE lead_email=? ORDER BY id", (e,)).fetchall()
+    arch = con.execute("SELECT * FROM archive WHERE lead_email=? ORDER BY at", (e,)).fetchall()
+    return render("conversation.html", e=e, items=items, leads_=leads_, notes=notes, tasks_=tasks_, temps=temps, incs=incs, arch=arch, users_=users_,
+                  tab="conversations", icons=TEMP_ICON, kinds=__import__("vis").INCIDENT_KINDS)
+
+
+@app.route("/archive")
+@need()
+def archive_page():
+    q = request.args.get("q", "").strip()
+    rows_ = []
+    if q:
+        rows_ = db().execute("SELECT a.*, u.name uname FROM archive a LEFT JOIN users u ON u.id=a.user_id WHERE a.text LIKE ? OR a.lead_email LIKE ? "
+                             "ORDER BY a.at DESC LIMIT 300", (f"%{q}%", f"%{q}%")).fetchall()
+    counts = db().execute("SELECT u.name, a.kind, COUNT(*) n FROM archive a LEFT JOIN users u ON u.id=a.user_id GROUP BY a.user_id, a.kind ORDER BY u.name").fetchall()
+    return render("archive.html", q=q, rows=rows_, counts=counts, tab="conversations")
 
 
 @app.route("/users")
@@ -1453,6 +1603,49 @@ def security_alerts(con):
     return out
 
 
+def archive_box_cycle(con, force=False):
+    """Read the company archive mailbox (if set up) and compare it with what the supervisors' BSOs reported."""
+    import vis as _vis
+    host, user = _m_get(con, "archive_box_host", ""), _m_get(con, "archive_box_user", "")
+    if not (host and user):
+        return 0
+    last = float(_m_get(con, "archive_box_ts", "0") or 0)
+    if not force and time.time() - last < 600:
+        return 0
+    _m_set(con, "archive_box_ts", str(time.time()))
+    pw = _secret_store().load().get("HUB_ARCHIVE_BOX_PASSWORD", "")
+    people = {r["email"].lower(): r["id"] for r in con.execute("SELECT id, email FROM users WHERE role='supervisor' AND status!='removed'")}
+    allow = [d for d in security_cfg(con)["allow_domains"].split(",") if d]
+    n = _vis.check_archive_box(con, {"host": host, "user": user}, pw, people, own_domains(con), allow)
+    _m_set(con, "archive_box_checked", iso())
+    return n
+
+
+@app.route("/guide/workspace")
+@need()
+def workspace_guide():
+    return render("workspace.html", tab="security")
+
+
+@app.get("/security/incidents.csv")
+@need("owner")
+def incidents_csv():
+    import csv as _csv
+    import io as _io
+    out = _io.StringIO()
+    w = _csv.writer(out)
+    w.writerow(["id", "when", "person", "type", "lead", "what happened", "how caught", "review", "reviewed by", "note", "email (json)", "chain hash"])
+    uid = request.args.get("user", type=int)
+    for i in db().execute("SELECT i.*, u.name uname, r.status rstatus, r.by rby, r.note rnote FROM incidents i LEFT JOIN users u ON u.id=i.user_id "
+                          "LEFT JOIN incident_reviews r ON r.incident_id=i.id" + (" WHERE i.user_id=?" if uid else "") + " ORDER BY i.id", (uid,) if uid else ()):
+        w.writerow([i["id"], i["at"], i["uname"] or "console", i["kind"], i["lead_email"], i["detail"], i["how"], i["rstatus"] or "open", i["rby"] or "",
+                    i["rnote"] or "", i["msg"] or "", i["hash"]])
+    audit("incidents_exported", f"user={uid or 'all'}")
+    resp = app.response_class(out.getvalue(), mimetype="text/csv")
+    resp.headers["Content-Disposition"] = "attachment; filename=bso-incidents.csv"
+    return resp
+
+
 @app.route("/security", methods=["GET", "POST"])
 @need("owner")
 def security_page():
@@ -1470,6 +1663,8 @@ def security_page():
                 meta_set("sec_big_list", str(_valid_int(f.get("big_list"), 50, 100000)))
                 meta_set("sec_export_roles", "owner,manager" + (",member" if f.get("members_export") else ""))
                 meta_set("sec_canary_domain", dom)
+                meta_set("sec_allow_domains", ",".join(d.strip().lower().lstrip("@") for d in re.split(r"[,;\s]+", f.get("allow_domains", "")) if "." in d))
+                meta_set("sec_retention_months", str(_valid_int(f.get("retention_months"), 0, 1200)))
                 meta_set("canary_imap_host", f.get("imap_host", "").strip())
                 meta_set("canary_imap_user", f.get("imap_user", "").strip())
                 if f.get("imap_password"):
@@ -1486,6 +1681,27 @@ def security_page():
                 msg = f"{c['email']} is a trap contact planted only for {c['uname'] or 'a removed account'} ({c['uemail'] or ''}). Logged as a leak."
             else:
                 msg = "That address isn't one of our trap contacts."
+        elif act == "archive_box":
+            meta_set("archive_box_host", f.get("box_host", "").strip())
+            meta_set("archive_box_user", f.get("box_user", "").strip())
+            if f.get("box_password"):
+                _secret_store().set("HUB_ARCHIVE_BOX_PASSWORD", f.get("box_password"))
+            audit("archive_mailbox_set", f.get("box_user", ""))
+            try:
+                n = archive_box_cycle(con, force=True)
+                msg = f"Saved. Checked the company archive mailbox: {n} new incident(s)."
+            except Exception as e:
+                msg = f"Saved, but couldn't read the archive mailbox: {e}"
+        elif act == "review":
+            iid = _valid_int(f.get("incident_id"), 0, 10**9)
+            con.execute("INSERT OR REPLACE INTO incident_reviews(incident_id, status, by, at, note) VALUES (?,?,?,?,?)",
+                        (iid, f.get("status") or "reviewed", g.me["name"], iso(), f.get("note", "")[:1000]))
+            if f.get("allow_domain"):
+                cur_ = security_cfg(con)["allow_domains"]
+                meta_set("sec_allow_domains", ",".join(sorted({*[d for d in cur_.split(",") if d], f["allow_domain"].strip().lower()})))
+            con.commit()
+            audit("incident_reviewed", f"#{iid}: {f.get('status')} {f.get('note', '')[:100]}")
+            msg = "Review saved. The incident itself stays in the log unchanged."
         elif act == "check_now":
             try:
                 msg = f"Checked the trap mailbox: {canary_watch(con)} new hit(s)."
@@ -1501,7 +1717,15 @@ def security_page():
         except Exception:
             st = {}
         enc.append({"name": u["name"], "enc": st.get("disk_encrypted"), "lock": st.get("idle_lock"), "seen": u["last_seen"], "wipe": u["wipe"]})
-    return render("security.html", msg=msg, cfg=cfg, alerts=security_alerts(con), rows=rows, traps=traps, enc=enc,
+    import vis as _vis
+    kind_f = request.args.get("kind", "")
+    iq = "SELECT i.*, u.name uname, r.status rstatus, r.by rby, r.at rat, r.note rnote FROM incidents i LEFT JOIN users u ON u.id=i.user_id " \
+         "LEFT JOIN incident_reviews r ON r.incident_id=i.id" + (" WHERE i.kind=?" if kind_f else "") + " ORDER BY (r.incident_id IS NULL) DESC, i.id DESC LIMIT 300"
+    incs = con.execute(iq, (kind_f,) if kind_f else ()).fetchall()
+    chain_ok, chain_bad = _vis.verify_chain(con)
+    return render("security.html", msg=msg, cfg=cfg, alerts=security_alerts(con), rows=rows, traps=traps, enc=enc, incs=incs, kinds=_vis.INCIDENT_KINDS,
+                  chain_ok=chain_ok, chain_bad=chain_bad, watch=supervisor_watch(con), kind_f=kind_f,
+                  box_host=meta_get("archive_box_host", ""), box_user=meta_get("archive_box_user", ""), box_checked=meta_get("archive_box_checked", ""),
                   imap_host=meta_get("canary_imap_host", ""), imap_user=meta_get("canary_imap_user", ""), tab="security")
 
 
@@ -1621,7 +1845,10 @@ def ingest(con, uid, j):
             store_handover(con, uid, e.get("data") or {})
             continue
         if isinstance(e, dict) and e.get("type") == "__comment":
-            c = e.get("data") or {}
+            c = dict(e.get("data") or {})
+            inner = open_team(c.get("text"))
+            if isinstance(inner, dict):
+                c.update(inner)
             if c.get("uid"):
                 con.execute("INSERT OR IGNORE INTO comments(uid, user_id, author_name, lead_email, lead_name, company, text, at, to_) "
                             "VALUES (?,?,(SELECT name FROM users WHERE id=?),?,?,?,?,?,?)",
@@ -1638,6 +1865,13 @@ def ingest(con, uid, j):
             continue
         if isinstance(e, dict) and e.get("type") == "__transfer":
             d = e.get("data") or {}
+            if d.get("box"):
+                try:
+                    import sealbox
+                    d = json.loads(sealbox.open_(bytes.fromhex(_secret_store().load().get(f"VIS_KEY_{uid}", "")), d["box"]))
+                except Exception as ex:
+                    print("transfer:", ex)
+                    continue
             con.execute("INSERT OR IGNORE INTO transfers(user_id, part, leads, at) VALUES (?,?,?,?)",
                         (uid, int(d.get("part") or 0), json.dumps({"leads": d.get("leads") or [], "suppress": d.get("suppress") or []}), iso()))
             if d.get("last"):
@@ -1648,6 +1882,21 @@ def ingest(con, uid, j):
             con.execute("INSERT OR IGNORE INTO data_audit(user_id, uid, kind, detail, n, at) VALUES (?,?,?,?,?,?)",
                         (uid, str(a.get("uid") or "")[:80] or None, str(a.get("kind") or "")[:30], str(a.get("detail") or "")[:300],
                          int(a.get("n") or 0), str(a.get("at") or iso())[:25]))
+            continue
+        if isinstance(e, dict) and e.get("type") == "__vkey":
+            import vis as _vis
+            try:
+                _, priv = _vis.keypair(_secret_store(), lambda k, d=None: _m_get(con, k, d), lambda k, v: _m_set(con, k, v))
+                _vis.take_key(con, _secret_store(), uid, str((e.get("data") or {}).get("box") or ""), priv)
+            except Exception as ex:
+                print("vis key:", ex)
+            continue
+        if isinstance(e, dict) and e.get("type") == "__vis":
+            import vis as _vis
+            try:
+                _vis.ingest(con, _secret_store(), uid, str((e.get("data") or {}).get("box") or ""))
+            except Exception as ex:
+                print("vis:", ex)
             continue
         if isinstance(e, dict) and e.get("type") == "__setup":
             con.execute("UPDATE users SET setup_applied=? WHERE id=?", (str((e.get("data") or {}).get("v") or "")[:25], uid))
@@ -1707,8 +1956,35 @@ def ingest(con, uid, j):
     return n_ev
 
 
+def team_key():
+    st = _secret_store()
+    k = st.load().get("HUB_TEAM_KEY")
+    if not k:
+        k = secrets.token_hex(32)
+        st.set("HUB_TEAM_KEY", k)
+    return bytes.fromhex(k)
+
+
+def open_team(v):
+    import sealbox
+    if isinstance(v, str) and v.startswith("BSOSEAL:"):
+        try:
+            return json.loads(sealbox.open_(team_key(), v[8:]))
+        except Exception:
+            return None
+    return None
+
+
+def seal_team(obj):
+    import sealbox
+    return "BSOSEAL:" + sealbox.seal(team_key(), json.dumps(obj, default=str))
+
+
 def store_handover(con, uid, h):
     """A prospect handed over from a team member's laptop: route it to the chosen supervisor."""
+    inner = open_team(h.get("reply"))
+    if isinstance(inner, dict):
+        h = dict(inner, out_id=h.get("out_id"))
     lead = h.get("lead") or {}
     sid = str(h.get("supervisor") or "")
     sup = con.execute("SELECT id FROM users WHERE role='supervisor' AND (username=? OR email=?)", (sid, sid)).fetchone() \
@@ -1896,7 +2172,8 @@ def supervisor_config(con):
     return {"action": "config", "local_id": None, "supervisors": sups, "people": ppl, "as_of": last, "security": security_cfg(con)}
 
 
-SECURITY_DEFAULTS = {"idle_minutes": 15, "reauth_days": 7, "export_roles": "owner,manager", "big_list": 500, "canary_domain": ""}
+SECURITY_DEFAULTS = {"idle_minutes": 15, "reauth_days": 7, "export_roles": "owner,manager", "big_list": 500, "canary_domain": "",
+                     "allow_domains": "", "retention_months": 24}
 
 
 def security_cfg(con):
@@ -1905,7 +2182,26 @@ def security_cfg(con):
         r = con.execute("SELECT value FROM meta WHERE key=?", (f"sec_{k}",)).fetchone()
         if r and r["value"] not in (None, ""):
             out[k] = int(r["value"]) if isinstance(SECURITY_DEFAULTS[k], int) else r["value"]
+    pub = con.execute("SELECT value FROM meta WHERE key='vis_pub'").fetchone()
+    if pub and pub["value"]:
+        out["console_key"] = json.loads(pub["value"])
+    out["own_domains"] = sorted(own_domains(con))
     return out
+
+
+def own_domains(con):
+    """Our company's domains: the people on the team and the sending inboxes."""
+    ds = set()
+    for r in con.execute("SELECT email FROM users WHERE status NOT IN ('removed')"):
+        e = str(r["email"] or "")
+        if "@" in e:
+            ds.add(e.rsplit("@", 1)[-1].lower())
+    return ds
+
+
+def vis_keys():
+    import vis as _vis
+    return _vis.keypair(_secret_store(), meta_get, meta_set)
 
 
 def decisions_for(con, uid, handovers=True):
@@ -1913,8 +2209,21 @@ def decisions_for(con, uid, handovers=True):
             "subject": d["subject"], "body": d["body"], "by": d["decided_by"]}
            for d in con.execute("SELECT * FROM drafts WHERE user_id=? AND status!='pending' AND delivered=0", (uid,)).fetchall()]
     out.append(supervisor_config(con))
+    try:
+        import vis as _vis
+        import sealbox
+        vk = _secret_store().load().get(f"VIS_KEY_{uid}")
+        item = {"action": "vis_state", "local_id": None, "key_ok": bool(vk)}
+        if vk:
+            item["team_key"] = sealbox.seal(bytes.fromhex(vk), team_key().hex())
+        out.append(item)
+    except Exception:
+        vk = None
     for nt in con.execute("SELECT * FROM notices WHERE user_id=? AND delivered=0 ORDER BY id LIMIT 50", (uid,)).fetchall():
-        out.append(dict(json.loads(nt["item"]), local_id=None, handover_id=f"nt:{nt['id']}"))
+        it = json.loads(nt["item"])
+        if vk and it.get("action") in ("leads_in", "comment", "removed", "transfer_out", "canary"):     # sealed for this person's BSO
+            it = {"action": it["action"], "sealed": seal_team(it)}
+        out.append(dict(it, local_id=None, handover_id=f"nt:{nt['id']}"))
     if not handovers:          # the Google relay (version 2+) delivers handovers to the supervisor itself
         return out
     for h in con.execute("SELECT h.*, u.name fromname FROM handovers h LEFT JOIN users u ON u.id=h.from_user_id "
@@ -2062,6 +2371,14 @@ def _relay_loop():
             con.row_factory = sqlite3.Row
             try:
                 ensure_canaries(con)
+                try:
+                    archive_box_cycle(con)
+                except Exception as e:
+                    print("archive mailbox:", e)
+                if time.time() - float(_m_get(con, "purge_ts", "0") or 0) > 86400:
+                    import vis as _vis
+                    _vis.purge(con, security_cfg(con)["retention_months"])
+                    _m_set(con, "purge_ts", str(time.time()))
                 if time.time() - last_watch > 1800:
                     last_watch = time.time()
                     canary_watch(con)
@@ -2123,7 +2440,7 @@ BASE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name=
 <title>{% block title %}Master console{% endblock %} · BSO</title><style>""" + CSS + """{{ logo_css|safe }}</style></head><body>
 {% if me %}<div class="top">{{ logo(30, tile=True, uid='tp', weight='b', label='BSO')|safe }}<b>BSO Master console</b><small>{{ org }}</small><span class="sp"></span>
 <small>{{ me.name }} · {{ me.role }}</small><a href="{{ url_for('twofa') }}" style="color:#b9c3c9;font-size:12px">2-step sign-in</a><form method="post" action="{{ url_for('logout') }}" style="margin:0"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" style="padding:4px 10px">Sign out</button></form></div>
-<div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('users','Users','users'),('approvals','Approvals','approvals'),('board','Prospect board','board'),('handovers','Handovers','handovers_page'),('activity','Activity','activity')] + ([('bso_setup','BSO setup','bso_setup'),('security','Security','security_page'),('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
+<div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('conversations','Conversations','conversations'),('users','Users','users'),('approvals','Approvals','approvals'),('board','Prospect board','board'),('handovers','Handovers','handovers_page'),('activity','Activity','activity')] + ([('bso_setup','BSO setup','bso_setup'),('security','Security','security_page'),('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
 <div class="wrap">{% if me %}<nav class="pgnav" style="display:flex;align-items:center;gap:8px;margin:0 0 12px;min-height:32px" aria-label="Page history"><a id="nav-back" class="pgbtn" href="#" title="Back (Alt + Left arrow)" style="display:none"><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg><span></span></a><a id="nav-fwd" class="pgbtn" href="#" title="Forward (Alt + Right arrow)" style="display:none"><span></span><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M4 11h12.2l-5.6-5.6L12 4l8 8-8 8-1.4-1.4 5.6-5.6H4z"/></svg></a></nav>{% endif %}{% if request.args.get('err') %}<div class="err">{{ request.args.get('err') }}</div>{% endif %}{% if request.args.get('ok') %}<div class="note">{{ request.args.get('ok') }}</div>{% endif %}{% block body %}{% endblock %}</div><script src="/hub.js"></script><script>(function(){ /* back / forward through the pages opened in this window, each labelled with the page's name */
  var name=(document.title||'').split(' · ')[0].trim()||'Page', here=location.pathname+location.search, t={l:[],i:-1};
  try{ t=JSON.parse(sessionStorage.getItem('bso_hist')||'') || t; }catch(e){}
@@ -2187,6 +2504,12 @@ T["twofa.html"] = """{% extends 'base.html' %}{% block title %}2-step sign-in{% 
 <form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn brand" name="action" value="start">Set up 2-step sign-in</button></form>{% endif %}
 </div></div>{% endblock %}"""
 T["dashboard.html"] = """{% extends 'base.html' %}{% block body %}
+{% if open_incidents %}<div class="err"><b>{{ open_incidents }} incident(s) waiting for review</b>: client emails copied outside, blocked or deleted. <a href="{{ url_for('security_page') }}#incidents">Review them →</a></div>{% endif %}
+{% if hot %}<div class="card" style="border-left:4px solid #ba0517"><div class="card-h"><h2>🔥 Hot and warm leads waiting for an answer</h2></div><table><tr><th>Lead</th><th>Supervisor</th><th>Handed over</th><th>Answer by</th><th></th></tr>
+{% for x in hot %}<tr><td>{{ icons[x.temp] }} <a href="{{ url_for('conversation', email=x.h.lead_email) }}">{{ x.h.lead_name or x.h.lead_email }}</a> <span class="muted">{{ x.h.company or '' }}</span><br><small class="muted">{{ x.reason }}</small></td>
+<td>{{ x.h.sup_name or '—' }}</td><td class="muted">{{ x.h.at|dt }}</td><td>{{ x.deadline.strftime('%a %d %b %H:%M') }}</td>
+<td>{% if x.late %}<span class="badge b-bad">late: tell {{ (x.h.sup_name or '').split(' ')[0] }}</span>{% elif x.overdue %}<span class="badge b-warn">overdue</span>{% else %}<span class="badge">in time</span>{% endif %}</td></tr>{% endfor %}</table></div>{% endif %}
+{% if watch %}<div class="card" style="border-left:4px solid #dd7a01"><div class="card-h"><h2>Supervisors BSO can't fully see</h2></div><div class="card-b">{% for w in watch %}<div><b>{{ w.u.name }}</b>: {{ w.warn|join('; ') }}</div>{% endfor %}</div></div>{% endif %}
 <div class="stats"><div class="stat"><small>Sent (7 days)</small><div>{{ totals.sent }}</div></div><div class="stat"><small>Replies (7 days)</small><div>{{ totals.replies }}</div></div>
 <div class="stat"><small>Interested replies</small><div>{{ totals.interested }}</div></div><div class="stat"><small>Drafts awaiting approval</small><div><a href="{{ url_for('approvals') }}">{{ totals.pending }}</a></div></div>
 <div class="stat"><small>Laptops online now</small><div>{{ totals.online }}</div></div>
@@ -2342,11 +2665,101 @@ T["bso_import.html"] = """{% extends 'base.html' %}{% block title %}Import inbox
 {% for r in report %}<tr><td><a href="{{ url_for('user_detail', uid=r.id) }}">{{ r.name }}</a>{% if r.new %} <span class="badge b-ok">new</span>{% endif %}</td><td class="r">{{ r.added }}</td><td class="r">{{ r.updated }}</td><td class="r">{{ r.total }}</td>
 <td>{% if r.sent %}sent; their BSO applies it at its next check-in{% else %}<span class="badge b-warn">saved; enter their BSO password once on their page to send it</span>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="muted">Nothing imported.</td></tr>{% endfor %}</table>
 </div></div>{% endblock %}"""
+T["conversations.html"] = """{% extends 'base.html' %}{% block title %}Conversations{% endblock %}{% block body %}
+<div class="card"><div class="card-h"><h2>Campaigns, by person</h2><span class="muted">click a number to see those leads</span><span style="flex:1"></span><a class="btn" href="{{ url_for('archive_page') }}">Archive (older data)</a></div>
+<table><tr><th>Person</th><th>Campaign</th><th class="r">Leads</th><th class="r">Emails sent</th><th class="r">Replied</th><th class="r">🔥 Hot</th><th class="r">☀ Warm</th><th class="r">❄ Cold</th><th class="r">Handed over</th></tr>
+{% for c in camps %}{% set base = {'user': c.user_id, 'campaign': c.campaign} %}<tr><td>{{ users_[c.user_id].name if c.user_id in users_ else '?' }}</td><td>{{ c.campaign }}</td>
+<td class="r"><a href="{{ url_for('conversations', **base) }}">{{ c.leads }}</a></td><td class="r"><a href="{{ url_for('conversations', what='sent', **base) }}">{{ c.sent }}</a></td>
+<td class="r"><a href="{{ url_for('conversations', what='replied', **base) }}">{{ c.replied }}</a></td><td class="r"><a href="{{ url_for('conversations', what='hot', **base) }}">{{ c.hot }}</a></td>
+<td class="r"><a href="{{ url_for('conversations', what='warm', **base) }}">{{ c.warm }}</a></td><td class="r"><a href="{{ url_for('conversations', what='cold', **base) }}">{{ c.cold }}</a></td>
+<td class="r"><a href="{{ url_for('conversations', what='handed', **base) }}">{{ c.handed }}</a></td></tr>{% else %}<tr><td colspan="9" class="muted">Nothing reported yet. Each BSO sends its data at its next check-in after updating.</td></tr>{% endfor %}</table></div>
+<div class="card"><div class="card-b"><form style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+<div><label>Person</label><select name="user"><option value="">Everyone</option>{% for u in ulist %}<option value="{{ u.id }}" {{ 'selected' if request.args.get('user')|string == u.id|string }}>{{ u.name }}</option>{% endfor %}</select></div>
+<div><label>Campaign</label><select name="campaign"><option value="">All</option>{% for c in clist %}<option {{ 'selected' if request.args.get('campaign') == c }}>{{ c }}</option>{% endfor %}</select></div>
+<div><label>Show</label><select name="what"><option value="">All leads</option>{% for k, l in [('sent','Emailed'),('replied','Replied'),('hot','🔥 Hot'),('warm','☀ Warm'),('cold','❄ Cold'),('nurture','Nurture'),('handed','Handed over'),('flagged','⚠ Flagged')] %}<option value="{{ k }}" {{ 'selected' if what == k }}>{{ l }}</option>{% endfor %}</select></div>
+<div style="flex:1;min-width:200px"><label>Search names, companies and email text</label><input name="q" value="{{ request.args.get('q','') }}"></div><button class="btn brand">Show</button></form></div>
+<table><tr><th>Lead</th><th>Person</th><th>Campaign</th><th>Status</th><th>Last activity</th></tr>
+{% for l in items %}<tr><td>{% if l.flags %}<span class="badge b-bad">⚠ flagged</span> {% endif %}<a href="{{ url_for('conversation', email=l.email) }}">{{ l.first_name or l.email }}</a> <span class="muted">{{ l.email }}</span><br><small class="muted">{{ l.company or '' }}</small></td>
+<td>{{ users_[l.user_id].name if l.user_id in users_ else '?' }}</td><td>{{ l.campaign or 'Main campaign' }}</td>
+<td>{{ icons.get(l.temperature, '') }} {{ l.temperature or '' }} {{ l.status }}{% if l.handed_to %}<br><small class="muted">handed to {{ l.handed_to }}</small>{% endif %}{% if l.prospect_stage %}<br><small class="muted">prospect: {{ l.prospect_stage }}</small>{% endif %}</td>
+<td class="muted">{{ l.last_at|dt if l.last_at else '' }}</td></tr>{% else %}<tr><td colspan="5" class="muted">No leads match.</td></tr>{% endfor %}</table>
+{% if pages > 1 %}<div class="card-b">Page {{ page }} of {{ pages }} · {% if page > 1 %}<a href="{{ request.path }}?{{ request.query_string.decode()|replace('page=' ~ page, '') }}&page={{ page - 1 }}">previous</a>{% endif %} {% if page < pages %}<a href="{{ request.path }}?{{ request.query_string.decode()|replace('page=' ~ page, '') }}&page={{ page + 1 }}">next</a>{% endif %}</div>{% endif %}</div>
+{% endblock %}"""
+T["conversation.html"] = """{% extends 'base.html' %}{% block title %}{{ e }}{% endblock %}{% block body %}
+<div class="card"><div class="card-h"><h2>{{ e }}</h2></div><div class="card-b">
+{% for l in leads_ %}<div><b>{{ l.first_name or '' }}</b> · {{ l.company or '' }} · in {{ users_.get(l.user_id, '?') }}'s BSO · campaign {{ l.campaign or 'Main campaign' }} · {{ l.status }}
+ {% if l.temperature %} · {{ icons.get(l.temperature, '') }} {{ l.temperature }} <span class="muted">({{ l.temp_reason or '' }})</span>{% endif %}{% if l.check_back %} · check back {{ l.check_back }}{% endif %}
+ {% if l.handed_to %} · handed to {{ l.handed_to }}{% endif %}{% if l.prospect_stage %} · prospect stage {{ l.prospect_stage }}{% endif %}{% if l.came_back %} · came back {{ l.came_back }}{% endif %}</div>{% endfor %}
+</div></div>
+{% if incs %}<div class="card" style="border-left:4px solid #ba0517"><div class="card-h"><h2>⚠ Incidents on this conversation</h2></div><div class="card-b">{% for i in incs %}<div><b>{{ kinds.get(i.kind, i.kind) }}</b> · {{ i.at|dt }} · {{ users_.get(i.user_id, 'console') }}: {{ i.detail }} <a href="{{ url_for('security_page') }}#inc{{ i.id }}">open</a></div>{% endfor %}</div></div>{% endif %}
+<div class="card"><div class="card-h"><h2>Every email ({{ items|length }})</h2></div><div class="card-b">
+{% for m in items %}<div style="border:1px solid var(--line);border-left:4px solid {{ '#2e844a' if m.dir == 'in' else '#0176d3' }};border-radius:6px;padding:10px 12px;margin-bottom:10px;{{ 'background:#f6fbf7' if m.dir == 'in' }}">
+<div class="muted" style="font-size:12px">{{ 'Received' if m.dir == 'in' else 'Sent' }} {{ m.at|dt }} · {{ m.who }}'s BSO · {{ m.tag }}{% if m.extra %} · {{ m.extra }}{% endif %}</div>
+<div><b>From:</b> {{ m.frm }}{% if m.to %} &nbsp; <b>To:</b> {{ m.to }}{% endif %}{% if m.cc %} &nbsp; <b>CC:</b> {{ m.cc }}{% endif %}{% if m.bcc %} &nbsp; <b style="color:#ba0517">BCC:</b> {{ m.bcc }}{% endif %}</div>
+<div><b>{{ m.subject }}</b></div><div style="white-space:pre-wrap;margin-top:6px">{{ m.body }}</div></div>{% else %}<p class="muted">No emails reported yet.</p>{% endfor %}</div></div>
+<div class="grid"><div class="card"><div class="card-h"><h2>Notes</h2></div><div class="card-b">{% for n in notes %}<div style="margin-bottom:8px"><span class="muted">{{ n.at|dt }} · {{ users_.get(n.user_id, '?') }}</span><div style="white-space:pre-wrap">{{ n.body }}</div></div>{% else %}<span class="muted">None.</span>{% endfor %}</div></div>
+<div class="card"><div class="card-h"><h2>Tasks and temperature</h2></div><div class="card-b">{% for t in tasks_ %}<div>{{ '✓' if t.status == 'done' else '○' }} {{ t.subject }} <span class="muted">due {{ t.due_at or t.due_date }}</span></div>{% endfor %}
+{% for t in temps %}<div class="muted">{{ t.at|dt }}: {{ icons.get(t.temperature, '') }} {{ t.temperature }} by {{ t.by }} ({{ t.reason }})</div>{% endfor %}</div></div></div>
+{% if arch %}<div class="card"><div class="card-h"><h2>From the archive (before full visibility)</h2></div><div class="card-b">{% for a in arch %}<div style="margin-bottom:6px"><span class="muted">{{ a.at }} · {{ a.kind }} · {{ users_.get(a.user_id, '?') }}</span><div style="white-space:pre-wrap">{{ a.text[:1500] }}</div></div>{% endfor %}</div></div>{% endif %}
+{% endblock %}"""
+T["archive.html"] = """{% extends 'base.html' %}{% block title %}Archive{% endblock %}{% block body %}
+<div class="card"><div class="card-h"><h2>Archive</h2><span class="muted">everything each BSO held before full visibility: read-only, kept until you delete it</span></div><div class="card-b">
+<form style="display:flex;gap:8px"><input name="q" value="{{ q }}" placeholder="search an email address, company, subject or text"><button class="btn brand">Search</button></form>
+<p class="muted">{% for c in counts %}{{ c.name }}: {{ c.n }} {{ c.kind }}{{ ', ' if not loop.last }}{% else %}Nothing archived yet.{% endfor %}</p></div>
+<table><tr><th>When</th><th>Whose BSO</th><th>What</th><th>Lead</th><th>Text</th></tr>{% for r in rows %}<tr><td class="muted">{{ r.at }}</td><td>{{ r.uname }}</td><td>{{ r.kind }}</td>
+<td>{% if r.lead_email %}<a href="{{ url_for('conversation', email=r.lead_email) }}">{{ r.lead_email }}</a>{% endif %}</td><td style="white-space:pre-wrap">{{ r.text[:600] }}</td></tr>{% endfor %}</table></div>{% endblock %}"""
+T["workspace.html"] = """{% extends 'base.html' %}{% block title %}Google Workspace setup{% endblock %}{% block body %}
+<div class="card"><div class="card-h"><h2>Google Workspace: a record supervisors can't delete, and blocking outside copies everywhere</h2></div><div class="card-b" style="line-height:1.6;max-width:900px">
+<p>BSO blocks outside copies of client emails written inside BSO, and reports anything it finds afterwards. These Google Workspace settings cover email written in Gmail on the web or on phones too, and keep a copy nobody but you can delete. You need to be a Workspace super admin. Settings can take up to an hour to apply. Menus are as Google shows them in 2026; if one has moved, search the Admin console for the setting's name.</p>
+<h3>1. A company archive mailbox</h3><ol>
+<li>Admin console (admin.google.com) → <b>Directory → Users → Add new user</b>, e.g. <b>archive@blacswanken.com</b>. Only you keep its password. Turn on 2-step verification for it.</li>
+<li>Make a group of the supervisors: <b>Directory → Groups → Create group</b>, e.g. <i>lead-gen-supervisors@</i>, and add every supervisor.</li></ol>
+<h3>2. Copy every supervisor email to the archive</h3><ol>
+<li><b>Apps → Google Workspace → Gmail → Routing</b>. Next to <b>Routing</b>, click <b>Configure</b>.</li>
+<li>Name it <i>Archive supervisors</i>. Messages to affect: tick <b>Inbound</b>, <b>Outbound</b> and <b>Internal - sending</b> / <b>Internal - receiving</b>.</li>
+<li>Under <i>Also deliver to</i> → <b>Add more recipients</b> → <b>Add</b> → archive@blacswanken.com.</li>
+<li>Under <i>Options</i>, limit it to the supervisors' group (Account types / Envelope filter: <b>Only affect specific envelope senders</b> and a second rule for <b>recipients</b>, both set to the group). Save.</li>
+<li>Every email to or from a supervisor now also lands in the archive mailbox the moment it's sent or received. Deleting it in their own mailbox doesn't touch this copy.</li></ol>
+<h3>3. Connect the archive mailbox to this console</h3><ol>
+<li>Sign in to archive@ once, then <b>Google Account → Security → App passwords</b>, create one named <i>BSO console</i>.</li>
+<li>Here: <b>Security → Company archive mailbox</b>: IMAP server <b>imap.gmail.com</b>, the address and the app password. The console checks it every 10 minutes.</li></ol>
+<h3>4. Hold outside copies for your approval (quarantine)</h3><ol>
+<li><b>Apps → Google Workspace → Gmail → Compliance → Content compliance</b> → <b>Configure</b>. Name it <i>Client emails outside</i>.</li>
+<li>Messages to affect: <b>Outbound</b>. Add expressions: <b>Advanced content match</b> → Location <b>Recipient(s)</b> (this includes BCC) → <b>Matches regex</b>:<br><code>@(gmail|googlemail|yahoo|hotmail|outlook|live|icloud|aol|proton|protonmail|gmx|yandex|zoho)\\.</code></li>
+<li>If the above expressions match: <b>Modify message</b> → <b>Send to admin quarantine</b> (create a quarantine named <i>Outside copies</i> under <b>Gmail → Manage quarantines</b> if asked). Limit it to the supervisors' group under <i>Options</i>.</li>
+<li>Quarantined emails wait in <b>Admin console → Reporting → Email log search / Admin quarantine</b> until you release or reject them. Supervisors can't get around it from any app.</li>
+<li>Your plan decides what's available: if <i>admin quarantine</i> isn't offered, choose <b>Reject message</b> instead, which bounces it back to the supervisor.</li></ol>
+<h3>5. Google Vault (if your plan includes it)</h3><p>Business Plus, Enterprise and some Education plans include Vault (vault.google.com). Create a <b>Retention rule</b> for Gmail covering the supervisors' group ("retain indefinitely"): Vault then keeps every message even after a supervisor permanently deletes it, and you can search and export them for legal needs. Check your plan under <b>Billing → Subscriptions</b>.</p>
+<h3>6. Tell the team</h3><p>Monitoring company mailboxes is generally allowed when staff are clearly told beforehand. BSO shows each person the updated notice and they confirm it once. Your local employment and privacy rules may add requirements; take local advice.</p>
+</div></div>{% endblock %}"""
 T["security.html"] = """{% extends 'base.html' %}{% block title %}Security{% endblock %}{% block body %}
 {% if msg %}<div class="note">{{ msg }}</div>{% endif %}
+<div class="card" id="incidents"><div class="card-h"><h2>Incidents</h2><span class="badge {{ 'b-ok' if chain_ok else 'b-bad' }}">{{ 'log intact' if chain_ok else 'log altered at #' ~ chain_bad }}</span>
+<span style="flex:1"></span><form style="margin:0"><select name="kind" onchange="this.form.submit()"><option value="">All types</option>{% for k, l in kinds.items() %}<option value="{{ k }}" {{ 'selected' if kind_f == k }}>{{ l }}</option>{% endfor %}</select></form>
+<a class="btn" href="{{ url_for('incidents_csv') }}">Export all (CSV)</a></div>
+<p class="muted" style="margin:8px 16px">Every client email copied outside the company, blocked, deleted or sent outside BSO. Entries are permanent and chained together, so any change to an old entry shows above. Reviewing adds a note beside an entry; it never changes it.</p>
+<table><tr><th>When</th><th>Who</th><th>What</th><th>Lead</th><th>Review</th></tr>
+{% for i in incs %}<tr id="inc{{ i.id }}" style="{{ 'background:#fff4f4' if not i.rstatus }}"><td class="muted">#{{ i.id }}<br>{{ i.at|dt }}</td><td>{{ i.uname or 'console' }}</td>
+<td><b>{{ kinds.get(i.kind, i.kind) }}</b><br>{{ i.detail }}<br><small class="muted">{{ i.how }}</small>{% if i.msg %}<details><summary>the email</summary><pre style="white-space:pre-wrap;font:12px ui-monospace,Consolas,monospace">{{ i.msg }}</pre></details>{% endif %}</td>
+<td>{% if i.lead_email %}<a href="{{ url_for('conversation', email=i.lead_email) }}">{{ i.lead_email }}</a>{% endif %}</td>
+<td>{% if i.rstatus %}<span class="badge {{ 'b-ok' if i.rstatus == 'fine' else 'b-warn' }}">{{ i.rstatus }}</span> by {{ i.rby }}{% if i.rnote %}<br><small>{{ i.rnote }}</small>{% endif %}{% endif %}
+<form method="post" style="margin-top:4px"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="review"><input type="hidden" name="incident_id" value="{{ i.id }}">
+<select name="status"><option value="reviewed">reviewed: keep flagged</option><option value="fine">fine (no problem)</option><option value="escalated">escalated (HR / legal)</option></select>
+<input name="note" placeholder="note" style="margin-top:4px"><label style="display:flex;gap:6px;color:inherit;font-size:12px"><input type="checkbox" name="allow_domain" value="{{ (i.detail or '').split('@')[-1].split(' ')[0] if '@' in (i.detail or '') else '' }}" style="width:auto"> allow this domain from now on</label>
+<button class="btn" style="margin-top:4px">Save review</button></form>{% if i.user_id %}<a class="btn" href="{{ url_for('user_detail', uid=i.user_id) }}">Person: reassign / pause…</a>{% endif %}</td></tr>
+{% else %}<tr><td colspan="5" class="muted">No incidents.</td></tr>{% endfor %}</table></div>
+<div class="card"><div class="card-h"><h2>Supervisors' mailboxes</h2></div><table><tr><th>Supervisor</th><th>Mailbox in BSO</th><th>Last checked</th><th>Problems</th></tr>
+{% for w in watch %}<tr><td>{{ w.u.name }}</td><td>{{ 'connected' if w.st.mailbox_connected else 'NOT connected' }}</td><td class="muted">{{ w.st.mailbox_checked|dt if w.st.mailbox_checked else '—' }}</td><td>{{ w.warn|join('; ') or '—' }}</td></tr>{% else %}<tr><td colspan="4" class="muted">No supervisors.</td></tr>{% endfor %}</table></div>
+<div class="card" id="archivebox"><div class="card-h"><h2>Company archive mailbox</h2>{% if box_checked %}<span class="muted">last checked {{ box_checked|dt }}</span>{% endif %}</div><div class="card-b">
+<p style="margin-top:0">For a record supervisors can't delete: in Google Workspace, copy every supervisor email to an archive mailbox only you control (<a href="{{ url_for('workspace_guide') }}">step-by-step guide</a>). Connect it here and the console checks it every 10 minutes: anything a supervisor sent or received with a lead that their BSO never saw becomes an incident, and outside copies are flagged even if the email was deleted.</p>
+<form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="archive_box"><div class="grid">
+<div><label>IMAP server</label><input name="box_host" value="{{ box_host }}" placeholder="imap.gmail.com"></div><div><label>Archive mailbox address</label><input name="box_user" value="{{ box_user }}" placeholder="archive@blacswanken.com"></div>
+<div><label>App password (kept encrypted on this computer)</label><input name="box_password" type="password" placeholder="{{ 'saved, leave blank to keep' if box_user else '' }}"></div></div><p><button class="btn brand">Save and check now</button></p></form></div></div>
 <div class="card"><div class="card-h"><h2>Alerts</h2><span class="muted">last 7 days</span></div><div class="card-b">
 {% for lvl, head, sub in alerts %}<div class="{{ 'err' if lvl == 'bad' else 'note' }}"><b>{{ head }}</b><br><span class="muted">{{ sub }}</span></div>{% else %}<span class="muted">Nothing needs your attention.</span>{% endfor %}</div></div>
 <div class="card"><div class="card-h"><h2>Rules for every BSO</h2></div><div class="card-b"><form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}">
+<div class="grid"><div><label>Keep emails and conversations for (months, 0 = forever; incidents and the archive are always kept)</label><input name="retention_months" type="number" min="0" value="{{ cfg.retention_months }}"></div>
+<div style="grid-column:span 2"><label>Domains supervisors may copy on client emails, besides our own and the client's (partners), comma separated</label><input name="allow_domains" value="{{ cfg.allow_domains }}" placeholder="partnerfirm.com, consultants.io"></div></div>
 <div class="grid"><div><label>Default automatic sign-out after this many idle minutes (0 = never; each person can change their own)</label><input name="idle_minutes" type="number" min="0" max="240" value="{{ cfg.idle_minutes }}"></div>
 <div><label>Ask for the password again every N days, even offline</label><input name="reauth_days" type="number" min="1" max="90" value="{{ cfg.reauth_days }}"></div>
 <div><label>Flag anyone who views or exports more than this many records at once</label><input name="big_list" type="number" min="50" value="{{ cfg.big_list }}"></div></div>
