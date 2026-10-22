@@ -446,9 +446,26 @@ def _receive_handover(con, d, restoring=False):
         text += ["", f"--- Our email {i} ({str(t.get('at', ''))[:10]}): {t.get('subject', '')} ---", t.get("body", "")]
     con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'email')", (lid, "\n".join(text), at))
     name = " ".join(p for p in (L.get("first_name"), L.get("last_name")) if p) or email
+    temp = d.get("temperature") or ("hot" if d.get("label") == "meeting_request" else "warm")
+    if temp in ("hot", "warm", "cold"):
+        con.execute("UPDATE leads SET temperature=?, temp_reason=? WHERE id=?", (temp, d.get("reason") or "", lid))
+    if d.get("first_touch") and (d["first_touch"] or {}).get("campaign"):
+        ft = d["first_touch"]
+        con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",
+                    (lid, f"First reached {str(ft.get('at', ''))[:10]} by campaign \"{ft.get('campaign')}\" (subject \"{ft.get('subject', '')}\") from {ft.get('sender', '')}.", at))
+    for r in d.get("related") or []:
+        if r.get("email"):
+            con.execute("INSERT OR IGNORE INTO related_contacts(email, lead_id, name, role, at) VALUES (?,?,?,?,?)",
+                        (str(r["email"]).lower(), lid, r.get("name") or "", r.get("role") or "cc", at))
     if (d.get("stage") or "new") == "new":
-        add_task(con, f"Contact {name}{' at ' + L['company'] if L.get('company') else ''}: handed over by {who_from}",
-                 due_date=at[:10], lead_id=lid)
+        import convo
+        hours = int(d.get("respond_hours") or convo.PLAYBOOK.get(temp, {}).get("respond_hours", 9))
+        due = convo.add_working_hours(datetime.now(), hours)
+        icon = convo.TEMP_ICON.get(temp, "")
+        add_task(con, f"{icon} Contact {name}{' at ' + L['company'] if L.get('company') else ''} within {hours} working hour(s): {temp}, handed over by {who_from}",
+                 due_date=due.date().isoformat(), lead_id=lid)
+        con.execute("UPDATE tasks SET priority=?, due_at=?, kind='respond' WHERE id=last_insert_rowid()",
+                    ("high" if temp == "hot" else "normal", due.isoformat(timespec="minutes")))
     log_event(con, lid, "handover_in", who_from)
 
 
@@ -577,9 +594,20 @@ def big_list():
 
 
 def idle_minutes():
+    """Minutes without use before BSO signs itself out. Each person chooses their own (Settings → Sign-out);
+    until they do, the default from the Master Console applies. The BSO Bot account is never signed out."""
     if is_bot() or not joined():
         return 0
+    mine = state().get("my_idle_minutes")
+    if mine is not None:
+        return int(mine or 0)
     return int(security().get("idle_minutes", 15) or 0)
+
+
+def set_idle_minutes(minutes):
+    s = state()
+    s["my_idle_minutes"] = None if minutes is None else max(0, min(int(minutes), 24 * 60))
+    save_state(s)
 
 
 def needs_reauth():
@@ -936,7 +964,11 @@ def status(con):
             "test_mode": bool((cfg.get("test_mode") or {}).get("enabled")), "review": bool((cfg.get("review") or {}).get("enabled")),
             "paused_inboxes": sorted(paused), "inboxes": len([sv for sv in cfg.get("senders") or [] if sv.get("email") and "example" not in sv["email"]]),
             "campaigns": [dict(r) for r in con.execute("SELECT id, name, status FROM campaigns ORDER BY id")],
-            "disk_encrypted": disk_encrypted_cached(), "idle_lock": idle_minutes()}
+            "disk_encrypted": disk_encrypted_cached(), "idle_lock": idle_minutes(),
+            "overdue": [dict(r) for r in con.execute(
+                "SELECT l.email lead_email, l.company, t.subject, t.due_at, t.priority FROM tasks t JOIN leads l ON l.id=t.lead_id "
+                "WHERE t.status='open' AND t.kind='respond' AND t.due_at IS NOT NULL AND t.due_at<? ORDER BY t.due_at LIMIT 50",
+                (datetime.now().isoformat(timespec="minutes"),))]}
 
 
 def sync(con, version=""):

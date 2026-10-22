@@ -2347,7 +2347,7 @@ T["security.html"] = """{% extends 'base.html' %}{% block title %}Security{% end
 <div class="card"><div class="card-h"><h2>Alerts</h2><span class="muted">last 7 days</span></div><div class="card-b">
 {% for lvl, head, sub in alerts %}<div class="{{ 'err' if lvl == 'bad' else 'note' }}"><b>{{ head }}</b><br><span class="muted">{{ sub }}</span></div>{% else %}<span class="muted">Nothing needs your attention.</span>{% endfor %}</div></div>
 <div class="card"><div class="card-h"><h2>Rules for every BSO</h2></div><div class="card-b"><form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}">
-<div class="grid"><div><label>Lock BSO after this many idle minutes (0 = never)</label><input name="idle_minutes" type="number" min="0" max="240" value="{{ cfg.idle_minutes }}"></div>
+<div class="grid"><div><label>Default automatic sign-out after this many idle minutes (0 = never; each person can change their own)</label><input name="idle_minutes" type="number" min="0" max="240" value="{{ cfg.idle_minutes }}"></div>
 <div><label>Ask for the password again every N days, even offline</label><input name="reauth_days" type="number" min="1" max="90" value="{{ cfg.reauth_days }}"></div>
 <div><label>Flag anyone who views or exports more than this many records at once</label><input name="big_list" type="number" min="50" value="{{ cfg.big_list }}"></div></div>
 <label style="display:flex;gap:8px;align-items:center;color:inherit"><input type="checkbox" name="members_export" style="width:auto" {{ 'checked' if 'member' in cfg.export_roles }}> Let members export to CSV and open the data folder (owners and managers always can; every export is logged here)</label>

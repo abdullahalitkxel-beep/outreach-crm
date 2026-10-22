@@ -14,7 +14,7 @@ import os
 import subprocess
 import sys
 import threading
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from flask import Flask, Response, abort, g, jsonify, redirect, request, url_for
@@ -37,7 +37,7 @@ app.jinja_loader = DictLoader(TEMPLATES)
 app.jinja_env.globals.update(logo=brand.logo_svg, logo_css=brand.MARK_CSS)
 
 STATUS_LABELS = {
-    "active": "In sequence", "paused": "Paused", "done": "Sequence finished", "replied": "Replied",
+    "active": "In sequence", "paused": "Paused", "done": "Sequence finished", "replied": "Replied", "nurture": "Nurture (check back later)",
     "not_interested": "Not interested", "unsubscribed": "Unsubscribed", "bounced": "Bounced",
 }
 JOB_LABELS = {"run": "Run bot (draft + send approved + check replies)", "check": "Check replies",
@@ -232,6 +232,19 @@ def legal_docs_version():
     return legal.app_version()
 
 
+import convo as _convo  # noqa: E402
+from markupsafe import Markup  # noqa: E402
+
+TEMP_STYLE = {"hot": "background:#fde1e1;color:#8c1c13", "warm": "background:#fff1d6;color:#7a4b00", "cold": "background:#e3effc;color:#0b4a8b",
+              "closed": "background:#e5e5e5;color:#444"}
+
+
+def temp_badge(t):
+    if t not in _convo.TEMP_ICON:
+        return ""
+    return Markup(f'<span class="badge" style="{TEMP_STYLE[t]}">{_convo.TEMP_ICON[t]} {t}</span>')
+
+
 def render(name, **ctx):
     try:
         bot.sync_mode(db(), cfg())          # keeps test-mode results apart from live ones
@@ -253,6 +266,7 @@ def render(name, **ctx):
     ctx.setdefault("all_campaigns", rows("SELECT id, name, status FROM campaigns ORDER BY id"))
     return app.jinja_env.get_template(name).render(
         request=request, url_for=url_for, money=money, today=today(), status_labels=STATUS_LABELS,
+        temp_badge=temp_badge, temp_icons=_convo.TEMP_ICON, now_local=datetime.now().isoformat(timespec="minutes"),
         stages=STAGES, nav_items=nav, active=active, review_count=review_count, job_labels=JOB_LABELS,
         test_redirect=test_redirect(), test_mode_broken=tm.get("enabled") and not tm.get("redirect_to"),
         team_user=team.signed_in(), team_name=team.SIGNED_IN.get("name"), team_bot=team.SIGNED_IN.get("bot"), currency=cfg().get("currency", "$"), app_version=legal_docs_version(), publisher=cfg().get("publisher", "BlacSwanken"),
@@ -371,7 +385,7 @@ def leads():
     if a.get("q"):
         where.append("(email LIKE ? OR first_name LIKE ? OR company LIKE ? OR extra LIKE ?)")
         params += [f"%{a['q']}%"] * 4
-    for field in ("stage", "status"):
+    for field in ("stage", "status", "temperature"):
         if a.get(field):
             where.append(f"{field}=?")
             params.append(a[field])
@@ -449,8 +463,68 @@ def lead(lead_id):
         pending_draft=(rows("SELECT id FROM outbox WHERE lead_id=? AND status='pending'", lead_id) or [None])[0],
         opps=rows("SELECT * FROM opportunities WHERE lead_id=?", lead_id),
         open_tasks=rows("SELECT * FROM tasks WHERE lead_id=? AND status='open' ORDER BY due_date", lead_id),
-        timeline=timeline_for(lead_id), opp_open=OPP_OPEN_STAGES,
+        timeline=timeline_for(lead_id), opp_open=OPP_OPEN_STAGES, **tracking_ctx(lead_id),
         default_close=(date.today() + timedelta(days=30)).isoformat(), **prospect_ctx(lead_id, l))
+
+
+KIND_LABELS = {"step": "email", "intro": "warm intro", "reconnect": "check-back", "supervisor": "supervisor email"}
+
+
+def tracking_ctx(lead_id):
+    touches = []
+    for t in rows("SELECT s.*, c.name campaign FROM sent_log s LEFT JOIN campaigns c ON c.id=s.campaign_id WHERE s.lead_id=? ORDER BY s.id", lead_id):
+        t = dict(t)
+        t["kind_label"] = (f"email {int(t['step']) + 1}" if t["kind"] == "step" and t["step"] is not None else KIND_LABELS.get(t["kind"], t["kind"] or "email"))
+        touches.append(t)
+    return {"other_addresses": rows("SELECT * FROM lead_addresses WHERE lead_id=? ORDER BY at", lead_id),
+            "related": rows("SELECT * FROM related_contacts WHERE lead_id=? ORDER BY at", lead_id), "touches": touches}
+
+
+@app.post("/lead/<int:lead_id>/temperature")
+def lead_temperature(lead_id):
+    import convo
+    t = request.form.get("temperature", "")
+    if t not in convo.TEMPS:
+        return redirect(url_for("lead", lead_id=lead_id))
+    old = get_lead(lead_id)["temperature"]
+    cb = request.form.get("check_back") or None
+    convo.set_temperature(db(), lead_id, t, None, f"set by {team.signed_in() or 'you'}" + (f" (was {old})" if old else ""), "person", cb if t == "cold" else None)
+    log_event(db(), lead_id, "temperature", f"{t} (changed by a person{', was ' + old if old else ''})")
+    if t == "cold" and cb:
+        db().execute("UPDATE leads SET status='nurture' WHERE id=? AND status IN ('replied','active','paused')", (lead_id,))
+    if t == "closed":
+        l = get_lead(lead_id)
+        db().execute("UPDATE leads SET status='unsubscribed' WHERE id=?", (lead_id,))
+        suppress(db(), l["email"], "closed by a person")
+    db().commit()
+    return redirect(url_for("lead", lead_id=lead_id, msg="Temperature changed.") + "#tracking")
+
+
+@app.post("/lead/<int:lead_id>/address")
+def lead_address(lead_id):
+    e = request.form.get("email", "").strip().lower()
+    act = request.form.get("action")
+    if act == "add" and re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", e):
+        other = db().execute("SELECT lead_id FROM lead_addresses WHERE email=?", (e,)).fetchone()
+        if other and other["lead_id"] != lead_id:
+            return redirect(url_for("lead", lead_id=lead_id, msg=f"{e} is already linked to another lead.", err=1) + "#tracking")
+        db().execute("INSERT OR REPLACE INTO lead_addresses(email, lead_id, how, confirmed, at, note) VALUES (?,?,?,1,?,?)",
+                     (e, lead_id, "added by hand", iso(now_utc()), team.signed_in() or ""))
+    elif act == "confirm":
+        db().execute("UPDATE lead_addresses SET confirmed=1 WHERE email=? AND lead_id=?", (e, lead_id))
+    elif act == "unlink":
+        db().execute("DELETE FROM lead_addresses WHERE email=? AND lead_id=?", (e, lead_id))
+    db().commit()
+    return redirect(url_for("lead", lead_id=lead_id) + "#tracking")
+
+
+@app.post("/lead/<int:lead_id>/reconnect")
+def lead_reconnect(lead_id):
+    oid = bot.reconnect_draft(cfg(), db(), get_lead(lead_id), "reconnect")
+    db().commit()
+    if not oid:
+        return redirect(url_for("lead", lead_id=lead_id, msg="A reconnect email is already waiting for review (or no inbox is set up).", err=1))
+    return redirect(url_for("review", msg="Reconnect email drafted. Edit it and approve it to send.") + f"#d{oid}")
 
 
 def prospect_ctx(lead_id, l):
@@ -811,7 +885,7 @@ def tasks():
     show = request.args.get("show", "open") if request.args.get("show") in ("open", "done", "overdue") else "open"
     where = {"open": "t.status='open'", "done": "t.status='done'", "overdue": "t.status='open' AND t.due_date<?"}[show]
     params = (today(),) if show == "overdue" else ()
-    order = "t.done_at DESC" if show == "done" else "t.due_date"
+    order = "t.done_at DESC" if show == "done" else "t.priority='high' DESC, t.due_date, COALESCE(t.due_at, '99')"
     data = rows(f"SELECT t.*, l.first_name lead_name, o.name opp_name FROM tasks t "
                 f"LEFT JOIN leads l ON l.id=t.lead_id LEFT JOIN opportunities o ON o.id=t.opp_id "
                 f"WHERE {where} ORDER BY {order} LIMIT 300", *params)
@@ -901,7 +975,112 @@ def campaign_stats(cid):
             "sent": sent, "replies": replies, "positive": good,
             "handed": q(f"SELECT COUNT(*) FROM events WHERE type='handover' AND lead_id IN ({lead_ids})", cid),
             "bounces": q(f"SELECT COUNT(*) FROM events WHERE type='bounce' AND lead_id IN ({lead_ids})", cid),
-            "rate": f"{replies * 100 / sent:.1f}%" if sent else "–", "pos_rate": f"{good * 100 / sent:.1f}%" if sent else "–"}
+            "rate": f"{replies * 100 / sent:.1f}%" if sent else "–", "pos_rate": f"{good * 100 / sent:.1f}%" if sent else "–",
+            **{t: q("SELECT COUNT(*) FROM leads WHERE COALESCE(campaign_id,1)=? AND temperature=?", cid, t) for t in ("hot", "warm", "cold")}}
+
+
+DRILL = {"leads": "All leads", "waiting": "Not yet emailed", "in_sequence": "In sequence", "sent": "Emails sent", "replies": "Replies",
+         "positive": "Positive replies", "handed": "Handed over", "bounces": "Bounces", "hot": "🔥 Hot", "warm": "☀ Warm", "cold": "❄ Cold"}
+
+
+def _period_since(p):
+    return {"today": iso(now_utc().replace(hour=0, minute=0, second=0)), "7d": iso(now_utc() - timedelta(days=7)),
+            "30d": iso(now_utc() - timedelta(days=30))}.get(p)
+
+
+@app.route("/campaigns/<int:cid>/list/<what>")
+def campaign_list(cid, what):
+    if what not in DRILL:
+        abort(404)
+    c = (rows("SELECT * FROM campaigns WHERE id=?", cid) or [None])[0] or abort(404)
+    a = request.args
+    since, q, page = _period_since(a.get("period")), a.get("q", "").strip().lower(), max(1, a.get("page", 1, type=int))
+    like = f"%{q}%"
+    per = 100
+    if what == "sent":
+        sql = ("SELECT s.id sid, s.at, s.lead_id, s.kind, s.step, s.variant, s.sender, s.subject, s.test, l.email, l.first_name, l.company, l.status, l.temperature, "
+               "l.handed_to FROM sent_log s LEFT JOIN leads l ON l.id=s.lead_id WHERE s.campaign_id=? AND s.kind IN ('step','reconnect','intro')")
+        args = [cid]
+        if since:
+            sql += " AND s.at>=?"
+            args.append(since)
+        if q:
+            sql += " AND (lower(COALESCE(l.email, s.lead_email)) LIKE ? OR lower(COALESCE(l.company,'')) LIKE ? OR lower(s.subject) LIKE ?)"
+            args += [like] * 3
+        legacy = ("SELECT NULL sid, e.at, e.lead_id, 'step' kind, NULL step, e.variant, e.sender, e.detail subject, "
+                  "CASE WHEN e.detail LIKE '%(test)%' THEN 1 ELSE 0 END test, l.email, l.first_name, l.company, l.status, l.temperature, l.handed_to "
+                  "FROM events e JOIN leads l ON l.id=e.lead_id WHERE e.type='sent' AND COALESCE(l.campaign_id,1)=? "
+                  "AND e.detail NOT LIKE '%handover%' AND NOT EXISTS (SELECT 1 FROM sent_log s2 WHERE s2.lead_id=e.lead_id)")
+        largs = [cid]
+        if since:
+            legacy += " AND e.at>=?"
+            largs.append(since)
+        if q:
+            legacy += " AND (lower(l.email) LIKE ? OR lower(COALESCE(l.company,'')) LIKE ?)"
+            largs += [like] * 2
+        full = f"SELECT * FROM ({sql} UNION ALL {legacy}) ORDER BY at DESC"
+        total = one(f"SELECT COUNT(*) FROM ({full})", *(args + largs))
+        items = rows(full + f" LIMIT {per} OFFSET {(page - 1) * per}", *(args + largs))
+    else:
+        cond = {"leads": "1=1", "waiting": "l.status='active' AND l.step=0", "in_sequence": "l.status='active' AND l.step>0",
+                "replies": "l.id IN (SELECT lead_id FROM events WHERE type='reply')",
+                "positive": "l.id IN (SELECT lead_id FROM events WHERE type='reply' AND detail IN ('interested','meeting_request','question','referral'))",
+                "handed": "l.id IN (SELECT lead_id FROM events WHERE type='handover')", "bounces": "l.status='bounced'",
+                "hot": "l.temperature='hot'", "warm": "l.temperature='warm'", "cold": "l.temperature='cold'"}[what]
+        sql = (f"SELECT l.*, (SELECT MAX(at) FROM events e WHERE e.lead_id=l.id) last_at, (SELECT COUNT(*) FROM sent_log s WHERE s.lead_id=l.id) n_sent "
+               f"FROM leads l WHERE COALESCE(l.campaign_id,1)=? AND {cond}")
+        args = [cid]
+        if since:
+            sql += " AND l.id IN (SELECT lead_id FROM events WHERE at>=?)"
+            args.append(since)
+        if q:
+            sql += " AND (lower(l.email) LIKE ? OR lower(COALESCE(l.company,'')) LIKE ? OR lower(COALESCE(l.first_name,'')) LIKE ?)"
+            args += [like] * 3
+        total = one(f"SELECT COUNT(*) FROM ({sql})", *args)
+        items = rows(sql + f" ORDER BY last_at DESC LIMIT {per} OFFSET {(page - 1) * per}", *args)
+    if len(items) >= min(team.big_list(), per):
+        team.record_access(db(), "big_list", f"campaign {c['name']}: {DRILL[what]}", total)
+    return render("drill.html", c=c, what=what, title=DRILL[what], items=items, total=total, page=page, pages=max(1, (total + per - 1) // per),
+                  drill=DRILL, kind_labels=KIND_LABELS)
+
+
+def _mail_json(row, direction):
+    return {"dir": direction, "at": row["at"], "from": row.get("frm") or row.get("sender") or "", "to": row.get("to_") or "",
+            "cc": row.get("cc") or "", "bcc": row.get("bcc") or "", "subject": row.get("subject") or "", "body": row.get("body") or "",
+            "test": bool(row.get("test")), "label": row.get("label") or "", "temperature": row.get("temperature") or "", "how": row.get("how") or ""}
+
+
+@app.get("/api/email/<int:sid>")
+def api_email(sid):
+    r = (rows("SELECT * FROM sent_log WHERE id=?", sid) or [None])[0] or abort(404)
+    return jsonify(conversation_json(r["lead_id"], focus=sid) if r["lead_id"] else {"items": [_mail_json(dict(r), "out")], "focus": 0})
+
+
+@app.get("/api/conversation/<int:lead_id>")
+def api_conversation(lead_id):
+    return jsonify(conversation_json(lead_id))
+
+
+def conversation_json(lead_id, focus=None):
+    items, fidx = [], None
+    for r in rows("SELECT * FROM sent_log WHERE lead_id=?", lead_id):
+        if r["id"] == focus:
+            fidx = len(items)
+        items.append(dict(_mail_json(dict(r), "out"), _sid=r["id"]))
+    for r in rows("SELECT * FROM received WHERE lead_id=?", lead_id):
+        items.append(_mail_json(dict(r), "in"))
+    for r in rows("SELECT * FROM messages WHERE lead_id=?", lead_id):
+        items.append(dict(_mail_json(dict(r), "in" if r["direction"] == "in" else "out"), via="supervisor mailbox"))
+    if not items:                                   # sent before BSO kept copies
+        for e in rows("SELECT * FROM events WHERE lead_id=? AND type IN ('sent','reply') ORDER BY at", lead_id):
+            items.append({"dir": "out" if e["type"] == "sent" else "in", "at": e["at"], "from": e["sender"] or "", "to": "", "cc": "", "bcc": "",
+                          "subject": e["detail"] or "", "body": "(text not saved: sent before BSO kept copies of emails)", "test": "(test)" in (e["detail"] or "")})
+    items.sort(key=lambda x: x["at"] or "")
+    if focus is not None:
+        fidx = next((i for i, x in enumerate(items) if x.get("_sid") == focus), None)
+    l = get_lead(lead_id)
+    team.record_access(db(), "view_conversation", l["email"] if l else str(lead_id), len(items))
+    return {"items": items, "focus": fidx, "lead": {"email": l["email"], "name": lead_view(l)["name"], "company": l["company"]} if l else {}}
 
 
 def campaign_sequence(c):
@@ -1431,7 +1610,11 @@ def job(job_id):
     if j["status"] == "failed" and not problems:
         last = [l for l in (j["output"] or "").splitlines() if l.strip()]
         problems = [last[-1][:300]] if last else ["The run stopped unexpectedly."]
-    return render("job.html", j=j, after_links=after, problems=problems)
+    end = j["finished_at"] or iso(now_utc() + timedelta(minutes=1))
+    sent_now = rows("SELECT s.*, l.first_name, l.company FROM sent_log s LEFT JOIN leads l ON l.id=s.lead_id WHERE s.at>=? AND s.at<=? ORDER BY s.id DESC",
+                    j["started_at"], end) if j["cmd"] == "run" else []
+    skipped = [l_[5:].strip() for l_ in (j["output"] or "").splitlines() if l_.startswith("SKIP:")]
+    return render("job.html", j=j, after_links=after, problems=problems, sent_now=sent_now, skipped=skipped, kind_labels=KIND_LABELS)
 
 
 @app.route("/jobs")
@@ -1493,6 +1676,10 @@ def erase_lead(con, lead_id, keep_blocked):
     for table, col in (("notes", "lead_id"), ("events", "lead_id"), ("outbox", "lead_id"), ("tasks", "lead_id")):
         con.execute(f"DELETE FROM {table} WHERE {col}=?", (lead_id,))
     con.execute("UPDATE opportunities SET lead_id=NULL WHERE lead_id=?", (lead_id,))
+    # the touch ledger keeps that an email went to this company (for campaign credit) but not who or what it said
+    con.execute("UPDATE sent_log SET lead_email='', to_='', cc=NULL, bcc=NULL, subject='', body='', lead_id=NULL WHERE lead_id=?", (lead_id,))
+    for t in ("received", "lead_addresses", "related_contacts", "temp_log"):
+        con.execute(f"DELETE FROM {t} WHERE lead_id=?", (lead_id,))
     con.execute("DELETE FROM leads WHERE id=?", (lead_id,))
 
 
@@ -1692,8 +1879,34 @@ def settings():
                   dsc_recent=rows("SELECT * FROM discovered ORDER BY at DESC LIMIT 8"), ai_key=bool(env("ANTHROPIC_API_KEY")), inbox_emails=[x.get("email") for x in (c.get("senders") or []) if x.get("email") and "example" not in x.get("email", "")],
                   startup_ok=startup_supported(), startup_on=startup_enabled(), is_bot=team.is_bot(),
                   ho=dict(c.get("handover") or {}), pm=dict(c.get("prospect_mailbox") or {}), pm_pw=mask(env(mailbox.PW_KEY)), ho_default=bot_default_intro(), team_sups=team.supervisors() if team.joined() else [],
-                  live=_live_summary(), test_info=bot.test_counts(db()),
-                  team=dict(team.state(), joined=team.joined(), policy=team.policy(), disclosure=team.DISCLOSURE, locked=team.locked_in(), signed=team.signed_in()))
+                  live=_live_summary(), test_info=bot.test_counts(db()), pb=_convo.playbook(cfg()), **_activity_ctx(),
+                  team=dict(team.state(), joined=team.joined(), is_bot=team.is_bot(), idle=team.idle_minutes(),
+                            idle_mine=team.state().get("my_idle_minutes") is not None, idle_default=int(team.security().get("idle_minutes", 15) or 0), policy=team.policy(), disclosure=team.DISCLOSURE, locked=team.locked_in(), signed=team.signed_in()))
+
+
+def _activity_ctx():
+    ibs = [x.get("email") for x in (cfg().get("senders") or []) if x.get("email") and "example" not in x.get("email", "")]
+    ib = request.args.get("ib") or (ibs[0] if ibs else "")
+    return {"activity_inboxes": ibs, "activity_ib": ib,
+            "activity": rows("SELECT * FROM inbox_log WHERE inbox=? ORDER BY id DESC LIMIT 50", ib.lower()) if ib else []}
+
+
+@app.post("/settings/inboxes/recheck")
+def inbox_recheck():
+    e = request.form.get("email", "").lower()
+    c = cfg()
+    s_ = next((x for x in bot.load_senders(c) if x["email"].lower() == e), None)
+    if not s_ or not s_.get("password"):
+        return redirect(url_for("settings", tab="inbox", ib=e, result="That inbox has no saved password.") + "#activity")
+    try:
+        con = db_connect(c.get("database", "outreach.db"))
+        bot.sync_mode(con, c)
+        n = bot.process_inbox(c, con, s_, recheck=True)
+        con.close()
+        msg = f"Re-checked {e}: {n} email(s) looked at again." if n else f"Re-checked {e}: nothing new to handle."
+    except Exception as ex:
+        msg = f"Couldn't check {e}: {ex}"
+    return redirect(url_for("settings", tab="inbox", ib=e, result=msg, ok=1) + "#activity")
 
 
 def _live_summary():
@@ -1713,6 +1926,15 @@ def team_leave():
         return redirect(url_for("settings", tab="team", result="This install is managed by your admin and can't leave the team."))
     team.leave()
     return redirect(url_for("settings", tab="team", result="You left the team.", ok=1))
+
+
+@app.post("/settings/signout")
+def save_idle():
+    v = request.form.get("minutes", "")
+    team.set_idle_minutes(None if v == "default" else int(v or 0))
+    LAST_ACTIVE["t"] = None
+    return redirect(url_for("settings", tab="team", result="Saved: " + ("you'll follow your manager's default." if v == "default" else
+                                                                      ("BSO won't sign you out by itself." if v in ("0", "") else f"BSO signs you out after {v} minutes without use.")), ok=1) + "#signout")
 
 
 @app.post("/settings/team/sync")
@@ -1849,6 +2071,16 @@ def save_safety():
         except OSError as e:
             msg += f" Couldn't change 'start with Windows' ({e})."
     return redirect(url_for("settings", tab="safety", result=msg, ok=1))
+
+
+@app.post("/settings/replies")
+def save_replies():
+    f = request.form
+    num = lambda k, lo, hi, d: max(lo, min(hi, int(f.get(k) or d)))
+    write_settings({"playbooks": {"hot": {"respond_hours": num("hot_hours", 1, 24, 2), "escalate_hours": num("hot_escalate", 1, 48, 4)},
+                                  "warm": {"respond_hours": num("warm_hours", 1, 48, 9)}, "cold": {"check_back_days": num("cold_days", 7, 365, 90)}},
+                    "ref_code": {"enabled": bool(f.get("ref_on")), "prefix": re.sub(r"[^A-Z]", "", (f.get("ref_prefix") or "NS").upper())[:4] or "NS"}})
+    return redirect(url_for("settings", tab="safety", result="Saved.", ok=1) + "#replies")
 
 
 @app.post("/settings/test/clear")

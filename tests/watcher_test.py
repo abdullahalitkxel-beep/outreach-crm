@@ -25,7 +25,8 @@ def check(cond, what):
     n += 1
 
 # ---------------------------------------------------------------- a tiny IMAP server with IDLE
-MAILBOX, IDLERS, LOGINS = [], [], []
+MAILBOX, IDLERS, LOGINS, SPAM = [], [], [], []
+FOLDERS = {"INBOX": MAILBOX, "INBOX.spam": SPAM}
 LOCK = threading.Lock()
 CAPS = {"IDLE": True}
 
@@ -36,6 +37,7 @@ class H(socketserver.StreamRequestHandler):
         self.wfile.flush()
 
     def handle(self):
+        self.box = MAILBOX
         caps = "IMAP4rev1" + (" IDLE" if CAPS["IDLE"] else "")
         self.w(f"* OK [CAPABILITY {caps}] ready\r\n")
         while True:
@@ -52,12 +54,15 @@ class H(socketserver.StreamRequestHandler):
                 LOGINS.append(rest)
                 self.w(f"{tag} OK logged in\r\n")
             elif cmd in ("SELECT", "EXAMINE"):
-                self.w(f"* {len(MAILBOX)} EXISTS\r\n{tag} OK [READ-ONLY] done\r\n")
+                self.box = FOLDERS.get(rest.strip().strip('"'), MAILBOX)
+                self.w(f"* {len(self.box)} EXISTS\r\n{tag} OK [READ-ONLY] done\r\n")
+            elif cmd == "LIST":
+                self.w('* LIST (\\HasNoChildren) "." INBOX\r\n* LIST (\\HasNoChildren \\Junk) "." INBOX.spam\r\n' + f"{tag} OK done\r\n")
             elif cmd == "UID" and rest.upper().startswith("SEARCH"):
-                self.w("* SEARCH " + " ".join(str(i + 1) for i in range(len(MAILBOX))) + f"\r\n{tag} OK done\r\n")
+                self.w("* SEARCH " + " ".join(str(i + 1) for i in range(len(self.box))) + f"\r\n{tag} OK done\r\n")
             elif cmd == "UID" and rest.upper().startswith("FETCH"):
                 uid = int(rest.split()[1])
-                raw = MAILBOX[uid - 1]
+                raw = self.box[uid - 1]
                 if "HEADER.FIELDS" in rest.upper():
                     hdr = raw.split(b"\r\n\r\n", 1)[0]
                     keep = b"\r\n".join(l for l in hdr.split(b"\r\n") if l.lower().startswith((b"message-id", b"subject"))) + b"\r\n\r\n"
@@ -94,11 +99,13 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 imaplib.IMAP4_SSL = lambda host, port=993, timeout=None, **k: imaplib.IMAP4(host, port, timeout=timeout)   # plain connection for the test
 
 
-def deliver(frm, subject, body, mid):
+def deliver(frm, subject, body, mid, box=None, in_reply_to=None):
     m = EmailMessage()
     m["From"], m["To"], m["Subject"], m["Message-ID"] = frm, "inbox1@getneosofttech.com", subject, mid
+    if in_reply_to:
+        m["In-Reply-To"] = in_reply_to
     m.set_content(body)
-    MAILBOX.append(m.as_bytes().replace(b"\n", b"\r\n").replace(b"\r\r\n", b"\r\n"))
+    (box if box is not None else MAILBOX).append(m.as_bytes().replace(b"\n", b"\r\n").replace(b"\r\r\n", b"\r\n"))
     with LOCK:
         for h in list(IDLERS):
             try:
@@ -135,7 +142,7 @@ for _ in range(100):
     time.sleep(0.1)
 check(watcher.STATUS.get("inbox1@getneosofttech.com", {}).get("state") == "live" and IDLERS, "BSO keeps a live connection open to the inbox")
 st = lambda e: con.execute("SELECT status FROM leads WHERE email=?", (e,)).fetchone()[0]
-check(st("kim@umbrella.com") == "not_interested", "on start it catches up, including a test reply an older version skipped")
+check(st("kim@umbrella.com") == "nurture", "on start it catches up, including a test reply an older version skipped (a polite no: nurture)")
 
 t0 = time.time()
 deliver("Omar Ali <omar@blacswanken.com>", "RE: [TEST for sarah@acme.com] Quick question", "Sounds interesting, tell me more please.", "<r-1@x>")
@@ -160,6 +167,28 @@ ths = [threading.Thread(target=lambda: res.append(bot.process_inbox(cfg, bot.db_
 time.sleep(2)
 cnt = con.execute("SELECT COUNT(*) FROM events WHERE type='reply' AND lead_id=(SELECT id FROM leads WHERE email='tom@globex.com')").fetchone()[0]
 check(cnt == 1, "each message is handled exactly once")
+
+# replies that land in Spam are still found, if they belong to a BSO conversation
+import convo  # noqa: E402
+lid = con.execute("SELECT id FROM leads WHERE email='kim@umbrella.com'").fetchone()[0]
+con.execute("UPDATE leads SET status='active' WHERE id=?", (lid,))
+convo.record_sent(con, "<our-kim@x>", dict(con.execute("SELECT * FROM leads WHERE id=?", (lid,)).fetchone()), "step", "inbox1@getneosofttech.com",
+                  "kim@umbrella.com", "Quick question", "hello")
+con.commit()
+deliver("Kim <kim@umbrella.com>", "Re: Quick question", "Actually yes, let's talk next week.", "<spam-1@x>", box=SPAM, in_reply_to="<our-kim@x>")
+deliver("Pills <spam@pills.biz>", "Cheap pills", "Buy now", "<spam-2@x>", box=SPAM)
+watcher.check_now(cfgp, "inbox1@getneosofttech.com")
+check(st("kim@umbrella.com") == "replied", "a reply that landed in Spam is still found (it's in a BSO thread)")
+logd = {r["msg_id"]: r["decision"] for r in con.execute("SELECT * FROM inbox_log")}
+check("left in Spam" in logd.get("<spam-2@x>", "") and "Spam" in logd.get("<spam-1@x>", ""), "real spam is left alone; the activity log says what happened")
+
+# re-check: something skipped earlier is looked at again
+deliver("Zed <zed@nowhere.com>", "Hi", "hello", "<late-1@x>")
+watcher.check_now(cfgp, "inbox1@getneosofttech.com")
+con.execute("INSERT INTO leads(email, first_name, company, extra, status, step, created_at, first_subject) VALUES ('zed@nowhere.com','Zed','Nowhere','{}','active',1,'2026-10-01','Hi')")
+con.commit()
+n_again = bot.process_inbox(cfg, con, s1, recheck=True)
+check(st("zed@nowhere.com") == "replied" and n_again >= 1, "Re-check picks up an email that was skipped before")
 
 # a server without IDLE: checked every couple of minutes instead
 watcher.stop_all()

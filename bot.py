@@ -25,7 +25,7 @@ import socket
 import sqlite3
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, parseaddr
 from pathlib import Path
@@ -275,6 +275,9 @@ def db_connect(path):
         con.execute("INSERT OR IGNORE INTO campaigns(id, name, status, created_at) VALUES (1, 'Main campaign', 'active', ?)", (iso(now_utc()),))
         con.execute("UPDATE leads SET stage='qualified' WHERE stage IN ('meeting','proposal','won')")
         con.execute("UPDATE leads SET stage='unqualified' WHERE stage='lost'")
+        import convo
+        convo.ensure(con, _add_column)
+        con.execute("CREATE INDEX IF NOT EXISTS sent_log_email ON sent_log(lead_email)")
         _test_triggers(con)
         con.commit()
         _migrated.add(str(full))
@@ -286,9 +289,11 @@ def db_connect(path):
 # event, draft, note, task, handover and do-not-contact entry added. Going live (or "Clear test results") puts the
 # leads back exactly as they were and removes what the test added, so test replies never close a real lead.
 
-TEST_TRACKED = ("events", "outbox", "notes", "tasks", "handover_out", "suppression")
+TEST_TRACKED = ("events", "outbox", "notes", "tasks", "handover_out", "suppression", "sent_log", "received", "temp_log",
+                "related_contacts", "lead_addresses")
 # what a test run changes on a lead; edits you make yourself (name, company, notes on the lead itself) are kept
-TEST_PROGRESS = {"step", "status", "stage", "next_send_at", "sender", "first_msg_id", "first_subject", "handed_to", "handed_at", "prospect_stage"}
+TEST_PROGRESS = {"step", "status", "stage", "next_send_at", "sender", "first_msg_id", "first_subject", "handed_to", "handed_at", "prospect_stage",
+                 "temperature", "temp_reason", "check_back", "came_back", "score", "deal_status", "lost_reason", "journey"}
 
 
 def _test_triggers(con):
@@ -628,6 +633,43 @@ Output only the sentence."""
     return line
 
 
+def analyze_reply(cfg, msg, body):
+    """{'label', 'temperature', 'check_back', 'reason'} from the AI when it's on (else just the label from keywords)."""
+    low = body.lower()
+    if any(k in low for k in ("unsubscribe", "remove me", "stop emailing", "take me off")):
+        return {"label": "unsubscribe", "temperature": "closed"}
+    auto = (msg.get("Auto-Submitted", "") + msg.get("X-Autoreply", "")).lower()
+    if auto and auto != "no":
+        return {"label": "out_of_office"}
+    if not (cfg.get("ai_reply_sorting") or {}).get("enabled"):
+        return {"label": keyword_label(low)}
+    prompt = f"""You sort replies to B2B cold sales emails. Today is {date.today().isoformat()}.
+Return only JSON: {{"label": one of {REPLY_LABELS}, "temperature": "hot"|"warm"|"cold"|"closed",
+"check_back": "YYYY-MM-DD" or null, "reason": "max 12 words"}}
+label: interested = positive, wants to know more; meeting_request = asks for or proposes a call/meeting/time;
+question = asks something specific (price, process, examples); referral = points us to someone else; other = needs a human look.
+temperature: hot = ready to talk/buy now (meeting, price, proposal, timeline); warm = interested or asking; cold = not now, has a vendor,
+no budget, polite no; closed = wants no more contact. check_back = the date they suggest coming back (e.g. "after Q1"), else null.
+
+Reply:
+\"\"\"{body[:2500]}\"\"\""""
+    raw = llm(cfg, "classify", prompt, max_tokens=120)
+    if raw:
+        m = re.search(r"\{.*\}", raw, re.S)
+        try:
+            j = json.loads(m.group(0)) if m else {}
+        except ValueError:
+            j = {}
+        lab = str(j.get("label") or "").lower().strip()
+        if lab in REPLY_LABELS:
+            return {"label": lab, "temperature": str(j.get("temperature") or "").lower(), "check_back": j.get("check_back"),
+                    "reason": str(j.get("reason") or "")[:120]}
+        lab = raw.lower().strip(" .\n")
+        if lab in REPLY_LABELS:
+            return {"label": lab}
+    return {"label": keyword_label(low)}
+
+
 def classify_reply(cfg, msg, body):
     low = body.lower()
     if any(k in low for k in ("unsubscribe", "remove me", "stop emailing", "take me off")):
@@ -920,9 +962,16 @@ def cmd_run(cfg, con, args):
     sent = drafted = waiting = failed = 0
     problems = []
     lo, hi = cfg.get("delay_between_sends_seconds", [60, 180])
+    import convo
     for row in due:
         lead = dict(row)
         idx = lead["step"]
+        if convo.protected(con, lead["email"]):                # part of a live deal elsewhere: no cold emails
+            print(f"SKIP: {lead['email']}: part of an open conversation with their company; emails paused")
+            con.execute("UPDATE leads SET status='paused' WHERE id=?", (lead["id"],))
+            con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",
+                        (lead["id"], "Emails paused: this person is part of an open conversation with their company.", iso(now_utc())))
+            continue
         ccfg, senders = for_campaign(lead.get("campaign_id") or 1)
         steps = ccfg["sequence"]
         if not senders:
@@ -976,6 +1025,11 @@ def cmd_run(cfg, con, args):
 
         reply_to = lead["first_msg_id"] if idx > 0 else None
         full_body = body + "\n\n" + render(ccfg["footer"], lead, sender, ccfg)
+        rc = cfg.get("ref_code") or {}
+        if rc.get("enabled", True):
+            code = convo.ref_code(con, lead["id"], rc.get("prefix") or "NS")
+            if code:
+                full_body += f"\nRef: {code}"
         to, shown_subject = lead["email"], subject
         if redirect:  # test mode: real lead data, but it lands in your own inbox
             to, shown_subject = redirect, f"[TEST for {lead['email']}] {subject}"
@@ -1005,6 +1059,8 @@ def cmd_run(cfg, con, args):
             failed += 1
             continue
 
+        convo.record_sent(con, msg_id, lead, "step", sender["email"], to, shown_subject, full_body, step=idx, variant=variant,
+                          test=bool(redirect), angle=(draft["angle"] if draft and "angle" in draft.keys() else None))
         sent += 1
         capacity[sender["email"]] -= 1
         if not args.dry_run:
@@ -1033,6 +1089,14 @@ def cmd_run(cfg, con, args):
         log.info("Sent step %d to %s via %s", idx + 1, to, sender["email"])
 
     con.commit()
+    if not args.dry_run:
+        try:
+            r_drafted, r_sent = nurture_tick(cfg, con, all_senders, redirect)
+            if r_drafted:
+                print(f"Drafted {r_drafted} check-back email(s) for leads who asked us to come back later: waiting for review.")
+            sent += r_sent
+        except Exception as e:
+            problems.append(f"Check-back emails: {e}")
     if team_mod:
         try:
             team_mod.sync(con)
@@ -1048,6 +1112,70 @@ def cmd_run(cfg, con, args):
         print("PROBLEM:", p)
     if problems or failed:
         sys.exit(1)  # marks the run as Failed in the CRM so it's noticed
+
+
+DEFAULT_RECONNECT = """Hi {first_name},
+
+When we last spoke you mentioned it could make sense to pick this up again around now, so I'm checking in.
+
+Is {company} still thinking about extra engineering capacity? Happy to share what's changed on our side, or to leave it if the timing still isn't right.
+
+Best,
+{sender_name}"""
+
+
+def reconnect_draft(cfg, con, lead, why="check back"):
+    """A soft check-back / reconnect email, always waiting for a human to review it."""
+    lead = dict(lead)
+    have = con.execute("SELECT 1 FROM outbox WHERE lead_id=? AND kind='reconnect' AND status IN ('pending','approved')", (lead["id"],)).fetchone()
+    if have:
+        return None
+    senders = cfg.get("senders") or []
+    sender = next((x for x in senders if x.get("email", "").lower() == (lead.get("sender") or "").lower()), None) or (senders[0] if senders else None)
+    if not sender:
+        return None
+    body = None
+    try:
+        import writer
+        body = writer.reconnect(cfg, con, lead, sender, why)
+    except Exception as e:
+        log.warning("AI check-back draft unavailable: %s", e)
+    body = body or render((cfg.get("nurture") or {}).get("template") or DEFAULT_RECONNECT, lead, sender, cfg)
+    subject = "Re: " + (lead.get("first_subject") or "following up") if lead.get("first_subject") else f"Following up, {lead.get('first_name') or ''}".strip(", ")
+    cur = con.execute("INSERT INTO outbox(lead_id, step, sender, subject, body, status, created_at, kind) VALUES (?,?,?,?,?,'pending',?,'reconnect')",
+                      (lead["id"], -1, sender["email"], subject, body, iso(now_utc())))
+    log_event(con, lead["id"], "drafted", f"check-back email ({why})", sender["email"])
+    return cur.lastrowid
+
+
+def nurture_tick(cfg, con, senders, redirect):
+    """Leads who said 'not now': draft the check-back email when their date comes; send the ones a person approved."""
+    import convo
+    today = date.today().isoformat()
+    drafted = sent = 0
+    for l in con.execute("SELECT * FROM leads WHERE status='nurture' AND check_back IS NOT NULL AND check_back<=?", (today,)).fetchall():
+        if reconnect_draft(cfg, con, l, "they asked us to check back"):
+            drafted += 1
+    by_email = {x["email"].lower(): x for x in senders}
+    for d in con.execute("SELECT o.*, l.email lemail, l.first_msg_id FROM outbox o JOIN leads l ON l.id=o.lead_id "
+                         "WHERE o.kind='reconnect' AND o.status='approved'").fetchall():
+        sender = by_email.get((d["sender"] or "").lower()) or (senders[0] if senders else None)
+        if not sender:
+            continue
+        lead = dict(con.execute("SELECT * FROM leads WHERE id=?", (d["lead_id"],)).fetchone())
+        if lead["status"] in ("unsubscribed", "bounced") or con.execute("SELECT 1 FROM suppression WHERE email=?", (lead["email"],)).fetchone():
+            con.execute("UPDATE outbox SET status='cancelled' WHERE id=?", (d["id"],))
+            continue
+        to, subj = (redirect, f"[TEST for {lead['email']}] {d['subject']}") if redirect else (lead["email"], d["subject"])
+        body = d["body"] + "\n\n" + render(cfg.get("footer") or "", lead, sender, cfg)
+        mid = send_email(sender, to, subj, body, lead.get("first_msg_id"))
+        convo.record_sent(con, mid, lead, "reconnect", sender["email"], to, subj, body, test=bool(redirect))
+        con.execute("UPDATE outbox SET status='sent', sent_at=? WHERE id=?", (iso(now_utc()), d["id"]))
+        con.execute("UPDATE leads SET check_back=NULL WHERE id=?", (lead["id"],))
+        log_event(con, lead["id"], "sent", "check-back email" + (" (test)" if redirect else ""), sender["email"])
+        sent += 1
+    con.commit()
+    return drafted, sent
 
 
 # ---------------------------------------------------------------- inbox
@@ -1132,6 +1260,8 @@ def intake_message(cfg, con, sender, msg):
                        headers={"X-BSO-Kind": "intake"})
         except Exception as e:
             log.error("Couldn't answer the lead file email: %s", e)
+    if not files and not re.search(r"\b(leads?|campaign)\b", subject, re.I):
+        return False          # an ordinary email (a reply, a question): not a lead file, let normal handling see it
     if not files:
         answer("BSO found no lead file in your email. Attach a CSV or Excel (.xlsx) file with one lead per row and an email column, and send it again.")
         return True
@@ -1232,16 +1362,25 @@ def capture_referral(cfg, con, lead, sender, body):
     return new
 
 
-TEST_TAG_RE = re.compile(r"\[TEST for ([^\],\s]+@[^\],\s]+)")
+from convo import TEST_TAG_RE  # noqa: E402  (kept importable from here)
 
 
-def handle_message(cfg, con, sender, msg):
-    if intake_message(cfg, con, sender, msg):
-        return
+def handle_message(cfg, con, sender, msg, folder="INBOX"):
+    """Work out whose conversation an incoming email belongs to (by thread first, not by sender) and act on it.
+    Returns a short description of what was done (kept in the inbox activity log)."""
+    import convo
+    inbox = sender["email"]
     frm = parseaddr(msg.get("From", ""))[1].lower()
     body = get_text_body(msg)
 
+    def done(decision, lead_id=None):
+        convo.log_inbox(con, inbox, msg, decision, lead_id, folder)
+        return decision
+
+    if msg.get("X-BSO-Kind"):
+        return done("ignored: an email BSO itself sent (briefing, forward or answer)")
     if "mailer-daemon" in frm or "postmaster" in frm:  # bounce
+        hit = []
         for addr in set(a.lower() for a in FIND_EMAILS_RE.findall(body)):
             lead = con.execute("SELECT id FROM leads WHERE email=?", (addr,)).fetchone()
             if lead:
@@ -1251,50 +1390,114 @@ def handle_message(cfg, con, sender, msg):
                 suppress(con, addr, "bounced")
                 log_event(con, lead["id"], "bounce", "", sender["email"])
                 log.info("Bounce: %s", addr)
-        return
+                hit.append(addr)
+        return done("bounce: " + (", ".join(hit) if hit else "no lead found in it"))
 
-    lead = con.execute("SELECT * FROM leads WHERE email=?", (frm,)).fetchone()
-    tm = cfg.get("test_mode") or {}
-    if not lead and tm.get("enabled") and not msg.get("X-BSO-Kind"):
-        # test mode: our emails went to your own inbox as "[TEST for lead@x] ...", so your reply stands in for the lead's
-        subj = re.sub(r"\s+", " ", msg.get("Subject", "") or "").strip()
-        m_ = TEST_TAG_RE.search(subj)
-        if m_ and re.match(r"^(re|aw|antw|sv|r)\s*:", subj, re.I):
-            lead = con.execute("SELECT * FROM leads WHERE email=?", (m_.group(1).lower(),)).fetchone()
-            frm = lead["email"] if lead else frm
-    if lead and lead["handed_to"] and lead["status"] not in ("unsubscribed", "bounced"):
-        forward_to_supervisor(cfg, con, dict(lead), sender, msg, body)   # nothing slips through after a handover
-        return
-    if not lead or lead["status"] in ("replied", "unsubscribed", "not_interested", "bounced"):
-        return
+    m = convo.match(cfg, con, msg, frm, inbox, body)
+    lead = m["lead"]
+    if not lead:
+        if folder != "INBOX":
+            return done(f"left in {folder}: not part of a BSO conversation")
+        if intake_message(cfg, con, sender, msg):
+            return done("lead file email (imported or answered)")
+        return done("ignored: not from a lead or part of a BSO conversation")
+    if folder != "INBOX" and not m["sure"]:
+        return done(f"left in {folder}: only loosely matches {lead['email']}", lead["id"])
+    lead = dict(lead)
+    where = f" (found in {folder})" if folder != "INBOX" else ""
+    convo.link_people(con, lead, msg, frm, m["how"], m["sure"], cfg)
+    if m["path"]:
+        convo.add_path_contacts(con, lead, m["path"])
+    who_sent = "" if frm == lead["email"] else f" from {frm}"
+    if lead.get("handed_to") and lead["status"] not in ("unsubscribed", "bounced"):
+        convo.record_received(con, msg, lead["id"], inbox, folder, frm, body, how=m["how"], path=m["path"])
+        forward_to_supervisor(cfg, con, lead, sender, msg, body)   # nothing slips through after a handover
+        return done(f"handed-over prospect {lead['email']} wrote again{who_sent}: forwarded to their supervisor{where}", lead["id"])
+    if lead["status"] in ("unsubscribed", "bounced"):
+        convo.record_received(con, msg, lead["id"], inbox, folder, frm, body, how=m["how"], path=m["path"])
+        return done(f"ignored: {lead['email']} is on do-not-contact", lead["id"])
 
-    label = classify_reply(cfg, msg, body)
-    log_event(con, lead["id"], "reply", label, sender["email"])
+    a = analyze_reply(cfg, msg, body)
+    label = a["label"]
+    x = json.loads(lead.get("extra") or "{}")
+    engaged = con.execute("SELECT COUNT(*) FROM received WHERE lead_id=?", (lead["id"],)).fetchone()[0] + \
+        (1 if frm != lead["email"] else 0) + (1 if m["path"] else 0)
+    pbk = convo.playbook(cfg)
+    temp, score, reason, when = convo.temperature(label, body, lead, x.get("title", ""), engaged, a if a.get("temperature") else None,
+                                                  int(pbk["cold"].get("check_back_days") or 90))
     pointer = re.search(r"\b(reach out to|contact|speak (to|with)|talk to|get in touch with|right person|better person|best person|handles|responsible for|in charge of|"
                         r"forward(ed|ing)? (this|you)|loop(ing|ed)? in|cc'?d|copying|introduc)", body.lower())
-    if label == "referral" or (label in ("not_interested", "other") and pointer):   # "not me, talk to sarah@…" often reads as not interested
-        if capture_referral(cfg, con, dict(lead), sender, body) and label != "referral":
+    if label == "referral" or (label in ("not_interested", "other") and pointer):   # "not me, talk to sarah@..." often reads as not interested
+        if capture_referral(cfg, con, lead, sender, body) and label != "referral":
             label = "referral"
+            temp = "warm" if temp == "cold" else temp
+    via = ""
+    if frm != lead["email"]:
+        via = f"replied by {parseaddr(msg.get('From', ''))[0] or frm} <{frm}>" + (f", reached via {' → '.join(m['path'])}" if m["path"] else "") + \
+              f" (matched by {m['how']})"
+    log_event(con, lead["id"], "reply", label, sender["email"])
+    convo.record_received(con, msg, lead["id"], inbox, folder, frm, body, label, temp, m["how"], m["path"])
+    last = con.execute("SELECT at FROM sent_log WHERE lead_id=? AND test=0 ORDER BY id DESC LIMIT 1", (lead["id"],)).fetchone()
+    if last and last["at"] < iso(now_utc() - timedelta(days=60)):
+        con.execute("UPDATE leads SET came_back=? WHERE id=?", (iso(now_utc())[:10], lead["id"]))
+        j = convo.journey(con, lead["id"])
+        f = j["first"] or {}
+        con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",
+                    (lead["id"], f"Came back {(now_utc().date() - date.fromisoformat(last['at'][:10])).days} days after our last email. "
+                     f"First reached {str(f.get('at', ''))[:10]} by campaign \"{f.get('campaign', '')}\" (email {int(f.get('step') or 0) + 1}"
+                     f"{', version ' + f['variant'] if f.get('variant') else ''}, subject \"{f.get('subject', '')}\") from {f.get('sender', '')}.", iso(now_utc())))
+    if not m["sure"]:
+        add_task(con, f"Confirm: {frm} ({m['how']}) wrote to {inbox}. Is it part of {lead['first_name'] or lead['email']}'s conversation?", lead_id=lead["id"])
+    if via:
+        con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')", (lead["id"], via[0].upper() + via[1:] + ".", iso(now_utc())))
+
     if label == "out_of_office":
-        return  # keep the sequence going
+        back = convo.return_date(body)
+        if back and lead["status"] == "active":
+            nxt = datetime.combine(back + timedelta(days=2), datetime.min.time(), tzinfo=timezone.utc).replace(hour=9)
+            con.execute("UPDATE leads SET next_send_at=? WHERE id=? AND (next_send_at IS NULL OR next_send_at<?)", (iso(nxt), lead["id"], iso(nxt)))
+            return done(f"out of office until {back.isoformat()}: emails to {lead['email']} paused until {(back + timedelta(days=2)).isoformat()}{where}", lead["id"])
+        return done(f"out of office: sequence for {lead['email']} carries on{where}", lead["id"])
+
     cancel_drafts(con, lead["id"])
-    if label in ("unsubscribe", "not_interested"):
-        status = "unsubscribed" if label == "unsubscribe" else "not_interested"
-        con.execute("UPDATE leads SET status=? WHERE id=?", (status, lead["id"]))
+    who = lead["first_name"] or lead["email"]
+    stopped = convo.company_stop(con, lead, f"{who} at {lead['company'] or convo.company_domain(lead['email'])} replied")
+    convo.set_temperature(con, lead["id"], temp, score, reason, "bot", when)
+    log_event(con, lead["id"], "temperature", temp)
+    extra_note = f"; {stopped} other lead(s) at the company paused" if stopped else ""
+    if temp == "closed":
+        con.execute("UPDATE leads SET status='unsubscribed' WHERE id=?", (lead["id"],))
         set_stage(con, lead["id"], "unqualified")
-        suppress(con, frm, label)
-        return
+        suppress(con, lead["email"], label if label in ("unsubscribe", "not_interested") else "asked not to be contacted")
+        if frm != lead["email"]:
+            suppress(con, frm, "asked not to be contacted")
+        return done(f"{label.replace('_', ' ')} from {lead['email']}{who_sent}: closed, on do-not-contact{extra_note}{where}", lead["id"])
+    if temp == "cold":
+        con.execute("UPDATE leads SET status='nurture' WHERE id=?", (lead["id"],))
+        set_stage(con, lead["id"], "replied")
+        con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'email')",
+                    (lead["id"], f"[{label} reply, cold: {reason}]\n{body[:2000]}", iso(now_utc())))
+        add_task(con, f"Check back with {who} ({reason})", due_date=when.isoformat(), lead_id=lead["id"])
+        con.execute("UPDATE tasks SET kind='nurture' WHERE id=last_insert_rowid()")
+        notify(f"❄ Cold reply from {who} ({lead['company'] or ''}): {reason}. Check back on {when.isoformat()}.", cfg)
+        return done(f"❄ cold reply from {lead['email']}{who_sent} ({reason}): nurture, check back {when.isoformat()}{extra_note}{where}", lead["id"])
+
     con.execute("UPDATE leads SET status='replied' WHERE id=?", (lead["id"],))
     set_stage(con, lead["id"], "replied")
     con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'email')",
-                (lead["id"], f"[{label} reply]\n{body[:2000]}", iso(now_utc())))
-    who = lead["first_name"] or frm
-    if label in HANDOVER_LABELS and handover(cfg, con, dict(lead), sender, msg, body, label):
-        return
-    add_task(con, f"Respond to {who} ({label.replace('_', ' ')} reply)", lead_id=lead["id"])
+                (lead["id"], f"[{label} reply, {temp}]\n{body[:2000]}", iso(now_utc())))
+    icon = convo.TEMP_ICON[temp]
+    if (label in HANDOVER_LABELS or temp == "hot") and handover(cfg, con, lead, sender, msg, body, label, temp, reason):
+        return done(f"{icon} {temp} {label.replace('_', ' ')} reply from {lead['email']}{who_sent}: handed over{extra_note}{where}", lead["id"])
+    pb = convo.playbook(cfg)[temp]
+    due = convo.add_working_hours(datetime.now(), pb["respond_hours"])
+    add_task(con, f"{icon} Respond to {who} ({temp}, {label.replace('_', ' ')} reply) within {pb['respond_hours']} working hour(s)",
+             due_date=due.date().isoformat(), lead_id=lead["id"])
+    con.execute("UPDATE tasks SET priority=?, due_at=?, kind='respond' WHERE id=last_insert_rowid()", ("high" if temp == "hot" else "normal", due.isoformat(timespec="minutes")))
     snippet = body[:300].replace("\n", " ")
-    notify(f"📬 {label.upper()} reply from {lead['first_name'] or ''} <{frm}> "
+    notify(f"📬 {icon} {temp.upper()} {label.upper()} reply from {lead['first_name'] or ''} <{frm}> "
            f"({lead['company'] or ''}) in {sender['email']}:\n{snippet}", cfg)
+    return done(f"{icon} {temp} {label.replace('_', ' ')} reply from {lead['email']}{who_sent}: task to respond{extra_note}{where}", lead["id"])
 
 
 # ---------------------------------------------------------------- handover to a lead gen supervisor
@@ -1344,15 +1547,27 @@ def _thread(con, lead_id):
             for r in con.execute("SELECT * FROM outbox WHERE lead_id=? AND status='sent' ORDER BY id", (lead_id,))]
 
 
-def handover(cfg, con, lead, sender, msg, body, label):
+def handover(cfg, con, lead, sender, msg, body, label, temp="warm", reason=""):
     """Hand an interested prospect to a lead gen supervisor. Returns False when there's nobody to hand to."""
+    import convo
     hc = cfg.get("handover") or {}
     if not hc.get("enabled", True):
         return False
     sup = None
+    cd = convo.company_domain(lead["email"])
+    if cd:                                              # one company stays with one supervisor
+        owner = con.execute("SELECT handed_to FROM leads WHERE handed_to IS NOT NULL AND id!=? AND lower(email) LIKE ? ORDER BY handed_at DESC LIMIT 1",
+                            (lead["id"], "%@" + cd)).fetchone()
+        if owner:
+            sup = next((x for x in supervisors(cfg) if x["email"].lower() == owner["handed_to"].lower()), None)
     try:
+        if sup:
+            raise StopIteration
+
         import team
         sup = team.assign_supervisor(lead["email"])     # the always-on relay keeps the turns fair for everyone
+    except StopIteration:
+        pass
     except Exception as e:
         log.warning("Supervisor assignment unavailable: %s", e)
     sup = sup or pick_supervisor(cfg, con)
@@ -1375,9 +1590,11 @@ def handover(cfg, con, lead, sender, msg, body, label):
         subject = subject if subject.lower().startswith("re:") else "Re: " + subject
         try:
             if redirect:
-                send_email(sender, redirect, f"[TEST for {lead['email']}, CC {sup['email']}] {subject}", intro_text, msg.get("Message-ID"))
+                mid = send_email(sender, redirect, f"[TEST for {lead['email']}, CC {sup['email']}] {subject}", intro_text, msg.get("Message-ID"))
             else:
-                send_email(sender, lead["email"], subject, intro_text, msg.get("Message-ID"), cc=sup["email"])
+                mid = send_email(sender, lead["email"], subject, intro_text, msg.get("Message-ID"), cc=sup["email"])
+            convo.record_sent(con, mid, lead, "intro", sender["email"], redirect or lead["email"], subject, intro_text,
+                              cc=None if redirect else sup["email"], test=bool(redirect))
             log_event(con, lead["id"], "sent", "handover intro" + (" (test)" if redirect else ""), sender["email"])
             if hits:
                 log.warning("Handover intro uses avoided words: %s", ", ".join(hits))
@@ -1398,7 +1615,9 @@ def handover(cfg, con, lead, sender, msg, body, label):
     lines = [f"{sup['name']}, a prospect has been handed over to you.", intro_note,
              f"Prospect:   {name}", f"Title:      {x.get('title', '')}", f"Company:    {company}", f"Email:      {lead['email']}",
              f"Website:    {lead.get('website') or ''}", f"LinkedIn:   {x.get('linkedin', '')}",
-             f"Reply type: {label.replace('_', ' ')}", f"From:       {member or sender['name']} ({sender['email']})", "",
+             f"Reply type: {label.replace('_', ' ')}", f"Temperature: {convo.TEMP_ICON.get(temp, '')} {temp} ({reason})",
+             f"Respond within: {convo.playbook(cfg)[temp]['respond_hours']} working hour(s)" if temp in ("hot", "warm") else "",
+             f"From:       {member or sender['name']} ({sender['email']})", "",
              "--- Their reply ---", body.strip()[:4000], ""]
     if intro_text:
         lines += ["--- Introduction we sent (you were in CC) ---", intro_text, ""]
@@ -1419,7 +1638,13 @@ def handover(cfg, con, lead, sender, msg, body, label):
     con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",
                 (lead["id"], f"Handed over to {sup['name']} <{sup['email']}> ({label.replace('_', ' ')} reply).", at))
     log_event(con, lead["id"], "handover", sup["id"], sender["email"])
-    payload = {"lead_local_id": lead["id"], "supervisor": sup["id"], "label": label, "at": at,
+    j = convo.journey(con, lead["id"])
+    first = j["first"] or {}
+    payload = {"lead_local_id": lead["id"], "supervisor": sup["id"], "label": label, "at": at, "temperature": temp, "reason": reason,
+               "respond_hours": convo.playbook(cfg).get(temp, {}).get("respond_hours"),
+               "first_touch": {"campaign": first.get("campaign"), "at": first.get("at"), "step": first.get("step"), "variant": first.get("variant"),
+                               "subject": first.get("subject"), "sender": first.get("sender")},
+               "related": [dict(r) for r in con.execute("SELECT email, name, role FROM related_contacts WHERE lead_id=?", (lead["id"],))],
                "campaign": campaign_row(con, lead.get("campaign_id"))["name"],
                "lead": {"email": lead["email"], "first_name": lead.get("first_name"), "last_name": x.get("last_name"), "title": x.get("title"),
                         "company": company, "website": lead.get("website"), "linkedin": x.get("linkedin"), "city": x.get("city"), "country": x.get("country")},
@@ -1450,32 +1675,82 @@ def forward_to_supervisor(cfg, con, lead, sender, msg, body):
     con.commit()
 
 
-def process_inbox(cfg, con, sender):
-    """Read new messages in one inbox. Returns how many were new."""
+JUNK_NAMES = ("spam", "junk", "bulk", "junk e-mail", "junk email")
+
+
+def _junk_folder(M):
+    """The Spam/Junk folder's name on this server, or None."""
+    try:
+        _, rows = M.list()
+    except Exception:
+        return None
+    best = None
+    for raw in rows or []:
+        line = raw.decode(errors="replace") if isinstance(raw, bytes) else str(raw)
+        m = re.match(r'^\((?P<flags>[^)]*)\)\s+(?:"[^"]*"|NIL)\s+(?P<name>.+)$', line)
+        if not m:
+            continue
+        name = m.group("name").strip()
+        bare = name.strip('"')
+        if "\\Junk" in m.group("flags"):
+            return name
+        if bare.lower().split(".")[-1].split("/")[-1] in JUNK_NAMES:
+            best = best or name
+    return best
+
+
+def process_inbox(cfg, con, sender, recheck=False, days=None):
+    """Read new messages in one inbox (and its Spam folder, for replies to BSO's own threads). Returns how many were new.
+    recheck=True looks again at everything from the last `days` days that hasn't been handled as a reply yet."""
     n_new = 0
-    since = (datetime.now() - timedelta(days=cfg.get("reply_lookback_days", 14))).strftime("%d-%b-%Y")
+    since = (datetime.now() - timedelta(days=days or cfg.get("reply_lookback_days", 14))).strftime("%d-%b-%Y")
     M = imaplib.IMAP4_SSL(sender["imap_host"], sender.get("imap_port", 993))
     try:
         M.login(sender.get("username", sender["email"]), sender["password"])
-        M.select("INBOX", readonly=True)  # never marks your mail as read
-        _, data = M.uid("search", None, f'(SINCE "{since}")')
-        for uid in data[0].split():
-            # cheap header fetch first; full body only for new messages
-            _, hdr = M.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT)])")
-            head = email.message_from_bytes(hdr[0][1]) if hdr and hdr[0] and isinstance(hdr[0], tuple) else {}
-            key = (head.get("Message-ID") or "").strip() or f"{sender['email']}:{uid.decode()}"
-            if "[TEST for" in str(head.get("Subject") or ""):
-                key = "t:" + key                 # test replies are matched differently since v1.0.45: look at them once more
-            # claim it first, so the live reply watcher and a run never handle the same message twice
-            claimed = con.execute("INSERT OR IGNORE INTO seen_messages VALUES (?)", (key,)).rowcount
-            con.commit()                         # always end the transaction, or other readers of this inbox would wait
-            if not claimed:
+        folders = ["INBOX"]
+        junk = _junk_folder(M)
+        if junk and junk.strip('"').upper() != "INBOX":
+            folders.append(junk)
+        for folder in folders:
+            try:
+                typ, _ = M.select(folder, readonly=True)  # never marks your mail as read
+            except Exception:
                 continue
-            _, full = M.uid("fetch", uid, "(BODY.PEEK[])")
-            msg = email.message_from_bytes(full[0][1])
-            handle_message(cfg, con, sender, msg)
-            con.commit()
-            n_new += 1
+            if typ != "OK":
+                continue
+            label = "INBOX" if folder == "INBOX" else "Spam"
+            _, data = M.uid("search", None, f'(SINCE "{since}")')
+            for uid in (data[0].split() if data and data[0] else []):
+                # cheap header fetch first; full body only for new messages
+                _, hdr = M.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT)])")
+                head = email.message_from_bytes(hdr[0][1]) if hdr and hdr[0] and isinstance(hdr[0], tuple) else {}
+                mid = (head.get("Message-ID") or "").strip()
+                key = mid or f"{sender['email']}:{label}:{uid.decode()}"
+                if "[TEST for" in str(head.get("Subject") or ""):
+                    key = "t:" + key                 # test replies are matched differently since v1.0.45: look at them once more
+                # claim it first, so the live reply watcher and a run never handle the same message twice
+                claimed = con.execute("INSERT OR IGNORE INTO seen_messages VALUES (?)", (key,)).rowcount
+                con.commit()                         # always end the transaction, or other readers of this inbox would wait
+                if not claimed:
+                    if not recheck or not mid:
+                        continue
+                    done_before = con.execute("SELECT 1 FROM received WHERE msg_id=?", (mid,)).fetchone() or con.execute(
+                        "SELECT 1 FROM inbox_log WHERE msg_id=? AND (decision LIKE 'bounce%' OR decision LIKE 'lead file%' OR decision LIKE '%reply%' "
+                        "OR decision LIKE 'out of office%' OR decision LIKE 'handed-over%')", (mid,)).fetchone()
+                    if done_before:
+                        continue
+                _, full = M.uid("fetch", uid, "(BODY.PEEK[])")
+                msg = email.message_from_bytes(full[0][1])
+                try:
+                    handle_message(cfg, con, sender, msg, label)
+                    con.commit()
+                except Exception as e:
+                    con.rollback()
+                    log.error("Couldn't handle a message in %s: %s", sender["email"], e)
+                    import convo
+                    convo.log_inbox(con, sender["email"], msg, f"error: {e}"[:200], None, label)
+                    con.commit()
+                n_new += 1
     finally:
         try:
             M.logout()
@@ -1484,11 +1759,23 @@ def process_inbox(cfg, con, sender):
     return n_new
 
 
+def recheck_once(cfg, con, sender):
+    """After updating to this version, look once more at the last 14 days of each inbox (replies an older version skipped)."""
+    k = f"rechecked_v2:{sender['email'].lower()}"
+    if con.execute("SELECT 1 FROM app_mode WHERE k=?", (k,)).fetchone():
+        return 0
+    n = process_inbox(cfg, con, sender, recheck=True)
+    con.execute("INSERT OR REPLACE INTO app_mode(k, v) VALUES (?, '1')", (k,))
+    con.commit()
+    return n
+
+
 def cmd_check(cfg, con, args):
     for s in load_senders(cfg):
         if not s["password"]:
             continue
         try:
+            recheck_once(cfg, con, s)
             process_inbox(cfg, con, s)
         except Exception as e:
             log.error("Inbox check failed for %s: %s", s["email"], e)
@@ -1588,7 +1875,27 @@ def add_lead(con, row, status="active", why=None):
         (addr, row.get("first_name"), row.get("company"), row.get("website"),
          json.dumps(extra), status, iso(now_utc()), iso(now_utc()), campaign),
     )
-    return cur.lastrowid if cur.rowcount else None
+    if not cur.rowcount:
+        return None
+    lid = cur.lastrowid
+    try:
+        import convo
+        prev = convo.previously(con, addr)
+        if prev["touches"] and status == "active":
+            t0, t1 = prev["touches"][0], prev["touches"][-1]
+            camp = con.execute("SELECT name FROM campaigns WHERE id=?", (t0.get("campaign_id") or 1,)).fetchone()
+            note = (f"Already contacted before: {len(prev['touches'])} email(s), first on {t0['at'][:10]} "
+                    f"(campaign \"{camp['name'] if camp else ''}\", subject \"{t0['subject']}\"), last on {t1['at'][:10]}. "
+                    "Not starting the sequence again: write a reconnect email from the lead's page instead.")
+            con.execute("UPDATE leads SET status='paused', extra=json_set(extra, '$.previously_contacted', ?) WHERE id=?", (t1["at"][:10], lid))
+            con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')", (lid, note, iso(now_utc())))
+            add_task(con, f"Previously contacted: {addr}. Reconnect instead of a cold first email?", lead_id=lid)
+            con.execute("UPDATE tasks SET kind='reconnect_offer' WHERE id=last_insert_rowid()")
+        elif prev["company_contacts"]:
+            con.execute("UPDATE leads SET extra=json_set(extra, '$.company_contacted_before', ?) WHERE id=?", (prev["company_contacts"], lid))
+    except Exception as e:
+        log.warning("Touch history check failed for %s: %s", addr, e)
+    return lid
 
 
 def read_rows(path_or_file, filename=""):

@@ -24,6 +24,12 @@ h1,h2,h3{margin:0;font-weight:700}
 .gsearch input{width:100%;height:32px;border:1px solid #c9c9c9;border-radius:var(--r);padding:0 10px 0 32px;font:inherit;background:#fff}
 .gsearch svg{position:absolute;left:10px;top:9px;fill:var(--muted)}
 .gh .tools{display:flex;gap:6px;align-items:center}
+.mailpop{position:fixed;inset:0;background:rgba(10,20,30,.45);display:none;align-items:flex-start;justify-content:center;z-index:900;padding:40px 12px;overflow:auto}
+.mailpop.on{display:flex}.mailpop .box{background:#fff;border-radius:10px;max-width:760px;width:100%;box-shadow:0 18px 50px rgba(0,0,0,.3)}
+.mailpop .hd{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--line)}.mailpop .hd b{flex:1}
+.mailpop .msg{margin:12px 16px;border:1px solid var(--line);border-left:4px solid #0176d3;border-radius:6px;padding:10px 12px}.mailpop .msg.in{border-left-color:#2e844a;background:#f6fbf7}
+.mailpop .msg.focus{box-shadow:0 0 0 2px #0176d3}.mailpop .meta{font-size:12px;color:var(--muted)}.mailpop pre{white-space:pre-wrap;font:inherit;margin:8px 0 0}
+.statlink:hover{box-shadow:0 0 0 2px var(--brand,#0176d3)}
 .pgnav{display:flex;align-items:center;gap:8px;margin:0 0 10px;min-height:32px}.pgbtn{display:flex;align-items:center;gap:6px;max-width:240px;padding:5px 12px;border:1px solid var(--line);border-radius:16px;background:#fff;color:inherit;text-decoration:none;font-size:13px;white-space:nowrap}.pgbtn span{overflow:hidden;text-overflow:ellipsis}.pgbtn:hover{background:#f3f3f3}
 .iconbtn{width:32px;height:32px;border-radius:50%;border:1px solid var(--line);background:#fff;display:grid;place-items:center;cursor:pointer;color:var(--muted);font-weight:700;position:relative}
 .menu{position:absolute;right:0;top:38px;background:#fff;border:1px solid var(--line);border-radius:var(--r);box-shadow:0 2px 8px rgba(0,0,0,.16);min-width:220px;z-index:30;display:none;text-align:left}
@@ -203,7 +209,24 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
 </main>
 <div id="tour-dim"><div id="tour-spot"></div><div id="tour-pop"><h3></h3><p></p><div class="ft"><span></span>
 <button class="btn sm" id="tour-skip">Skip</button><button class="btn sm" id="tour-back">Back</button><button class="btn brand sm" id="tour-next">Next</button></div></div></div>
+<div class="mailpop" id="mailpop" onclick="if(event.target===this)closeMail()"><div class="box"><div class="hd"><b id="mailpop-t">Email</b><button class="btn sm" type="button" onclick="closeMail()">✕ Close</button></div><div id="mailpop-b" style="padding-bottom:6px"></div></div></div>
 <script>
+// ---- email pop-up: the exact email that went out, and the conversation around it
+function esc(t){ return String(t==null?'':t).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
+function closeMail(){ document.getElementById('mailpop').classList.remove('on'); }
+document.addEventListener('keydown',function(e){ if(e.key==='Escape') closeMail(); });
+function openMail(url){
+ var p=document.getElementById('mailpop'), b=document.getElementById('mailpop-b'); b.innerHTML='<p style="margin:16px">Loading…</p>'; p.classList.add('on');
+ fetch(url).then(function(r){return r.json();}).then(function(j){
+  var t=document.getElementById('mailpop-t'); t.textContent=j.lead&&j.lead.email?('Emails with '+(j.lead.name||j.lead.email)+(j.lead.company?' · '+j.lead.company:'')):'Email';
+  var h=''; (j.items||[]).forEach(function(m,i){
+   h+='<div class="msg '+(m.dir==='in'?'in':'')+(i===j.focus?' focus':'')+'" id="mp'+i+'"><div class="meta">'+(m.dir==='in'?'Received':'Sent')+' '+esc((m.at||'').slice(0,16).replace('T',' '))+(m.test?' · <b>TEST</b>':'')+(m.via?' · '+esc(m.via):'')+(m.temperature?' · '+esc(m.temperature):'')+(m.label?' · '+esc(m.label.replace('_',' ')):'')+'</div>'
+     +'<div><b>From:</b> '+esc(m.from)+(m.to?' &nbsp; <b>To:</b> '+esc(m.to):'')+(m.cc?' &nbsp; <b>CC:</b> '+esc(m.cc):'')+(m.bcc?' &nbsp; <b>BCC:</b> '+esc(m.bcc):'')+'</div>'
+     +'<div><b>'+esc(m.subject)+'</b></div><pre>'+esc(m.body)+'</pre></div>'; });
+  b.innerHTML=h||'<p style="margin:16px" class="muted">No emails saved for this lead yet.</p>';
+  if(j.focus!=null){ var f=document.getElementById('mp'+j.focus); if(f) f.scrollIntoView({block:'center'}); }
+ }).catch(function(){ b.innerHTML='<p style="margin:16px">Couldn\'t load the email.</p>'; });
+}
 // ---- tell the app this window is open; it quits about a minute after the last window is closed (unless auto-run is on)
 var _act=Date.now();['mousemove','keydown','mousedown','wheel','touchstart'].forEach(function(e){document.addEventListener(e,function(){_act=Date.now();},{passive:true});});
 (function(){ /* back / forward through the pages opened in this window, each labelled with the page's name */
@@ -388,13 +411,14 @@ LEADS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block tit
  <div><label>Search</label><input name="q" value="{{ request.args.get('q','') }}" placeholder="Name, email, company"></div>
  <div><label>Stage</label><select name="stage"><option value="">All stages</option>{% for s in stages %}<option value="{{ s }}" {{ 'selected' if request.args.get('stage')==s }}>{{ s|title }}</option>{% endfor %}</select></div>
  <div><label>Email status</label><select name="status"><option value="">Any</option>{% for k,v in status_labels.items() %}<option value="{{ k }}" {{ 'selected' if request.args.get('status')==k }}>{{ v }}</option>{% endfor %}</select></div>
+ <div><label>Temperature</label><select name="temperature"><option value="">Any</option>{% for t in ['hot','warm','cold','closed'] %}<option value="{{ t }}" {{ 'selected' if request.args.get('temperature')==t }}>{{ temp_icons[t] }} {{ t }}</option>{% endfor %}</select></div>
  <div><label>Fit</label><select name="fit"><option value="">Any</option>{% for g in 'ABC' %}<option {{ 'selected' if request.args.get('fit')==g }}>{{ g }}</option>{% endfor %}</select></div>
  <div><label>Source</label><select name="source"><option value="">Any</option>{% for s in sources %}<option {{ 'selected' if request.args.get('source')==s }}>{{ s }}</option>{% endfor %}</select></div>
  <div style="flex:0"><button class="btn brand">Filter</button></div>
 </form></div></div>
 {% if view == 'kanban' %}
 <div class="kb">{% for s in stages %}<div class="kcol"><h3>{{ s|title }} <small>{{ cols[s]|length }}</small></h3><div class="kcards">
- {% for l in cols[s] %}<a class="kcard" href="{{ url_for('lead', lead_id=l.id) }}">{{ m.fit(l.fit) }} <b>{{ l.name }}</b><small>{{ l.title }}</small><small>{{ l.company }}</small>{{ m.status_badge(l.status, status_labels) }}</a>
+ {% for l in cols[s] %}<a class="kcard" href="{{ url_for('lead', lead_id=l.id) }}">{{ m.fit(l.fit) }} <b>{{ l.name }}</b><small>{{ l.title }}</small><small>{{ l.company }}</small>{{ temp_badge(l.temperature) }} {{ m.status_badge(l.status, status_labels) }}</a>
  {% else %}<div class="muted" style="text-align:center;padding:8px">None</div>{% endfor %}</div></div>{% endfor %}</div>
 {% else %}
 <form method="post" action="{{ url_for('leads_bulk') }}" class="card">
@@ -409,7 +433,7 @@ LEADS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block tit
  <tbody>{% for l in rows %}<tr><td><input type="checkbox" name="ids" value="{{ l.id }}" style="width:auto"></td>
   <td><a href="{{ url_for('lead', lead_id=l.id) }}"><b>{{ l.name }}</b></a><br><span class="muted">{{ l.email }}</span></td>
   <td>{{ m.fit(l.fit) }}</td><td>{{ l.title }}</td><td>{{ l.company }}</td><td>{{ m.stage_badge(l.stage) }}</td>
-  <td>{{ m.status_badge(l.status, status_labels) }}</td><td class="muted">{{ l.source }}</td><td class="nowrap muted">{{ l.created_at[:10] }}</td></tr>{% endfor %}</tbody></table></div>
+  <td>{{ temp_badge(l.temperature) }} {{ m.status_badge(l.status, status_labels) }}</td><td class="muted">{{ l.source }}</td><td class="nowrap muted">{{ l.created_at[:10] }}</td></tr>{% endfor %}</tbody></table></div>
  {% else %}<div class="empty"><b>No leads match</b>Import a spreadsheet, add one by hand, or use <i>Find leads in Apollo</i>.<br><br><a class="btn brand" href="{{ url_for('import_page') }}">Import leads</a>
  <button class="btn" formaction="{{ url_for('sample_load') }}" formmethod="post">Add sample leads</button></div>{% endif %}
 </form>
@@ -441,7 +465,8 @@ LEAD = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block titl
  <div><small>Title</small>{{ x.title or '—' }}</div><div><small>Company</small>{% if account %}<a href="{{ url_for('account', account_id=account.id) }}">{{ l.company }}</a>{% else %}{{ l.company or '—' }}{% endif %}</div>
  <div><small>Email</small>{{ l.email }}</div><div><small>Fit</small>{{ m.fit(x.fit) or '—' }}</div>
  <div><small>Emails</small>{{ m.status_badge(l.status, status_labels) }}{% if l.status == 'active' %} <span class="muted">step {{ l.step + 1 }}/{{ n_steps }}</span>{% endif %}</div>
- <div><small>Source</small>{{ x.source or 'Manual' }}</div></div>{% endset %}
+ <div><small>Source</small>{{ x.source or 'Manual' }}</div>
+ {% if l.temperature %}<div><small>Temperature</small>{{ temp_badge(l.temperature) }}</div>{% endif %}</div>{% endset %}
 {% call m.header('t-lead', 'L', 'Lead', l.name, hl) %}
  {% if l.stage not in ('converted','unqualified') %}<a class="btn brand" href="#close">Convert</a>{% endif %}
  <form method="post" action="{{ url_for('sequence_action', lead_id=l.id) }}" style="display:inline">
@@ -517,6 +542,25 @@ LEAD = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block titl
   <label style="display:flex;gap:6px;align-items:center;color:var(--ink)"><input type="checkbox" name="keep_blocked" value="1" checked style="width:auto"> Keep their address on the do-not-contact list so they're never emailed or imported again</label>
   <button class="btn danger" style="margin-top:10px">Delete permanently</button></form></div></div>
 </div><div>
+ <div class="card" id="tracking"><div class="card-h"><h2>Conversation</h2>{% if l.came_back %}<span class="badge b-ok" title="Replied more than 60 days after our last email">came back {{ l.came_back }}</span>{% endif %}</div><div class="card-b">
+  <form method="post" action="{{ url_for('lead_temperature', lead_id=l.id) }}" style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
+   <div><label>Temperature</label><select name="temperature">{% for t in ['hot','warm','cold','closed'] %}<option value="{{ t }}" {{ 'selected' if l.temperature == t }}>{{ temp_icons[t] }} {{ t }}</option>{% endfor %}{% if not l.temperature %}<option selected value="">not set</option>{% endif %}</select></div>
+   <div style="flex:1;min-width:140px"><label>Check back on (cold)</label><input type="date" name="check_back" value="{{ l.check_back or '' }}"></div><button class="btn">Change</button></form>
+  {% if l.temp_reason %}<p class="muted" style="margin:6px 0 0">Why: {{ l.temp_reason }}</p>{% endif %}
+  <h3 style="font-size:13px;margin:14px 0 4px">Other addresses of {{ l.first_name or 'this lead' }}</h3>
+  {% for a in other_addresses %}<div style="display:flex;gap:6px;align-items:center;margin:3px 0"><span>{{ a.email }}</span><span class="muted" style="font-size:12px">({{ a.how }})</span>
+   {% if not a.confirmed %}<span class="badge" style="background:#ffeccc">please confirm</span><form method="post" action="{{ url_for('lead_address', lead_id=l.id) }}" style="margin:0"><input type="hidden" name="email" value="{{ a.email }}"><button class="btn sm" name="action" value="confirm">Confirm</button></form>{% endif %}
+   <form method="post" action="{{ url_for('lead_address', lead_id=l.id) }}" style="margin:0"><input type="hidden" name="email" value="{{ a.email }}"><button class="btn sm" name="action" value="unlink">Unlink</button></form></div>
+  {% else %}<p class="muted" style="margin:0">None known.</p>{% endfor %}
+  <form method="post" action="{{ url_for('lead_address', lead_id=l.id) }}" style="display:flex;gap:6px;margin-top:6px"><input name="email" type="email" placeholder="also writes from, e.g. abc@gmail.com" required><button class="btn sm" name="action" value="add">Add</button></form>
+  <h3 style="font-size:13px;margin:14px 0 4px">Others in the conversation</h3>
+  {% for r in related %}<div>{{ r.name or r.email }} <span class="muted">&lt;{{ r.email }}&gt; · {{ {'cc':'copied in','forward':'forwarded it','replied':'replied'}.get(r.role, r.role) }}{{ ' · replied' if r.replied and r.role != 'replied' }}</span></div>
+  {% else %}<p class="muted" style="margin:0">Nobody else yet.</p>{% endfor %}
+  <h3 style="font-size:13px;margin:14px 0 4px">Every email sent to {{ l.first_name or 'this lead' }}</h3>
+  {% for t in touches %}<div style="font-size:13px;margin:2px 0"><span class="muted">{{ t.at[:10] }}</span> {{ t.kind_label }} · <b>{{ t.campaign or 'Main campaign' }}</b>{% if t.variant %} · version {{ t.variant }}{% endif %} · “{{ t.subject }}” <span class="muted">from {{ t.sender }}</span>{% if t.test %} <span class="badge">test</span>{% endif %}</div>
+  {% else %}<p class="muted" style="margin:0">Nothing sent yet.</p>{% endfor %}
+  {% if l.status in ('nurture', 'paused', 'done', 'replied') and l.status not in ('unsubscribed','bounced') %}<form method="post" action="{{ url_for('lead_reconnect', lead_id=l.id) }}" style="margin-top:10px"><button class="btn">Write a reconnect email (for review)</button></form>{% endif %}
+ </div></div>
  {% with lead_id=l.id, opp_id=None %}""" + COMPOSER + r"""{% endwith %}
  <div class="card"><div class="card-h"><h2>Activity</h2></div><div class="card-b">""" + TIMELINE + r"""</div></div>
 </div></div>
@@ -591,7 +635,7 @@ TASKS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block tit
 <div class="card">{% if rows %}<table class="tbl"><thead><tr><th></th><th>Subject</th><th>Related to</th><th>Due</th></tr></thead>
 {% for t in rows %}<tr><td style="width:30px"><form method="post" action="{{ url_for('task_toggle', task_id=t.id) }}"><input type="hidden" name="next" value="{{ request.full_path }}"><input type="checkbox" style="width:auto" {{ 'checked' if t.status=='done' }} onchange="this.form.submit()"></form></td>
 <td>{{ t.subject }}</td><td>{% if t.lead_id %}<a href="{{ url_for('lead', lead_id=t.lead_id) }}">{{ t.lead_name }}</a>{% endif %}{% if t.opp_id %} · <a href="{{ url_for('opp', opp_id=t.opp_id) }}">{{ t.opp_name }}</a>{% endif %}</td>
-<td class="nowrap"><span class="{{ 'badge b-err' if t.status=='open' and t.due_date < today }}">{{ t.due_date }}</span></td></tr>{% endfor %}</table>
+<td class="nowrap"><span class="{{ 'badge b-err' if t.status=='open' and t.due_date < today }}">{{ t.due_date }}</span>{% if t.due_at %}<br><small class="{{ 'badge b-err' if t.status=='open' and t.due_at < now_local else 'muted' }}">by {{ t.due_at[11:16] }}</small>{% endif %}{% if t.priority == 'high' %} <span class="badge" style="background:#fde1e1;color:#8c1c13">urgent</span>{% endif %}</td></tr>{% endfor %}</table>
 {% else %}<div class="empty"><b>Nothing here</b>{{ 'You are all caught up.' if show != 'done' else 'No completed tasks yet.' }}</div>{% endif %}</div>
 {% endblock %}"""
 
@@ -674,10 +718,38 @@ JOB = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title
 <div class="card-b">{% for p in problems %}<div class="toast err">⚠️ {{ p }}</div>{% endfor %}
 {% if problems and 'Settings' in problems|join %}<p><a class="btn brand" href="{{ url_for('settings') }}">Open Settings</a></p>{% endif %}
 {% if j.status == 'running' %}<p class="muted">This page refreshes itself until the run finishes. Sending can take a few minutes because emails are spaced out on purpose.</p>{% endif %}
-<pre class="log">{{ j.output or 'Starting…' }}</pre>
+{% if j.cmd == 'run' %}<h3 style="font-size:14px;margin:4px 0 6px">Sent in this run ({{ sent_now|length }}){% if j.status == 'running' %} <span class="muted">· updating live</span>{% endif %}</h3>
+{% if sent_now %}<div class="scroll" style="max-height:340px;margin-bottom:10px"><table class="tbl"><thead><tr><th>Time (UTC)</th><th>To</th><th>Email</th><th>From inbox</th><th></th></tr></thead>
+{% for t in sent_now %}<tr><td class="nowrap muted">{{ t.at[11:19] }}</td><td>{{ t.first_name or '' }} <span class="muted">&lt;{{ t.lead_email }}&gt;</span>{% if t.company %}<br><small class="muted">{{ t.company }}</small>{% endif %}{% if t.test %} <span class="badge">TEST: went to your inbox</span>{% endif %}</td>
+<td>{{ ('email ' ~ (t.step + 1)) if t.kind == 'step' and t.step is not none else kind_labels.get(t.kind, t.kind) }}<br><small class="muted">{{ t.subject }}</small></td><td class="muted">{{ t.sender }}</td><td><button class="btn sm" type="button" onclick="openMail('/api/email/{{ t.id }}')">View</button></td></tr>{% endfor %}</table></div>
+{% else %}<p class="muted">{{ 'Nothing sent yet.' if j.status == 'running' else 'Nothing was sent in this run.' }}</p>{% endif %}
+{% if skipped %}<details style="margin-bottom:10px"><summary>Skipped ({{ skipped|length }})</summary><ul>{% for x in skipped %}<li>{{ x }}</li>{% endfor %}</ul></details>{% endif %}{% endif %}
+<details {{ 'open' if j.cmd != 'run' }}><summary>Run log</summary><pre class="log">{{ j.output or 'Starting…' }}</pre></details>
 {% if j.status != 'running' %}<div style="display:flex;gap:6px;flex-wrap:wrap">{% for ep, label in after_links %}<a class="btn {{ 'brand' if loop.first }}" href="{{ url_for(ep) }}">{{ label }}</a>{% endfor %}</div>{% endif %}
 </div></div>
 {% endblock %}{% block scripts %}{% if j.status == 'running' %}<script>setTimeout(function(){location.reload()},2500)</script>{% endif %}{% endblock %}"""
+
+DRILL = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}{{ title }}{% endblock %}{% block body %}
+{% call m.header('t-rev', '⚑', c.name, title ~ ' (' ~ total ~ ')') %}<a class="btn" href="{{ url_for('campaign', cid=c.id) }}">Campaign</a>{% endcall %}
+<div class="card"><div class="card-b" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+ {% for w, l in drill.items() %}<a class="btn sm {{ 'brand' if w == what }}" href="{{ url_for('campaign_list', cid=c.id, what=w, period=request.args.get('period','')) }}">{{ l }}</a>{% endfor %}</div>
+ <form class="card-b" style="display:flex;gap:8px;align-items:end;padding-top:0"><div><label>When</label><select name="period" onchange="this.form.submit()">{% for k, l in [('','All time'),('today','Today'),('7d','Last 7 days'),('30d','Last 30 days')] %}<option value="{{ k }}" {{ 'selected' if request.args.get('period','') == k }}>{{ l }}</option>{% endfor %}</select></div>
+ <div style="flex:1"><label>Search</label><input name="q" value="{{ request.args.get('q','') }}" placeholder="name, email, company{{ ', subject' if what == 'sent' }}"></div><button class="btn">Search</button></form></div>
+<div class="card">{% if items %}<div class="scroll"><table class="tbl">
+{% if what == 'sent' %}<thead><tr><th>Sent</th><th>To</th><th>Email</th><th>From inbox</th><th>Since then</th><th></th></tr></thead>
+{% for t in items %}<tr><td class="nowrap muted">{{ t.at[:16].replace('T',' ') }}</td>
+<td>{% if t.lead_id %}<a href="{{ url_for('lead', lead_id=t.lead_id) }}">{{ t.first_name or t.email }}</a>{% else %}{{ t.email or '(deleted lead)' }}{% endif %} <span class="muted">{{ t.email or '' }}</span>{% if t.company %}<br><small class="muted">{{ t.company }}</small>{% endif %}</td>
+<td>{{ ('email ' ~ (t.step + 1)) if t.kind == 'step' and t.step is not none else kind_labels.get(t.kind, 'email') }}{% if t.variant %} <small class="muted">· {{ t.variant }}</small>{% endif %}<br><small class="muted">{{ t.subject }}</small>{% if t.test %} <span class="badge">TEST: went to your inbox</span>{% endif %}</td>
+<td class="muted">{{ t.sender }}</td><td>{{ temp_badge(t.temperature) }} {{ m.status_badge(t.status, status_labels) if t.status }}{% if t.handed_to %}<br><small class="muted">handed to {{ t.handed_to }}</small>{% endif %}</td>
+<td>{% if t.sid %}<button class="btn sm" type="button" onclick="openMail('/api/email/{{ t.sid }}')">View email</button>{% elif t.lead_id %}<button class="btn sm" type="button" onclick="openMail('/api/conversation/{{ t.lead_id }}')">View</button>{% endif %}</td></tr>{% endfor %}
+{% else %}<thead><tr><th>Lead</th><th>Company</th><th>Status</th><th>Emails sent</th><th>Last activity</th><th></th></tr></thead>
+{% for l in items %}<tr><td><a href="{{ url_for('lead', lead_id=l.id) }}">{{ l.first_name or l.email }}</a> <span class="muted">{{ l.email }}</span></td><td>{{ l.company or '' }}</td>
+<td>{{ temp_badge(l.temperature) }} {{ m.status_badge(l.status, status_labels) }}{% if l.temp_reason and l.temperature %}<br><small class="muted">{{ l.temp_reason }}</small>{% endif %}</td><td>{{ l.n_sent }}</td><td class="muted nowrap">{{ (l.last_at or '')[:16].replace('T',' ') }}</td>
+<td><button class="btn sm" type="button" onclick="openMail('/api/conversation/{{ l.id }}')">View emails</button></td></tr>{% endfor %}{% endif %}
+</table></div>
+{% if pages > 1 %}<div class="card-b" style="display:flex;gap:6px">{% if page > 1 %}<a class="btn sm" href="{{ qs(page=page-1) }}">← Previous</a>{% endif %}<span class="muted">Page {{ page }} of {{ pages }}</span>{% if page < pages %}<a class="btn sm" href="{{ qs(page=page+1) }}">Next →</a>{% endif %}</div>{% endif %}
+{% else %}<div class="empty">Nothing here{{ ' for this period' if request.args.get('period') }}.</div>{% endif %}</div>
+{% endblock %}"""
 
 JOBS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}Bot runs{% endblock %}{% block body %}
 {% call m.header('t-setup', '▶', 'Bot', 'Run history') %}{% endcall %}
@@ -768,6 +840,13 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <label class="check"><input type="checkbox" name="ramp" checked> New inboxes: ramp up gradually</label>
  <button class="btn brand" style="margin-top:10px">Add inboxes</button></form></div></div>
 
+<div class="card" id="activity"><div class="card-h"><h2>Inbox activity</h2><span class="muted">what BSO did with each email it saw</span></div><div class="card-b">
+ <form style="display:flex;gap:8px;align-items:end;flex-wrap:wrap" method="get"><input type="hidden" name="tab" value="inbox"><div><label>Inbox</label><select name="ib" onchange="this.form.submit()">{% for e in activity_inboxes %}<option {{ 'selected' if e == activity_ib }}>{{ e }}</option>{% endfor %}</select></div></form>
+ {% if activity_ib %}<form method="post" action="{{ url_for('inbox_recheck') }}" style="margin:8px 0"><input type="hidden" name="email" value="{{ activity_ib }}"><button class="btn">↻ Re-check the last 14 days</button> <span class="hint">Looks again at every email in this inbox (and its Spam folder), including ones skipped before.</span></form>{% endif %}
+ {% if activity %}<div class="scroll" style="max-height:420px"><table class="tbl"><thead><tr><th>When (UTC)</th><th>From</th><th>Subject</th><th>What BSO did</th></tr></thead>
+ {% for a in activity %}<tr><td class="nowrap muted">{{ a.at[:16].replace('T',' ') }}</td><td>{{ a.frm }}</td><td>{{ a.subject }}{% if a.folder and a.folder != 'INBOX' %} <span class="badge">{{ a.folder }}</span>{% endif %}</td>
+ <td>{% if a.lead_id %}<a href="{{ url_for('lead', lead_id=a.lead_id) }}">{{ a.decision }}</a>{% else %}{{ a.decision }}{% endif %}</td></tr>{% endfor %}</table></div>
+ {% else %}<p class="muted">Nothing yet: emails appear here as BSO reads them.</p>{% endif %}</div></div>
 {% elif tab == 'safety' %}
 <div class="card"><div class="card-h"><h2>Safety &amp; automation</h2></div><div class="card-b"><form method="post" action="{{ url_for('save_safety') }}">
  <label class="switch"><input type="checkbox" name="test_mode" {{ 'checked' if (c.test_mode or {}).enabled }}><span></span><b>Test mode</b> &mdash; send every email to me instead of the lead</label>
@@ -785,6 +864,16 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <p class="hint">For the computer that runs the campaigns. With <b>Run automatically</b> on, BSO also stops Windows from going to sleep. Closing a laptop's lid still sleeps it unless you set Windows → Settings → System → Power → <i>Lid close action: Do nothing</i> (when plugged in).</p>{% endif %}
  {% if is_bot %}<p class="hint">This BSO is signed in as the <b>BSO Bot</b>: it stays signed in after a restart, so campaigns carry on by themselves.</p>{% endif %}
  <button class="btn brand" style="margin-top:12px">Save</button></form></div></div>
+<div class="card" id="replies"><div class="card-h"><h2>Replies: hot, warm and cold</h2></div><div class="card-b"><form method="post" action="{{ url_for('save_replies') }}">
+ <p class="muted" style="margin-top:0">Every reply is sorted 🔥 hot (ready to talk or buy), ☀ warm (interested, asking), ❄ cold (not now) or ⛔ closed (don't contact). Hot and warm go to a supervisor with a deadline; cold ones wait and come back on the date they mentioned.</p>
+ <div class="grid2"><div><label>🔥 Hot: respond within (working hours)</label><input name="hot_hours" type="number" min="1" max="24" value="{{ pb.hot.respond_hours }}"></div>
+ <div><label>🔥 Hot: tell the master if not handled after (working hours)</label><input name="hot_escalate" type="number" min="1" max="48" value="{{ pb.hot.escalate_hours }}"></div>
+ <div><label>☀ Warm: respond within (working hours)</label><input name="warm_hours" type="number" min="1" max="48" value="{{ pb.warm.respond_hours }}"></div>
+ <div><label>❄ Cold: check back after (days, when they don't say when)</label><input name="cold_days" type="number" min="7" max="365" value="{{ pb.cold.check_back_days }}"></div></div>
+ <label class="switch" style="margin-top:12px"><input type="checkbox" name="ref_on" {{ 'checked' if (c.ref_code or {}).get('enabled', True) }}><span></span><b>Reference code</b> &mdash; add a short "Ref: {{ (c.ref_code or {}).get('prefix') or 'NS' }}-7F3KQ" line under each email</label>
+ <div style="max-width:200px"><label>Code prefix</label><input name="ref_prefix" maxlength="4" value="{{ (c.ref_code or {}).get('prefix') or 'NS' }}"></div>
+ <p class="hint">The code survives forwards, so when someone else at the company answers weeks later BSO still knows which conversation it belongs to.</p>
+ <button class="btn brand" style="margin-top:8px">Save</button></form></div></div>
 
 {% elif tab == 'keys' %}
 <div class="card"><div class="card-h"><h2>AI &amp; Apollo keys</h2></div><div class="card-b"><form method="post" action="{{ url_for('save_keys') }}">
@@ -939,6 +1028,11 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <button class="btn brand" style="margin-top:8px">Save &amp; test mailbox</button></form></div></div>
 
 {% elif tab == 'team' %}
+{% if team.joined and not team.is_bot %}<div class="card" id="signout"><div class="card-h"><h2>Automatic sign-out</h2></div><div class="card-b">
+ <form method="post" action="{{ url_for('save_idle') }}" style="display:flex;gap:8px;align-items:end;flex-wrap:wrap"><div><label>Sign me out after this long without using BSO</label>
+ <select name="minutes">{% for v, l in [(5,'5 minutes'),(10,'10 minutes'),(15,'15 minutes'),(30,'30 minutes'),(60,'1 hour'),(120,'2 hours'),(240,'4 hours'),(480,'8 hours'),(0,'Never')] %}<option value="{{ v }}" {{ 'selected' if team.idle == v }}>{{ l }}</option>{% endfor %}</select></div>
+ <button class="btn brand">Save</button>{% if team.idle_mine %}<button class="btn" name="minutes" value="default">Use my manager's default ({{ team.idle_default or 'never' }}{{ ' min' if team.idle_default }})</button>{% endif %}</form>
+ <p class="hint">Your choice, on this computer. When BSO signs you out, it asks for your password again; nothing is lost.</p></div></div>{% endif %}
 {% if team.joined %}
 <div class="card"><div class="card-h"><h2>Your team account</h2></div><div class="card-b">
  <p style="margin-top:0"><b>{{ team.policy.org or 'Your team' }}</b> · {{ team.policy.name }} ({{ team.policy.role }}) · ID <b>{{ team.username }}</b><br>
@@ -1027,10 +1121,11 @@ ABOUT = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block tit
 CAMPAIGNS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}Campaigns{% endblock %}{% block body %}
 {% call m.header('t-rev', '⚑', 'Campaigns', items|length ~ ' campaign(s)') %}{% endcall %}
 <div class="help" style="margin-bottom:12px">Each campaign has its own emails, its own inboxes and its own leads. Use one per offer or audience (for example <i>CTOs, US fintech</i> and <i>Heads of Product, UK SaaS</i>). Imports, emailed lead files and Instantly imports each go into the campaign you choose.</div>
-<div class="card"><table class="tbl"><thead><tr><th>Campaign</th><th>Status</th><th class="r">Leads</th><th class="r">Not yet emailed</th><th class="r">In sequence</th><th class="r">Sent</th><th class="r">Reply rate</th><th class="r">Positive</th><th class="r">Handed over</th><th class="r">Bounces</th></tr></thead>
+<div class="card"><table class="tbl"><thead><tr><th>Campaign</th><th>Status</th><th class="r">Leads</th><th class="r">Not yet emailed</th><th class="r">In sequence</th><th class="r">Sent</th><th class="r">Reply rate</th><th class="r">Positive</th><th class="r">Handed over</th><th class="r" title="Hot / warm / cold replies">🔥 / ☀ / ❄</th><th class="r">Bounces</th></tr></thead>
 {% for c in items %}<tr><td><a href="{{ url_for('campaign', cid=c.id) }}"><b>{{ c.name }}</b></a><br><small class="muted">{{ c.inbox_list|length ~ ' inbox(es)' if c.inbox_list else 'all inboxes' }}</small></td>
-<td>{{ m.status_badge('active' if c.status == 'active' else 'paused', {'active':'Running','paused':'Paused'}) }}</td><td class="r"><a href="{{ url_for('leads', campaign=c.id) }}">{{ c.st.leads }}</a></td><td class="r">{{ c.st.waiting }}</td><td class="r">{{ c.st.in_sequence }}</td>
-<td class="r">{{ c.st.sent }}</td><td class="r">{{ c.st.rate }}</td><td class="r">{{ c.st.positive }} <small class="muted">({{ c.st.pos_rate }})</small></td><td class="r">{{ c.st.handed }}</td><td class="r">{{ c.st.bounces }}</td></tr>{% endfor %}</table></div>
+<td>{{ m.status_badge('active' if c.status == 'active' else 'paused', {'active':'Running','paused':'Paused'}) }}</td><td class="r"><a href="{{ url_for('leads', campaign=c.id) }}">{{ c.st.leads }}</a></td><td class="r"><a href="{{ url_for('campaign_list', cid=c.id, what='waiting') }}">{{ c.st.waiting }}</a></td><td class="r"><a href="{{ url_for('campaign_list', cid=c.id, what='in_sequence') }}">{{ c.st.in_sequence }}</a></td>
+<td class="r"><a href="{{ url_for('campaign_list', cid=c.id, what='sent') }}">{{ c.st.sent }}</a></td><td class="r"><a href="{{ url_for('campaign_list', cid=c.id, what='replies') }}">{{ c.st.rate }}</a></td><td class="r"><a href="{{ url_for('campaign_list', cid=c.id, what='positive') }}">{{ c.st.positive }}</a> <small class="muted">({{ c.st.pos_rate }})</small></td><td class="r"><a href="{{ url_for('campaign_list', cid=c.id, what='handed') }}">{{ c.st.handed }}</a></td>
+<td class="r"><a href="{{ url_for('campaign_list', cid=c.id, what='hot') }}">{{ c.st.hot }}</a> / <a href="{{ url_for('campaign_list', cid=c.id, what='warm') }}">{{ c.st.warm }}</a> / <a href="{{ url_for('campaign_list', cid=c.id, what='cold') }}">{{ c.st.cold }}</a></td><td class="r"><a href="{{ url_for('campaign_list', cid=c.id, what='bounces') }}">{{ c.st.bounces }}</a></td></tr>{% endfor %}</table></div>
 <div class="card" style="max-width:640px"><div class="card-h"><h2>New campaign</h2></div><div class="card-b"><form method="post" action="{{ url_for('campaign_new') }}"><div class="grid2">
 <div><label>Name</label><input name="name" required placeholder="e.g. Heads of Product, UK SaaS"></div>
 <div><label>Start from the emails of</label><select name="copy_from">{% for c in items %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></div></div>
@@ -1041,7 +1136,7 @@ CAMPAIGN = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <form method="post" style="display:inline">{% if c.status == 'active' %}<button class="btn" name="action" value="pause">Pause campaign</button>{% else %}<button class="btn brand" name="action" value="resume">▶ Start campaign</button>{% endif %}</form>
  <a class="btn" href="{{ url_for('leads', campaign=c.id) }}">Its leads ({{ st.leads }})</a>
 {% endcall %}
-<div class="stats" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:14px">{% for k, l in [('waiting','Not yet emailed'),('in_sequence','In sequence'),('sent','Emails sent'),('rate','Reply rate'),('positive','Positive replies'),('handed','Handed over'),('bounces','Bounces')] %}<div class="card" style="margin:0"><div class="card-b"><small class="muted">{{ l }}</small><div style="font-size:22px">{{ st[k] }}</div></div></div>{% endfor %}</div>
+<div class="stats" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:14px">{% for k, l, w in [('waiting','Not yet emailed','waiting'),('in_sequence','In sequence','in_sequence'),('sent','Emails sent','sent'),('rate','Reply rate','replies'),('positive','Positive replies','positive'),('handed','Handed over','handed'),('hot','🔥 Hot','hot'),('warm','☀ Warm','warm'),('cold','❄ Cold','cold'),('bounces','Bounces','bounces')] %}<a class="card statlink" style="margin:0;color:inherit;text-decoration:none" href="{{ url_for('campaign_list', cid=c.id, what=w) }}"><div class="card-b"><small class="muted">{{ l }}</small><div style="font-size:22px">{{ st[k] }}</div></div></a>{% endfor %}</div>
 <form method="post"><input type="hidden" name="action" value="save">
 <div class="card"><div class="card-h"><h2>Settings</h2>{{ m.status_badge('active' if c.status == 'active' else 'paused', {'active':'Running','paused':'Paused'}) }}</div><div class="card-b">
  <label>Name</label><input name="name" value="{{ c.name }}">
@@ -1077,7 +1172,7 @@ PROSPECTS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block
 <div id="board" style="display:grid;grid-template-columns:repeat(6,minmax(160px,1fr));gap:10px;overflow-x:auto">
 {% for k, lbl in labels.items() %}<div class="col" data-stage="{{ k }}" style="background:#eef1f4;border-radius:8px;padding:8px;min-height:240px"><div style="font-weight:600;margin:2px 4px 8px">{{ lbl.split(':')[0] }} <span class="muted">{{ counts[k] }}</span></div>
 {% for p in items if (p.prospect_stage or 'new') == k %}<div class="kcard" draggable="true" data-id="{{ p.id }}" style="background:#fff;border:1px solid var(--line);{{ 'border-left:4px solid #2e844a;' if p.unseen or p.new_comments else ('border-left:4px solid #ba0517;' if k == 'new' and p.age >= 2 else '') }}border-radius:6px;padding:8px 10px;margin-bottom:8px;cursor:grab">
-<a href="{{ url_for('lead', lead_id=p.id) }}"><b>{{ p.name }}</b></a><br><small class="muted">{{ p.company or '' }}</small><br>
+<a href="{{ url_for('lead', lead_id=p.id) }}"><b>{{ p.name }}</b></a> {{ temp_badge(p.temperature) }}<br><small class="muted">{{ p.company or '' }}</small><br>
 <small>{{ p.age }}d{% if p.unseen %} · <b style="color:#2e844a">● {{ p.unseen }} new</b>{% endif %}{% if p.ncomments %} · 💬 {{ p.ncomments }}{% if p.new_comments %} <b style="color:#2e844a">new</b>{% endif %}{% endif %}</small></div>{% endfor %}</div>{% endfor %}</div>
 <form id="mv" method="post" style="display:none"><input type="hidden" name="stage"><input type="hidden" name="back" value="{{ url_for('prospects', view='board') }}"></form>
 <p class="muted">Drag a card to another column to change its stage. Red edge: not contacted for 2+ days. Green edge: new reply or comment.</p>
@@ -1141,5 +1236,5 @@ TEMPLATES = {
     "base.html": BASE, "macros.html": MACROS, "home.html": HOME, "leads.html": LEADS, "lead.html": LEAD,
     "accounts.html": ACCOUNTS, "account.html": ACCOUNT, "opps.html": OPPS, "opp.html": OPP,
     "tasks.html": TASKS, "reports.html": REPORTS, "review.html": REVIEW, "setup.html": SETUP,
-    "job.html": JOB, "settings.html": SETTINGS, "welcome.html": WELCOME, "signin.html": SIGNIN, "prospects.html": PROSPECTS, "campaigns.html": CAMPAIGNS, "campaign.html": CAMPAIGN, "legal.html": LEGAL, "about.html": ABOUT, "jobs.html": JOBS, "new.html": NEW_LEAD, "import.html": IMPORT, "search.html": SEARCH,
+    "job.html": JOB, "settings.html": SETTINGS, "welcome.html": WELCOME, "signin.html": SIGNIN, "prospects.html": PROSPECTS, "campaigns.html": CAMPAIGNS, "campaign.html": CAMPAIGN, "legal.html": LEGAL, "about.html": ABOUT, "jobs.html": JOBS, "new.html": NEW_LEAD, "import.html": IMPORT, "search.html": SEARCH, "drill.html": DRILL,
 }
