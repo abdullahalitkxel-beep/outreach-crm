@@ -86,7 +86,14 @@ def send_cmd(con, uid, cmd):
 def config_extra(con):
     """Added to the settings every BSO receives: the kill switch and update control."""
     m = lambda k: (H._m_get(con, k, "") or "")
-    return {"kill": m("bot_kill"), "updates": {"hold": m("upd_hold") == "1", "min_version": m("upd_min"), "release_now": m("upd_now")}}
+    inboxes = []
+    for u in con.execute("SELECT bot_report FROM users WHERE role='bot' AND status!='removed' AND bot_report IS NOT NULL").fetchall():
+        try:
+            inboxes += [i["email"].lower() for i in json.loads(u[0]).get("inboxes", [])]
+        except Exception:
+            pass
+    return {"kill": m("bot_kill"), "updates": {"hold": m("upd_hold") == "1", "min_version": m("upd_min"), "release_now": m("upd_now")},
+            "bot_inboxes": sorted(set(inboxes))}
 
 
 def watch(con):

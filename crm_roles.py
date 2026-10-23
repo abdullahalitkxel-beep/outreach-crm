@@ -29,9 +29,25 @@ app = crm.app
 UNLOCK = {"t": 0}
 
 
+def role():
+    return ((team.policy() or {}).get("role") or "") if team.joined() else ""
+
+
+def is_owner():
+    return role() == "owner"
+
+
+def view_as():
+    """The owner can act as the bot or as a supervisor (UAT): that role's layout and functions, with full access."""
+    v = team.state().get("view_as") or "full"
+    return v if v in ("full", "bot", "workspace") else "full"
+
+
 def mode():
     if not team.joined():
         return "full"
+    if is_owner():
+        return view_as()
     return "bot" if team.is_bot() else "workspace"
 
 
@@ -41,7 +57,7 @@ WS_NAV = [("myday", "My day"), ("ws_conversations", "Conversations"), ("pipeline
 WS_ALLOWED = {"home", "lead", "leads", "export", "about", "myday", "ws_conversations", "pipeline", "prospects", "prospect_stage", "tasks", "task_toggle", "search",
               "comment_add", "comments_seen", "api_conversation", "api_email", "settings", "save_mailbox", "mailbox_check", "save_away",
               "save_idle", "team_sync", "updates_page", "open_data_folder", "add_note", "add_task_route", "prospect_reply",
-              "lead_temperature", "lead_address", "lead_stage", "update_lead", "lead_email"}
+              "lead_temperature", "lead_address", "lead_stage", "update_lead", "lead_email", "clear_cold_inboxes", "view_as_set"}
 WS_TABS = [("handover", "My mailbox & away", "1"), ("team", "Sign-out & account", "2"), ("updates", "About & updates", "3")]
 BOT_TABS = [("inbox", "Email inboxes", "1"), ("autopilot", "Bot: intake, limits & tests", "2"), ("safety", "Safety & automation", "3"),
             ("keys", "AI & Apollo keys", "4"), ("emails", "Your offer & emails", "5"), ("targeting", "Lead targeting", "6"),
@@ -79,6 +95,12 @@ def role_guard():
     if not ep or ep in crm.OPEN_ENDPOINTS or not team.signed_in():
         return None
     m = mode()
+    if is_owner():                                   # the owner: every module, every action, in every view
+        if ep == "home" and m == "bot":
+            return redirect(url_for("botroom"))
+        if ep == "home" and m == "workspace":
+            return redirect(url_for("myday"))
+        return None
     if m == "bot":
         if ep == "home":
             return redirect(url_for("botroom"))
@@ -93,6 +115,38 @@ def role_guard():
         if ep == "settings" and request.args.get("tab", "handover") not in {k for k, _, _ in WS_TABS}:
             return redirect(url_for("settings", tab="handover"))
     return None
+
+
+@app.post("/view-as")
+def view_as_set():
+    if not is_owner():
+        return redirect(url_for("home"))
+    v = request.form.get("view", "full")
+    st = team.state()
+    st["view_as"] = v if v in ("full", "bot", "workspace") else "full"
+    st.pop("device_sent", None)                       # tell the console at once: it routes handovers to an owner acting as supervisor
+    team.save_state(st)
+    try:
+        import threading
+        threading.Thread(target=lambda: team.sync(crm.db_connect(crm.cfg().get("database", "outreach.db"))), daemon=True).start()
+    except Exception:
+        pass
+    return redirect(url_for("home"))
+
+
+def bot_inboxes():
+    """Inboxes the BSO Bot runs (reported by the Master Console)."""
+    return {e.lower() for e in team.state().get("bot_inboxes") or []}
+
+
+@app.post("/settings/inboxes/clear-cold")
+def clear_cold_inboxes():
+    """A supervisor's BSO: remove the old cold inboxes (and their passwords) from this computer; they belong on the bot."""
+    senders = [x for x in (crm.cfg().get("senders") or []) if x.get("email")]
+    for x in senders:
+        crm.set_secret(x.get("password_env") or "", "")
+    crm.write_settings({"senders": []})
+    return redirect(url_for("settings", tab="handover", result=f"Removed {len(senders)} cold inbox(es) from this computer.", ok=1))
 
 
 # ---------------------------------------------------------------- bot control room
@@ -302,9 +356,14 @@ def updates_page():
 
 
 def ctx():
-    """Extra values every page needs (update banner)."""
+    """Extra values every page needs (update banner, owner's view, inboxes shared with the bot)."""
+    senders = [x["email"].lower() for x in (crm.cfg().get("senders") or []) if x.get("email") and "example" not in x["email"]]
+    shared = sorted(set(senders) & bot_inboxes()) if team.joined() and not team.is_bot() else []
+    out = {"role_mode": mode(), "settings_tabs": settings_tabs(), "is_owner": is_owner(), "view_as": view_as() if is_owner() else None,
+           "shared_inboxes": shared, "cold_here": len(senders) if mode() == "workspace" and not is_owner() else 0}
     try:
         import updater
-        return {"update": updater.banner(), "role_mode": mode(), "settings_tabs": settings_tabs()}
+        out["update"] = updater.banner()
     except Exception:
-        return {"update": None, "role_mode": mode(), "settings_tabs": settings_tabs()}
+        out["update"] = None
+    return out

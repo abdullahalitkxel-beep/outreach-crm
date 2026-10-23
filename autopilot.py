@@ -102,7 +102,7 @@ def active(cfg):
         return bool(ap["enabled"])
     try:
         import team
-        return team.joined() and team.is_bot()
+        return team.works_as_bot()
     except Exception:
         return False
 

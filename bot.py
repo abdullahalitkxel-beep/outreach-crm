@@ -1208,7 +1208,7 @@ def cmd_run(cfg, con, args):
     team_mod = None
     if not args.dry_run:
         import team as team_mod
-        if team_mod.joined() and not team_mod.is_bot() and (team_mod.policy() or {}).get("role"):
+        if team_mod.joined() and not team_mod.is_bot() and (team_mod.policy() or {}).get("role") not in (None, "", "owner"):
             print("Cold email is sent only by the BSO Bot. This BSO handles your own prospects and conversations; "
                   "the cold inboxes belong on the bot (Master Console → BSO setup).")
             return

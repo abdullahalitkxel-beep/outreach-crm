@@ -154,6 +154,20 @@ def is_bot():
     return (policy() or {}).get("role") == "bot"
 
 
+def acting_as():
+    """The role this BSO works as: its own role, or, for the owner, the role chosen under Act as (for UAT)."""
+    r = (policy() or {}).get("role") or ""
+    if r == "owner":
+        a = state().get("view_as") or "full"
+        return {"bot": "bot", "workspace": "supervisor"}.get(a, "owner")
+    return r
+
+
+def works_as_bot():
+    """The real BSO Bot, or the owner acting as the bot: the bot's rules, scheduler, intake and reports run here."""
+    return joined() and acting_as() == "bot"
+
+
 def resume():
     """The BSO Bot account stays signed in on its computer, so campaigns carry on after a restart or power cut.
     Human accounts always sign in with their password."""
@@ -927,6 +941,8 @@ def _apply_decisions(con, decisions):
                 s["kill"] = d.get("kill") or ""
             if isinstance(d.get("updates"), dict):
                 s["updates"] = d["updates"]
+            if isinstance(d.get("bot_inboxes"), list):
+                s["bot_inboxes"] = d["bot_inboxes"]
             save_state(s)
             continue
         if action == "bot_cmd":
@@ -1134,7 +1150,7 @@ def _sync(con, version=""):
             print("status:", e)
         packed += st_extra
         rep_marks = None
-        if is_bot():                                      # the full picture the Master Console mirrors (every 5 minutes or after a change)
+        if works_as_bot():                                # the full picture the Master Console mirrors (every 5 minutes or after a change)
             try:
                 import autopilot
                 import bot as _bot
@@ -1295,7 +1311,7 @@ def device_info():
         user = getpass.getuser()
     except Exception:
         user = ""
-    return {"device": os.getenv("COMPUTERNAME") or socket.gethostname(), "windows_user": user, "os": platform.platform()[:80],
+    return {"device": os.getenv("COMPUTERNAME") or socket.gethostname(), "windows_user": user, "os": platform.platform()[:80], "acting_as": acting_as(),
             "disk_encrypted": disk_encrypted_cached(), "version": _app_version(), "at": iso(now_utc()),
             "cert_trusted": state().get("cert_trusted")}
 

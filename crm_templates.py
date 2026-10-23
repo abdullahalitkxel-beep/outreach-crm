@@ -190,7 +190,8 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
     <button onclick="resetHelp()">Show all help tips again</button>
     <a href="{{ url_for('settings') }}">Settings</a>
     <a href="{{ url_for('about') }}">About &amp; legal</a>
-    {% if team_user %}<div class="muted" style="padding:6px 12px">Signed in as {{ team_name or team_user }}{{ ' (bot, stays signed in)' if team_bot }}</div><form method="post" action="{{ url_for('signout') }}"><button>Sign out</button></form>{% endif %}
+    {% if is_owner %}<form method="post" action="{{ url_for('view_as_set') }}" style="padding:4px 12px"><div class="muted">Act as (works as that role, with full access)</div>{% for v, l in [('full','Owner: everything'),('bot','BSO Bot'),('workspace','Supervisor')] %}<button name="view" value="{{ v }}" style="{{ 'font-weight:700' if view_as == v }}">{{ '✓ ' if view_as == v }}{{ l }}</button>{% endfor %}</form>{% endif %}
+    {% if team_user %}<div class="muted" style="padding:6px 12px">Signed in as {{ team_name or team_user }}{{ ' (bot, stays signed in)' if team_bot }}{{ ' · Owner: full access' if is_owner }}</div><form method="post" action="{{ url_for('signout') }}"><button>Sign out</button></form>{% endif %}
     <form method="post" action="{{ url_for('quit_app') }}" onsubmit="return confirm('Stop BSO? Automatic runs stop until you open it again.')"><button>Quit the app</button></form>
    </div>
   </div>
@@ -205,6 +206,7 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
 <main>
 {% if request.endpoint not in ('welcome', 'signin') %}<nav class="pgnav" aria-label="Page history"><a id="nav-back" class="pgbtn" href="#" title="Back (Alt + Left arrow)" style="display:none"><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg><span></span></a><a id="nav-fwd" class="pgbtn" href="#" title="Forward (Alt + Right arrow)" style="display:none"><span></span><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M4 11h12.2l-5.6-5.6L12 4l8 8-8 8-1.4-1.4 5.6-5.6H4z"/></svg></a></nav>{% endif %}
 {% if request.args.get('msg') %}<div class="toast {{ 'err' if request.args.get('err') }}">{{ request.args.get('msg') }}</div>{% endif %}
+{% if is_owner and view_as and view_as != 'full' %}<div class="help" style="display:flex;gap:10px;align-items:center;margin-bottom:10px;border-color:#7a4bd1">Owner acting as: <b>{{ 'BSO Bot' if view_as == 'bot' else 'Supervisor' }}</b> ({{ "the bot's rules, scheduler and intake run on this computer" if view_as == 'bot' else 'handovers come to you like any supervisor' }}; full access)<form method="post" action="{{ url_for('view_as_set') }}" style="margin:0"><button class="btn sm" name="view" value="full">Back to Owner</button></form></div>{% endif %}
 {% if update and update.available and update.allowed and request.endpoint != 'settings' %}<div class="help" style="display:flex;gap:10px;align-items:center;margin-bottom:10px"><span>⬆ BSO {{ update.latest }} is available.</span><a href="{{ url_for('settings', tab='updates') }}">What's new</a><form method="post" action="{{ url_for('updates_page') }}" style="margin:0"><button class="btn sm brand" name="action" value="now">Update now</button> <button class="btn sm" name="action" value="tonight">Tonight</button></form></div>{% endif %}
 {% block body %}{% endblock %}
 </main>
@@ -807,7 +809,8 @@ SEARCH = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block ti
 {% endblock %}"""
 
 SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}Settings{% endblock %}{% block body %}
-{% call m.header('t-setup', '⚙', 'Settings', 'Set up your outreach') %}<a class="btn" href="{{ url_for('setup') }}">Getting Started checklist</a>{% endcall %}
+{% call m.header('t-setup', '⚙', 'Settings', 'Set up your outreach') %}{% if role_mode != 'workspace' or is_owner %}<a class="btn" href="{{ url_for('setup') }}">Getting Started checklist</a>{% endif %}{% endcall %}
+{% if shared_inboxes %}<div class="help" style="border-color:#c27c0e">⚠ {{ shared_inboxes|length }} inbox(es) on this computer also run on the BSO Bot ({{ shared_inboxes[:5]|join(', ') }}{{ '…' if shared_inboxes|length > 5 }}). Both computers read their replies and could both act on one. Remove them here, or from the bot, to avoid that.</div>{% endif %}
 {% if result %}<div class="toast {{ '' if ok else 'err' }}">{{ result }}</div>{% endif %}
 <div class="settings">
 <nav class="snav">{% for k, lbl, n in settings_tabs %}
@@ -1022,6 +1025,8 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <button class="btn brand" style="margin-top:12px">Save schedule</button></form></div></div>
 
 {% elif tab == 'handover' %}
+{% if cold_here %}<div class="card"><div class="card-h"><h2>Old cold inboxes on this computer</h2></div><div class="card-b"><p style="margin-top:0">{{ cold_here }} cold inbox(es) are stored on this computer from before the BSO Bot. They aren't used here any more: cold email and its replies run on the bot. Once your manager has loaded them on the bot (Master Console → BSO setup), remove them from this computer.</p>
+<form method="post" action="{{ url_for('clear_cold_inboxes') }}" onsubmit="return confirm('Remove the cold inboxes and their passwords from this computer?')"><button class="btn">Remove them from this computer</button></form></div></div>{% endif %}
 <div class="card"><div class="card-h"><h2>Handover to a lead gen supervisor</h2></div><div class="card-b"><form method="post" action="{{ url_for('save_handover') }}">
  <p class="muted" style="margin-top:0">When a prospect replies <b>interested</b>, asks for a <b>meeting</b> or asks a <b>question</b>, BSO hands them to a supervisor (taking turns): the inbox that received the reply sends a short introduction with the supervisor in CC, the supervisor gets a briefing email with the whole conversation, and the prospect stops getting automatic emails.</p>
  <label class="check"><input type="checkbox" name="enabled" {{ 'checked' if ho.get('enabled', True) }}> Hand interested prospects over to a supervisor</label>

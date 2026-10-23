@@ -131,11 +131,20 @@ class Watcher(threading.Thread):
         return got
 
 
+def _cold_not_here():
+    """On a team, cold inboxes are read only on the BSO Bot (and the owner's BSO); supervisors' BSOs leave them alone."""
+    try:
+        import team
+        return team.joined() and not team.is_bot() and (team.policy() or {}).get("role") not in (None, "", "owner")
+    except Exception:
+        return False
+
+
 def reconcile(config_path, allowed):
     """Start a watcher for every inbox that has a password and an IMAP server; stop ones that were removed or changed."""
     try:
         cfg = bot.load_config(config_path)
-        if cfg.get("live_replies") is False:
+        if cfg.get("live_replies") is False or _cold_not_here():
             senders = []
         else:
             senders = [s for s in bot.load_senders(cfg) if s.get("password") and s.get("imap_host") and "example" not in s["email"]]

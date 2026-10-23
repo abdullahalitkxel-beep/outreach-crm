@@ -187,5 +187,36 @@ r = w.get("/settings?tab=inbox")
 check(r.status_code == 302 and "tab=handover" in r.headers["Location"], "no cold-inbox settings on a supervisor's BSO")
 check(w.get("/conversations").status_code == 200 and w.get("/pipeline").status_code == 200, "Conversations and Pipeline open")
 check(w.get("/settings?tab=handover").status_code == 200 and w.get("/settings?tab=updates").status_code == 200, "a supervisor's short settings open")
+page = txt(w.get("/settings"))
+check("Handover to a lead gen supervisor" in page and "Email inboxes</h2>" not in page, "a supervisor's Settings opens on their own tab, not on cold inboxes")
+import watcher  # noqa: E402
+check(watcher._cold_not_here(), "a supervisor's BSO doesn't watch or read cold inboxes")
+check("Old cold inboxes on this computer" in page, "a supervisor is offered to remove old cold inboxes from their computer")
+
+# ---------------------------------------------------------------- the owner: every module, and Act as for UAT
+team.policy = lambda: {"role": "owner", "name": "Omar"}
+st = team.state(); st["view_as"] = "full"; team.save_state(st)
+check(not watcher._cold_not_here(), "the owner's BSO keeps its inboxes")
+for path in ("/campaigns", "/review", "/leads", "/bot", "/bot/domains", "/bot/intake", "/myday", "/pipeline", "/settings?tab=inbox", "/settings?tab=autopilot", "/setup"):
+    check(w.get(path).status_code == 200, f"owner opens {path}")
+page = txt(w.get("/leads"))
+check('id="nav-campaigns"' in page and "Act as" in page and "Owner: full access" in page, "the owner gets the full menu and the Act as switch")
+w.post("/view-as", data={"view": "bot"})
+check(team.acting_as() == "bot" and autopilot.active(bot.load_config(crm.CONFIG_PATH)), "owner acting as the bot: the bot's rules run on this computer")
+r = w.get("/")
+check(r.status_code == 302 and r.headers["Location"].endswith("/bot") and w.get("/settings").status_code == 200 and w.get("/campaigns").status_code == 200,
+      "…with the bot's layout and full access (no settings lock)")
+page = txt(w.get("/bot"))
+check("Owner acting as" in page and 'id="nav-bot_domains"' in page, "a strip shows the owner is acting as the bot")
+w.post("/view-as", data={"view": "workspace"})
+check(team.acting_as() == "supervisor" and not autopilot.active(bot.load_config(crm.CONFIG_PATH)), "owner acting as a supervisor")
+r = w.get("/")
+check(r.headers["Location"].endswith("/myday") and w.get("/campaigns").status_code == 200, "…with the supervisor's layout and still every module")
+hc.execute("UPDATE users SET device_info=? WHERE role='owner'", (json.dumps(team.device_info()),))
+hc.commit()
+sups = [x["email"] for x in hub.supervisor_config(hc)["supervisors"]]
+check("omar@blacswanken.com" in sups, "the console hands prospects to the owner while acting as a supervisor")
+w.post("/view-as", data={"view": "full"})
+check(team.acting_as() == "owner", "back to Owner")
 print(f"\nAll {n} console and layout checks passed.")
 os._exit(0)

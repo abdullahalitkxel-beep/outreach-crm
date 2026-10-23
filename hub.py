@@ -166,6 +166,7 @@ def init_db():
     _vis.ensure(con)
     import hub_bot
     hub_bot.ensure(con)
+    con.execute("UPDATE users SET role='supervisor' WHERE role='member'")     # cold email runs on the bot: members are supervisors now
     con.row_factory = sqlite3.Row
     try:            # the console's key pair, for the sealed reports from every BSO (made once, ~2 seconds)
         _vis.keypair(_secret_store(), lambda k, d=None: _m_get(con, k, d), lambda k, v: _m_set(con, k, v))
@@ -1250,7 +1251,7 @@ def bso_template():
 @need("owner")
 def user_new():
     f = request.form
-    name, email, role = f.get("name", "").strip(), f.get("email", "").strip().lower(), f.get("role", "member")
+    name, email, role = f.get("name", "").strip(), f.get("email", "").strip().lower(), f.get("role", "supervisor")
     username = clean_username(f.get("username")) or clean_username(email.split("@")[0])
     if not name or "@" not in email or role not in ROLES or role == "owner" or len(username) < 3:
         return redirect(url_for("users", err="Enter a name, an ID of at least 3 characters, a valid email and a role."))
@@ -2087,7 +2088,7 @@ def store_handover(con, uid, h):
         h = dict(inner, out_id=h.get("out_id"))
     lead = h.get("lead") or {}
     sid = str(h.get("supervisor") or "")
-    sup = con.execute("SELECT id FROM users WHERE role='supervisor' AND (username=? OR email=?)", (sid, sid)).fetchone() \
+    sup = con.execute("SELECT id FROM users WHERE role IN ('supervisor','owner') AND (username=? OR email=?)", (sid, sid)).fetchone() \
         or con.execute("SELECT id FROM users WHERE role='supervisor' AND status NOT IN ('disabled','removed','removing') ORDER BY id LIMIT 1").fetchone()
     try:
         lid = int(h.get("lead_local_id"))
@@ -2261,7 +2262,8 @@ def remove_user(con, u, wait_for_leads=True):
 
 def supervisor_config(con):
     sups = []
-    for u in con.execute("SELECT * FROM users WHERE role='supervisor' AND status NOT IN ('disabled','removed','removing') ORDER BY id").fetchall():
+    for u in con.execute("SELECT * FROM users WHERE (role='supervisor' OR (role='owner' AND device_info LIKE '%\"acting_as\": \"supervisor\"%')) "
+                         "AND status NOT IN ('disabled','removed','removing') ORDER BY id").fetchall():
         if is_away(u):
             continue
         n = con.execute("SELECT COUNT(*) FROM handovers WHERE supervisor_id=? AND at>=?", (u["id"], iso(now() - timedelta(days=30)))).fetchone()[0]
@@ -2404,7 +2406,9 @@ def relay_doc(con):
         ident = u["username"] or u["email"]
         # relay keys can't contain dots (they're part of the sign-in token); the ID itself is matched via "email"
         users[relay_key_for(ident)] = dict(
-            rec, name=u["name"], email=ident, mail=u["email"], role=u["role"], status="disabled" if u["status"] in ("disabled", "removing") else "active",
+            rec, name=u["name"], email=ident, mail=u["email"],
+            role="supervisor" if u["role"] == "owner" and '"acting_as": "supervisor"' in (u["device_info"] or "") else u["role"],
+            status="disabled" if u["status"] in ("disabled", "removing") else "active",
             tv=u["tv"] or 1, away_until=u["away_until"] or "", daily_cap=u["daily_cap"] or 0, weekly_target=u["weekly_target"] or 0, approval=u["approval"] or "member",
             decisions=decisions_for(con, u["id"], handovers=int(_m_get(con, "relay_version", "1") or 1) < 2))
     return {"org": _m_get(con, "org_name", "Your team"), "grace_hours": int(_m_get(con, "grace_hours", str(GRACE_HOURS)) or 0), "users": users}
@@ -2661,7 +2665,7 @@ T["users.html"] = """{% extends 'base.html' %}{% block title %}Users{% endblock 
 {% if me.role == 'owner' %}<div class="card"><div class="card-h"><h2>Add a user</h2></div><div class="card-b"><form method="post" action="{{ url_for('user_new') }}"><input type="hidden" name="_csrf" value="{{ csrf }}">
 <div class="grid"><div><label>Name</label><input name="name" required></div><div><label>Email</label><input name="email" type="email" required></div>
 <div><label>Sign-in ID (blank = part of email before @)</label><input name="username" autocomplete="off"></div>
-<div><label>Role</label><select name="role"><option value="member">Member (uses BSO on their laptop)</option><option value="manager">Manager (member + can use this console)</option><option value="supervisor">Lead Gen Supervisor (receives interested prospects)</option><option value="bot">BSO Bot (runs the campaigns on an always-on computer; stays signed in)</option></select></div>
+<div><label>Role</label><select name="role"><option value="supervisor">Supervisor: works the prospects the bot hands over</option><option value="manager">Manager: a supervisor who can also use this console (no owner pages)</option><option value="bot">BSO Bot: runs all cold outreach on an always-on computer; stays signed in</option></select></div>
 <div><label>Password (10+ characters; blank = generate one)</label><input name="password" autocomplete="off"></div>
 <div><label>Daily send cap (0 = no cap)</label><input name="daily_cap" type="number" min="0" value="0"></div><div><label>Weekly target (emails, 0 = none)</label><input name="weekly_target" type="number" min="0" value="0"></div>
 <div><label>Who approves their emails</label><select name="approval"><option value="member">They approve their own</option><option value="master">The master approves every email</option></select></div></div>
@@ -2676,7 +2680,7 @@ T["user.html"] = """{% extends 'base.html' %}{% block title %}{{ u.name }}{% end
 {% if me.role == 'owner' %}<div class="card"><div class="card-h"><h2>{{ u.name }} <span class="badge {{ 'b-ok' if u.status == 'active' else 'b-bad' if u.status == 'disabled' else 'b-warn' }}">{{ u.status }}</span></h2></div><div class="card-b">
 <form method="post"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="action" value="save"><div class="grid">
 <div><label>Name</label><input name="name" value="{{ u.name }}"></div><div><label>Email</label><input value="{{ u.email }}" disabled></div><div><label>Sign-in ID</label><input value="{{ u.username or u.email }}" disabled></div>
-<div><label>Role</label><select name="role" {{ 'disabled' if u.role == 'owner' }}>{% for r in ['member','manager','supervisor','bot'] %}<option {{ 'selected' if u.role == r }}>{{ r }}</option>{% endfor %}{% if u.role == 'owner' %}<option selected>owner</option>{% endif %}</select></div>
+<div><label>Role</label><select name="role" {{ 'disabled' if u.role == 'owner' }}>{% for r in ['manager','supervisor','bot'] %}<option {{ 'selected' if u.role == r }}>{{ r }}</option>{% endfor %}{% if u.role == 'owner' %}<option selected>owner</option>{% endif %}</select></div>
 <div><label>Daily send cap (0 = no cap)</label><input name="daily_cap" type="number" min="0" value="{{ u.daily_cap or 0 }}"></div><div><label>Weekly target</label><input name="weekly_target" type="number" min="0" value="{{ u.weekly_target or 0 }}"></div>
 {% if u.role == 'supervisor' %}<div><label>Away until (skipped for new prospects; empty = available)</label><input name="away_until" type="date" value="{{ u.away_until or '' }}"></div>{% endif %}
 <div><label>Who approves their emails</label><select name="approval"><option value="member" {{ 'selected' if u.approval != 'master' }}>They approve their own</option><option value="master" {{ 'selected' if u.approval == 'master' }}>The master approves every email</option></select></div>

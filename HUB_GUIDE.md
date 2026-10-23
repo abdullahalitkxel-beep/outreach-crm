@@ -94,6 +94,13 @@ One BSO account, **BSO Bot**, runs cold outreach for every client on one always-
 ## Clients: the Scope room
 **Clients → New scope**: upload a client's scope document (PDF, Word, email or text). BSO fills a Scope card (every field with the sentence it came from), lists questions for the client, works out the leads, inboxes, time and AI cost the target needs, flags conflicts (LinkedIn or phone steps, consent rules by country, figures to back up), and proposes a campaign. **Approve** sends it to the bot (starting in Assisted). A new version shows what changed; progress against the scope appears on its page. Copy the client summary to confirm what was agreed.
 
+## Roles
+- **Owner** (you): every module in BSO and the console, no locks. **Act as** (BSO menu): *BSO Bot* runs the bot's rules, scheduler and intake on your computer; *Supervisor* makes the console hand prospects to you; full access stays on in both. For UAT.
+- **Manager**: a supervisor who can also use this console, without the owner pages.
+- **Supervisor**: works the prospects the bot hands over (My day, Conversations, Pipeline, Tasks). Cold inboxes are not used or read on their BSO.
+- **BSO Bot**: runs all cold outreach.
+(The old *Member* role is retired: existing members became supervisors.)
+
 ## Devices and updates (owner)
 **Devices** lists every laptop joined with a setup code. A second laptop for the same person waits for your approval. Every BSO checks GitHub every 6 hours and installs only releases signed by BlacSwanken's build system: your BSO first, supervisors 6 hours later, the bot 24 hours later when no email is due. **Hold** stops all updates; a **minimum version** forces an urgent fix. On joining, BSO trusts the BlacSwanken publisher certificate for that Windows user (Windows asks once).
 

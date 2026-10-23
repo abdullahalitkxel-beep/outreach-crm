@@ -2004,7 +2004,7 @@ def settings():
                   regions=REGIONS, sizes=SIZES, seniorities=SENIORITIES, cf=cf, ac=ac,
                   keys={"ANTHROPIC_API_KEY": mask(env("ANTHROPIC_API_KEY")), "APOLLO_API_KEY": mask(env("APOLLO_API_KEY")),
                         "SLACK_WEBHOOK_URL": mask(env("SLACK_WEBHOOK_URL"))},
-                  tab=request.args.get("tab", "inbox"), result=request.args.get("result"),
+                  tab=request.args.get("tab") or __import__("crm_roles").settings_tabs()[0][0], result=request.args.get("result"),
                   ok=request.args.get("ok"), avoid_hits=template_avoid_hits(c), avoid_n=len(c.get("avoid_phrases") or []),
                   li=dict(c.get("lead_intake") or {}), ins=dict(c.get("instantly") or {}), ins_key=mask(env("INSTANTLY_API_KEY")),
                   ins_opts=__import__("instantly"), ins_pulls=rows("SELECT * FROM instantly_pulls ORDER BY id DESC LIMIT 5"),
