@@ -333,10 +333,11 @@ check(camp == "paused" and any("Bad list test" in x for x in out) and alerts, f"
 held = con.execute("SELECT COUNT(*) FROM leads WHERE batch='2026-10-23-badlist.csv' AND status='held'").fetchone()[0]
 check(held == 60 and con.execute("SELECT COUNT(*) FROM leads WHERE status='active' AND email LIKE 'q%'").fetchone()[0] >= 0,
       f"the imported list that caused it is held too ({held} leads), without touching other lists")
-check(len(safety.open_breakers(con)) == 2 and "paused" not in [r[0] for r in con.execute("SELECT status FROM campaigns WHERE id=1")],
+check(len([x for x in safety.open_breakers(con) if x["kind"] != "restore"]) == 2 and "paused" not in [r[0] for r in con.execute("SELECT status FROM campaigns WHERE id=1")],
       "nothing else is paused")
 for b_ in safety.open_breakers(con):
-    safety.resume_breaker(con, b_["id"])
+    if b_["kind"] != "restore":
+        safety.resume_breaker(con, b_["id"])
 check(con.execute("SELECT status FROM campaigns WHERE id=9").fetchone()[0] == "active" and
       con.execute("SELECT COUNT(*) FROM leads WHERE batch='2026-10-23-badlist.csv' AND status='active'").fetchone()[0] == 60 and
       not safety.breaker_check(cfg(), con), "resuming is a person's decision, and counting starts again from then")
