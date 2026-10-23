@@ -885,6 +885,9 @@ def _smtp_deliver(sender, msg):
             s.send_message(msg)
 
 
+UNREAD = {}          # inboxes whose replies weren't read recently: they send nothing this round (set by cmd_run)
+
+
 def send_key(lead, idx, redirect=None):
     """One name per scheduled email: the same lead, step and planned time. A restarted sequence gets new names."""
     return f"lead{lead['id']}-c{lead.get('campaign_id') or 1}-s{idx}-{lead.get('next_send_at') or ''}" + ("-test" if redirect else "")
@@ -1200,6 +1203,8 @@ def _autopilot_round(cfg, con, args, due, for_campaign, usable, capacity, limits
             code = convo.ref_code(con, lead["id"], rc.get("prefix") or "NS")
             if code:
                 full_body += f"\nRef: {code}"
+        if sender["email"].lower() in UNREAD:              # replies first: nothing goes out from this inbox until they're read
+            continue
         p["full_body"] = full_body
         p["to"], p["shown"] = (redirect, f"[TEST for {lead['email']}] {p['subject']}") if redirect else (lead["email"], p["subject"])
         p["key"] = send_key(lead, idx, redirect)
@@ -1318,15 +1323,14 @@ def cmd_run(cfg, con, args):
         import safety
         for line in safety.reconcile(cfg, senders):          # emails cut off by a crash: settled before anything new goes out
             print(line)
+        UNREAD.clear()
         if not args.no_check:
-            unread_now = safety.unread(con, senders)
-            if unread_now:
-                senders = [s for s in senders if s["email"].lower() not in unread_now]
-                shown = list(unread_now.items())[:10]
-                for e, why in shown:
-                    print(f"Inbox {e} waits: {why}.")
-                if len(unread_now) > len(shown):
-                    print(f"...and {len(unread_now) - len(shown)} more inbox(es) wait for their replies to be read.")
+            UNREAD.update(safety.unread(con, senders))       # these inboxes may draft for review, but send nothing yet
+            shown = list(UNREAD.items())[:10]
+            for e, why in shown:
+                print(f"Inbox {e} doesn't send yet: {why}.")
+            if len(UNREAD) > len(shown):
+                print(f"...and {len(UNREAD) - len(shown)} more inbox(es) wait for their replies to be read before sending.")
     if ap_on:                                       # today's limit follows each inbox's reputation
         for s in senders:
             s["daily_limit"], s["limit_why"] = autopilot.limit_for(cfg, con, s)
@@ -1536,6 +1540,8 @@ def cmd_run(cfg, con, args):
 
             if cap_left is not None and sent >= cap_left:
                 break
+            if sender["email"].lower() in UNREAD and not args.dry_run:      # replies first: it sends once they're read
+                continue
             if sent > 0 and not args.dry_run:
                 time.sleep(random.uniform(lo, hi))  # human-ish pacing
             try:
@@ -1670,7 +1676,7 @@ def nurture_tick(cfg, con, senders, redirect):
     for d in con.execute("SELECT o.*, l.email lemail, l.first_msg_id FROM outbox o JOIN leads l ON l.id=o.lead_id "
                          "WHERE o.kind='reconnect' AND o.status='approved'").fetchall():
         sender = by_email.get((d["sender"] or "").lower()) or (senders[0] if senders else None)
-        if not sender:
+        if not sender or sender["email"].lower() in UNREAD:
             continue
         lead = dict(con.execute("SELECT * FROM leads WHERE id=?", (d["lead_id"],)).fetchone())
         if lead["status"] in ("unsubscribed", "bounced") or con.execute("SELECT 1 FROM suppression WHERE email=?", (lead["email"],)).fetchone():
