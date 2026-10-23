@@ -653,11 +653,24 @@ def housekeeping(cfg, con):
     for e in autopilot.auto_resume(cfg, con):
         lines.append(f"Inbox {e} resumed on its own after its pause (half volume for 3 days).")
     senders = [s for s in bot.load_senders(cfg) if s.get("password") and "example" not in s["email"]]
+    todo = []
     for s in senders:
         r = autopilot.rep(con, s["email"])
         if not r["ready"] and (not r["ready_at"] or r["ready_at"] < iso(now_utc() - timedelta(hours=1))):
-            ok, detail = readiness(cfg, con, s)
-            lines.append(f"Readiness check {s['email']}: {detail}")
+            todo.append(s)
+    todo = todo[:40]                                  # a batch per round: hundreds of new inboxes are checked over a few rounds
+    if todo:
+        con.commit()
+        from concurrent.futures import ThreadPoolExecutor
+        def check_one(s):
+            c = bot.db_connect(cfg.get("database", "outreach.db"))
+            try:
+                return s["email"], readiness(cfg, c, s)
+            finally:
+                c.close()
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for e, (ok, detail) in ex.map(check_one, todo):
+                lines.append(f"Readiness check {e}: {detail}")
     ap = autopilot.conf(cfg)
     now = _owner_now(cfg)
     if now.hour >= int(ap["alert_hour"]) and not _done_today(con, "daily_rating"):

@@ -136,7 +136,8 @@ lines = "\n".join(f"bulk{i}@getneosofttech.com, Bulk {i}, pw{i}" for i in range(
 r = w.post("/settings/inboxes/bulk", data={"lines": lines, "smtp_host": "mail.getneosofttech.com", "smtp_port": "465", "imap_host": "mail.getneosofttech.com",
                                            "daily_limit": "15", "ramp": "on"}, follow_redirects=True)
 snd = crm.cfg()["senders"]
-check(len(snd) == 15 and "Added 12 inbox" in r.get_data(as_text=True) and "already added" in r.get_data(as_text=True), "12 inboxes added in one go; duplicates and bad lines reported")
+check(len(snd) == 15 and "Added 12 inbox" in r.get_data(as_text=True) and "updated 1" in r.get_data(as_text=True) and "expected email" in r.get_data(as_text=True),
+      "12 inboxes added in one go; an existing one is updated; bad lines reported")
 check(bot.env(snd[-1]["password_env"]) == "pw12" and snd[-1]["ramp_from"] == date.today().isoformat() and len({s["password_env"] for s in snd}) == 15,
       "each new inbox has its own encrypted password and ramps up")
 page = w.get("/settings?tab=inbox").get_data(as_text=True)

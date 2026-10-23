@@ -817,7 +817,12 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
 {% if tab == 'inbox' %}
 <div class="card"><div class="card-h"><h2>Email inboxes</h2>{% if live %}<span class="badge {{ 'b-ok' if live.live == live.total else '' }}" title="Replies are read the moment they arrive">⚡ Live replies: {{ live.live }} of {{ live.total }} inboxes</span>{% endif %}</div><div class="card-b">
 <p class="muted" style="margin-top:0">The addresses your emails are sent from. One is enough to start; add up to {{ max_inboxes }} (choose which ones each campaign uses on its page). Use your <b>outreach domains</b>, not your main company inbox. To add many at once, use <a href="#bulk">Add several inboxes</a> below.</p>
-<form method="post" action="{{ url_for('save_inbox') }}">
+{% if inbox_table %}<p><b>{{ inbox_table|length }} inboxes</b> on {{ inbox_table|map(attribute='domain')|unique|list|length }} domain(s). With this many, add, update and remove them in bulk below (or from the Master Console → BSO setup).</p>
+<div class="scroll" style="max-height:420px"><table class="tbl"><thead><tr><th>Inbox</th><th>Name</th><th class="r">Per day</th><th>Password</th><th>Status</th></tr></thead>
+{% for x in inbox_table %}<tr><td>{{ x.email }}</td><td>{{ x.name }}</td><td class="r">{{ x.limit }}</td><td>{{ 'saved' if x.pw else 'missing' }}</td><td>{% if x.paused %}<span class="badge" style="background:#fde1e1;color:#7b1018">paused</span> <form method="post" action="{{ url_for('inbox_resume') }}" style="display:inline"><button class="btn sm" name="email" value="{{ x.email }}">Resume</button></form>{% else %}<span class="muted">ok</span>{% endif %}</td></tr>{% endfor %}</table></div>
+<form method="post" action="{{ url_for('inbox_remove') }}" style="margin-top:10px" onsubmit="return confirm('Remove these inboxes?')"><label>Remove inboxes: one address per line, or <code>@domain.com</code> for every inbox of a domain</label><textarea name="emails" style="min-height:60px"></textarea><button class="btn">Remove</button></form>
+{% endif %}
+{% if inboxes %}<form method="post" action="{{ url_for('save_inbox') }}">
 {% for ib in inboxes %}{% set s = ib.s %}{% set n = ib.n %}
 <fieldset class="ibox" {{ 'data-optional' if n > 1 }}>{% if s.email %}<details {{ 'open' if ib.paused }}><summary style="cursor:pointer"><b>Inbox {{ n }}: {{ s.email }}</b> <span class="muted">{{ s.name }} · {{ ib.today }}/day{% if s.ramp_from and ib.today < (s.daily_limit or 10) %} today (ramping up to {{ s.daily_limit }}){% endif %}{% if ib.campaigns %} · {{ ib.campaigns|join(', ') }}{% endif %}</span>
  {% if ib.paused %}<span class="badge" style="background:#fde1e1;color:#7b1018">paused</span>{% elif ib.pw %}<span class="badge b-ok">saved</span>{% endif %}</summary>
@@ -839,7 +844,7 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <label class="check"><input type="checkbox" name="ramp{{ n }}" {{ 'checked' if s.ramp_from }}> New inbox: ramp up gradually ({{ (c.ramp or {}).start or 5 }}/day, +{{ (c.ramp or {}).per_week or 5 }} each week, up to the limit above){% if s.ramp_from %} <span class="muted">· since {{ s.ramp_from }}</span>{% endif %}</label><input type="hidden" name="ramp_from{{ n }}" value="{{ s.ramp_from or '' }}">
  <button class="btn" name="test" value="{{ n }}" style="margin-top:10px">Save &amp; test connection</button>
 {% if s.email %}</details>{% endif %}</fieldset>{% endfor %}
-<button class="btn brand">Save inboxes</button></form></div></div>
+<button class="btn brand">Save inboxes</button></form>{% endif %}</div></div>
 
 <div class="card" id="health"><div class="card-h"><h2>Sending domain health</h2><span style="flex:1"></span><form method="post" action="{{ url_for('domains_check') }}" style="margin:0"><button class="btn sm">Check now</button></form></div><div class="card-b">
  <p class="muted" style="margin-top:0">SPF, DKIM and DMARC tell receiving servers your emails are genuine; without them more of your emails land in spam. MX lets replies reach you.</p>
@@ -849,8 +854,8 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  {% else %}<p class="muted">Not checked yet. Click <b>Check now</b>.</p>{% endif %}
  <p class="hint">The deliverability guard also pauses an inbox by itself if more than 5% of its last emails bounce (after at least 20) or its login fails 3 times in a row, and tells you. Keep warm-up running in Instantly for every inbox.</p></div></div>
 
-<div class="card" id="bulk"><div class="card-h"><h2>Add several inboxes</h2></div><div class="card-b"><form method="post" action="{{ url_for('inbox_bulk') }}">
- <p class="muted" style="margin-top:0">For inboxes on the same mail server: one per line as <code>email, name, password</code>. Passwords are stored encrypted on this computer.</p>
+<div class="card" id="bulk"><div class="card-h"><h2>Add or update several inboxes</h2></div><div class="card-b"><form method="post" action="{{ url_for('inbox_bulk') }}">
+ <p class="muted" style="margin-top:0">For inboxes on the same mail server: one per line as <code>email, name, password</code> (hundreds at a time is fine). An address that's already there gets the new name and password. Passwords are stored encrypted on this computer.</p>
  <textarea name="lines" style="min-height:120px;font-family:ui-monospace,Menlo,Consolas,monospace" placeholder="maya.hart@getneosofttech.com, Maya Hart, password1&#10;liam.cole@getneosofttech.com, Liam Cole, password2" required></textarea>
  <div class="grid2"><div><label>Sending server (SMTP)</label><input name="smtp_host" placeholder="mail.getneosofttech.com" required></div><div><label>SMTP port</label><input name="smtp_port" type="number" value="465"></div>
  <div><label>Receiving server (IMAP)</label><input name="imap_host" placeholder="mail.getneosofttech.com" required></div><div><label>Emails per day from each</label><input name="daily_limit" type="number" min="1" max="100" value="10"></div></div>

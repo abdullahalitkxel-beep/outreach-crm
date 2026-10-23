@@ -38,6 +38,7 @@ DEFAULTS = {
     "bounce_warn": 0.02, "bounce_red": 0.03, "unsub_warn": 0.01, "unsub_red": 0.02,
     "default_stop_rate": 0.10,
     "spot_supervised": 20, "spot_autonomous": 50,
+    "write_workers": 6, "send_workers": 12, "check_workers": 8, "live_max": 200,
     "supervised_min": 85, "autonomous_min": 60,
 }
 AUTONOMY = ("assisted", "supervised", "autonomous")
@@ -587,8 +588,9 @@ def first_email_hold(cfg, con, lead, c):
 
 # ---------------------------------------------------------------- quality check and autonomy
 
-def quality(cfg, con, ccfg, lead, subject, body):
-    """(score 0-100, [reasons]). Passing means the email may go without a person reading it first."""
+def quality(cfg, con, ccfg, lead, subject, body, ai=True, sender_name=""):
+    """(score 0-100, [reasons]). Passing means the email may go without a person reading it first.
+    The figures check applies to AI-written emails; the owner's own templates are approved text."""
     score, why = 100, []
     hits = bot.find_avoid(ccfg, subject, body)
     if hits:
@@ -617,7 +619,7 @@ def quality(cfg, con, ccfg, lead, subject, body):
     try:
         import writer
         b = writer.brief(ccfg, con, lead.get("campaign_id"))
-        bad = writer.unsupported_facts(body, b)
+        bad = writer.unsupported_facts(body.replace(sender_name, "") if sender_name else body, b) if ai else []
         if bad:
             score -= min(45, 30 * len(bad))
             why.append("figures not in the approved facts: " + ", ".join(bad[:3]))
@@ -737,16 +739,29 @@ def why_not(cfg, con, senders=None):
     paused = bot.guard_paused(con)
     for e, w in paused.items():
         out.append(("paused", f"{e} is paused: {w}"))
-    limits = {}
+    limits, per = {}, []
+    full_n = 0
     for s in senders:
         lim, w = limit_for(cfg, con, s)
         limits[s["email"].lower()] = lim
         if lim == 0 and s["email"].lower() not in paused:
-            out.append(("not ready", f"{s['email']}: {w}"))
+            per.append(("not ready", f"{s['email']}: {w}"))
         elif w != "healthy":
-            out.append(("limit", f"{s['email']}: {lim} a day ({w})"))
+            per.append(("limit", f"{s['email']}: {lim} a day ({w})"))
         if lim and bot.sent_today(con, s["email"], cfg) >= lim:
-            out.append(("limit", f"{s['email']} has sent its {lim} emails for today"))
+            full_n += 1
+            if len(senders) <= 20:
+                per.append(("limit", f"{s['email']} has sent its {lim} emails for today"))
+    if len(per) > 15:                                   # hundreds of inboxes: a summary instead of a line each
+        kinds = {}
+        for k, w in per:
+            kinds.setdefault(k, []).append(w)
+        for k, ws in kinds.items():
+            out.append((k, f"{len(ws)} inboxes {'not ready yet' if k == 'not ready' else 'below their full limit'}, e.g. " + "; ".join(ws[:3])))
+    else:
+        out += per
+    if full_n and len(senders) > 20:
+        out.append(("limit", f"{full_n} of {len(senders)} inboxes have sent their emails for today"))
     allowance = campaign_allowance(cfg, con, limits, senders)
     for c in con.execute("SELECT * FROM campaigns WHERE COALESCE(status,'active')='active'").fetchall():
         st = stock(cfg, con, c, limits, senders, allowance)

@@ -39,6 +39,7 @@ import brand
 import relay
 
 ROLES = ("owner", "manager", "member", "supervisor", "bot")
+MAX_INBOXES = 2000          # inboxes one BSO (the bot) can be set up with
 EVENT_TYPES = ("sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "handover", "handover_in", "prospect_stage", "settings", "app_start", "paused")
 ONLINE_MINUTES = 10
 GRACE_HOURS = 72
@@ -965,7 +966,7 @@ def parse_inbox_lines(text):
             continue
         seen.add(e)
         out.append({"email": e, "name": parts[1], "password": ",".join(parts[2:])})
-    return out[:50], bad
+    return out[:MAX_INBOXES], bad
 
 
 def setup_payload(uid):
@@ -1144,9 +1145,9 @@ def import_inboxes(con, rows, assign_to=None, role_default="member"):
         added = sum(1 for x in g_["inboxes"] if x["email"] not in have)
         for x in g_["inboxes"]:
             have[x["email"]] = x
-        if len(have) > 50:
-            problems.append(f"{u['name']}: only the first 50 inboxes are kept")
-        _secret_store().set(f"SETUP_INBOXES_{u['id']}", json.dumps(list(have.values())[:50]))
+        if len(have) > MAX_INBOXES:
+            problems.append(f"{u['name']}: only the first {MAX_INBOXES} inboxes are kept")
+        _secret_store().set(f"SETUP_INBOXES_{u['id']}", json.dumps(list(have.values())[:MAX_INBOXES]))
         if new_pw:
             deliver_setup_key(con, u["id"], u["username"], new_pw)
         sent = push_setup(con, u["id"])

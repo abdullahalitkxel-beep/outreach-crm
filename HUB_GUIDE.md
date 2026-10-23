@@ -81,6 +81,8 @@ One BSO account, **BSO Bot**, runs cold outreach for every client on one always-
 4. **Master Console → BSO Bot**: add the clients (with their line of business), their sending domains, and choose each campaign's domains, autonomy, arrival window and information answers. A domain belongs to one client only.
 5. Cold inboxes live only on the bot. Supervisors connect only their own mailbox on each client's brand domain (Settings → My mailbox & away).
 
+**Hundreds of inboxes**: the bot takes 10 or 1,000 inboxes on as many domains as you like. Load them with the BSO setup spreadsheet or in bulk (Settings → Email inboxes: add, update or remove hundreds at a time, or a whole @domain). Each round, every inbox that may send writes and sends at the same time as the others (12 at once), still at most one email per inbox per round; replies are read in parallel; the first 200 inboxes keep a live connection for instant replies and the rest are read every 10–15 minutes.
+
 **How it runs**
 - Each inbox's daily limit follows its reputation (bounces, unsubscribes, blocklists, spam-placement tests, SPF/DKIM/DMARC), between 5 and 30. A new inbox (warmed up in Instantly) passes a readiness check, then sends at half volume for 5 working days. Bounce or login pauses resume by themselves after 24 hours at half volume; blocklisting waits for you.
 - First emails arrive between 08:45 and 10:30 in the lead's own time zone, on their working days, skipping public holidays; follow-ups use normal working hours; 6–20 minutes between two emails from one inbox.

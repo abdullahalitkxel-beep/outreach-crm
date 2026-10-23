@@ -107,6 +107,9 @@ jobs:
       - name: Test automatic updates (signature check, staged roll-out, hold, minimum version)
         run: python tests/updater_test.py
 
+      - name: Test hundreds of inboxes on the bot (1000 inboxes, parallel sending and reading)
+        run: python tests/scale_test.py
+
       - name: Test the AI line with thinking models
         run: python tests/llm_test.py
 

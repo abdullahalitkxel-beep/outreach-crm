@@ -14,6 +14,7 @@ import bot
 
 IDLE_SECONDS = 20 * 60          # servers end an idle connection after ~30 min; reconnect before that
 POLL_SECONDS = 120
+LIVE_MAX = 200                  # live (IDLE) connections at most; mail servers and laptops cope well below this
 _threads = {}                   # inbox email -> Watcher
 _lock = threading.Lock()
 _inbox_locks = {}
@@ -141,6 +142,9 @@ def reconcile(config_path, allowed):
     except Exception as e:
         print("watcher:", e)
         return
+    cap = int((cfg.get("autopilot") or {}).get("live_max") or LIVE_MAX) if senders else 0
+    if len(senders) > cap:              # hundreds of inboxes: a live connection for the first ones, the rest are read every few minutes
+        senders = senders[:cap]
     want = {(s["email"].lower(), s.get("imap_host"), s.get("password")): s for s in senders}
     with _lock:
         for email, w in list(_threads.items()):

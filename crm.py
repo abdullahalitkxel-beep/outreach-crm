@@ -1959,7 +1959,8 @@ def test_apollo(key):
         return False, f"Apollo key didn't work: {str(e)[:200]}"
 
 
-MAX_INBOXES = 50
+MAX_INBOXES = 2000          # the BSO Bot can run hundreds of inboxes
+FORM_INBOXES = 30           # up to this many, each inbox has its own form; above it, a table and bulk add / update / remove
 
 
 @app.route("/settings")
@@ -1967,7 +1968,8 @@ def settings():
     c = cfg()
     senders = list(c.get("senders") or [])
     real_n = sum(1 for x in senders if not any(p in (x.get("email") or "") for p in PLACEHOLDERS))
-    while len(senders) < min(MAX_INBOXES, max(3, real_n + 1)):
+    many = real_n > FORM_INBOXES
+    while not many and len(senders) < min(MAX_INBOXES, max(3, real_n + 1)):
         senders.append({})
     from bot import guard_paused, ramp_limit
     paused = guard_paused(db())
@@ -1976,6 +1978,14 @@ def settings():
         for e in json.loads(cp["inboxes"] or "[]"):
             used_by.setdefault(e.lower(), []).append(cp["name"])
     inboxes = []
+    inbox_table = []
+    if many:
+        for s in senders:
+            e = (s.get("email") or "").lower()
+            if e and not any(p in e for p in PLACEHOLDERS):
+                inbox_table.append({"email": s["email"], "name": s.get("name", ""), "domain": e.split("@")[-1], "limit": s.get("daily_limit") or 10,
+                                    "pw": bool(env(s.get("password_env") or "")), "paused": paused.get(e)})
+        senders = []
     for i, s in enumerate(senders[:MAX_INBOXES], 1):
         placeholder = any(p in (s.get("email") or "") for p in PLACEHOLDERS)
         e = (s.get("email") or "").lower()
@@ -1990,7 +2000,7 @@ def settings():
     for st in c.get("sequence") or []:
         vs = st.get("variants") or [{"name": "Variant A", "enabled": True, "subject": st.get("subject", ""), "body": st.get("body", "")}]
         seq.append({"delay_days": st.get("delay_days", 3), "variants": vs})
-    return render("settings.html", c=c, inboxes=inboxes, max_inboxes=MAX_INBOXES, dom_health=dom_health, seq=seq, providers=PROVIDERS, timezones=TIMEZONES,
+    return render("settings.html", c=c, inboxes=inboxes, inbox_table=inbox_table, max_inboxes=MAX_INBOXES, dom_health=dom_health, seq=seq, providers=PROVIDERS, timezones=TIMEZONES,
                   regions=REGIONS, sizes=SIZES, seniorities=SENIORITIES, cf=cf, ac=ac,
                   keys={"ANTHROPIC_API_KEY": mask(env("ANTHROPIC_API_KEY")), "APOLLO_API_KEY": mask(env("APOLLO_API_KEY")),
                         "SLACK_WEBHOOK_URL": mask(env("SLACK_WEBHOOK_URL"))},
@@ -2126,7 +2136,7 @@ def inbox_bulk():
     senders = [x for x in (cfg().get("senders") or []) if x.get("email") and not any(p in x["email"] for p in PLACEHOLDERS)]
     have = {x["email"].lower() for x in senders}
     used = {int(re.sub(r"\D", "", x.get("password_env", "")) or 0) for x in senders}
-    added, errors = 0, []
+    added, updated, errors = 0, 0, []
     for ln, line in enumerate(f.get("lines", "").splitlines(), 1):
         parts = [p.strip() for p in re.split(r"[,;\t]", line) if p.strip()]
         if not parts:
@@ -2135,8 +2145,12 @@ def inbox_bulk():
             errors.append(f"line {ln}: expected email, name, password")
             continue
         email_, name, pw = parts[0].lower(), parts[1], ",".join(parts[2:])
-        if email_ in have:
-            errors.append(f"{email_}: already added")
+        if email_ in have:                      # already there: update its name, password and servers
+            x = next(x for x in senders if x["email"].lower() == email_)
+            x.update(name=name, smtp_host=f.get("smtp_host", "").strip() or x.get("smtp_host"), imap_host=f.get("imap_host", "").strip() or x.get("imap_host"),
+                     smtp_port=int(f.get("smtp_port") or x.get("smtp_port") or 465))
+            set_secret(x["password_env"], pw)
+            updated += 1
             continue
         if len(senders) >= MAX_INBOXES:
             errors.append(f"{email_}: the limit is {MAX_INBOXES} inboxes")
@@ -2150,10 +2164,27 @@ def inbox_bulk():
                         "ramp_from": date.today().isoformat() if f.get("ramp") else None})
         have.add(email_)
         added += 1
-    if added:
+    if added or updated:
         write_settings({"senders": senders})
-    msg = f"Added {added} inbox(es)." + (" Problems: " + "; ".join(errors) if errors else "") + (" Use Save & test on each one to check the login." if added else "")
+    msg = f"Added {added} inbox(es)" + (f", updated {updated}" if updated else "") + "." + (" Problems: " + "; ".join(errors) if errors else "") + (" Use Save & test on each one to check the login." if added else "")
     return redirect(url_for("settings", tab="inbox", result=msg, ok=1 if added and not errors else None))
+
+
+@app.post("/settings/inboxes/remove")
+def inbox_remove():
+    """Remove inboxes (one address per line, or a whole domain as @domain.com). Conversations already under way keep their history."""
+    want = [x.strip().lower() for x in re.split(r"[\s,;]+", request.form.get("emails", "")) if x.strip()]
+    doms = {w[1:] for w in want if w.startswith("@")}
+    emails = {w for w in want if "@" in w and not w.startswith("@")}
+    senders = [x for x in (cfg().get("senders") or []) if x.get("email")]
+    keep = [x for x in senders if x["email"].lower() not in emails and x["email"].lower().split("@")[-1] not in doms]
+    gone = [x for x in senders if x not in keep]
+    if not keep:
+        return redirect(url_for("settings", tab="inbox", result="That would remove every inbox; keep at least one."))
+    for x in gone:
+        set_secret(x["password_env"], "")
+    write_settings({"senders": keep})
+    return redirect(url_for("settings", tab="inbox", result=f"Removed {len(gone)} inbox(es).", ok=1))
 
 
 @app.post("/settings/inboxes/resume")
