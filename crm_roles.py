@@ -86,7 +86,8 @@ def nav(default_nav):
 
 def active_for(endpoint):
     return {"ws_conversations": "ws_conversations", "pipeline": "pipeline", "lead": "ws_conversations" if mode() == "workspace" else "leads",
-            "bot_spot": "botroom", "bot_kill_local": "botroom"}.get(endpoint, endpoint)
+            "bot_spot": "botroom", "bot_kill_local": "botroom", "bot_breaker_resume": "botroom", "save_backup": "botroom",
+            "save_restore": "botroom"}.get(endpoint, endpoint)
 
 
 @app.before_request
@@ -124,6 +125,7 @@ def view_as_set():
     v = request.form.get("view", "full")
     st = team.state()
     st["view_as"] = v if v in ("full", "bot", "workspace") else "full"
+    st["view_as_at"] = time.time()
     st.pop("device_sent", None)                       # tell the console at once: it routes handovers to an owner acting as supervisor
     team.save_state(st)
     try:
@@ -162,7 +164,8 @@ def botroom():
     cap = sum(i["limit"] for i in rp["inboxes"])
     sent = sum(i["sent_today"] for i in rp["inboxes"])
     last = (crm.rows("SELECT * FROM jobs WHERE cmd='run' ORDER BY id DESC LIMIT 1") or [None])[0]
-    return crm.render("botroom.html", rp=rp, cap=cap, sent=sent, last=last, active_on=autopilot.active(c), lands=lambda e: "")
+    return crm.render("botroom.html", rp=rp, cap=cap, sent=sent, last=last, active_on=autopilot.active(c), lands=lambda e: "",
+                      backup_folder=(c.get("backup") or {}).get("folder", ""))
 
 
 @app.post("/bot/kill")
@@ -170,6 +173,43 @@ def bot_kill_local():
     on = request.form.get("on") == "1"
     autopilot.set_kill(crm.db(), on, "stopped on the bot computer")
     return redirect(url_for("botroom", msg="All sending stopped." if on else "Sending starts again at the next tick (within 3 minutes)."))
+
+
+@app.post("/bot/breaker/<int:bid>")
+def bot_breaker_resume(bid):
+    import safety
+    ok = safety.resume_breaker(crm.db(), bid, team.signed_in() or "this computer")
+    return redirect(url_for("botroom", msg="Resumed. Watch its bounces closely for the next 50 emails." if ok else "That pause was already lifted."))
+
+
+@app.post("/bot/backup")
+def save_backup():
+    import safety
+    folder = request.form.get("folder", "").strip().strip('"')
+    if "folder" in request.form:
+        crm.write_settings({"backup": {"folder": folder}})
+    msg = "Backup folder saved."
+    if request.form.get("now"):
+        r = safety.backup(crm.db(), folder=folder or (crm.cfg().get("backup") or {}).get("folder") or None)
+        msg = f"Backup made: {r['detail']}" + (f". Off-laptop copy: {r['offsite_detail']}" if r.get("offsite_detail") else "")
+    return redirect(url_for("botroom", msg=msg))
+
+
+@app.post("/bot/restore")
+def save_restore():
+    import safety
+    if not is_owner() and team.signed_in():
+        return redirect(url_for("botroom", msg="Only the owner can restore a backup."))
+    if request.form.get("confirm", "").strip().upper() != "RESTORE":
+        return redirect(url_for("botroom", msg="Type RESTORE to confirm. Nothing was changed."))
+    path = request.form.get("path", "").strip().strip('"')
+    try:
+        detail = safety.restore(path, now=False)
+    except Exception as e:
+        return redirect(url_for("botroom", msg=f"Not restored: {e}"))
+    autopilot.set_kill(crm.db(), True, "a backup is waiting to be restored: quit BSO and open it again")
+    return redirect(url_for("botroom", msg=f"Backup checked ({detail}). Sending is stopped. Quit BSO (tray icon → Quit) and open it again: "
+                                            "the backup is put in place as it starts. Then press Start sending."))
 
 
 @app.post("/bot/spot/<int:sid>")

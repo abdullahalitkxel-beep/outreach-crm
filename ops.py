@@ -306,6 +306,7 @@ def import_file(cfg, con, name, data, frm=""):
             rejected.append((i, e, reason))
             continue
         row["campaign_id"] = c["id"]
+        row["_batch"] = f"{date.today().isoformat()}-{name[:40]}"          # one imported file = one list for the circuit breaker
         row.setdefault("source", f"emailed by {frm}: {name}" if frm else name)
         why = []
         lid = bot.add_lead(con, row, "active", why)
@@ -700,6 +701,16 @@ def housekeeping(cfg, con):
             collect_seed_results(cfg, con)
         except Exception:
             pass
+    try:
+        import safety
+        if safety.due_backup(con):
+            r = safety.backup(con, folder=(cfg.get("backup") or {}).get("folder") or None)
+            lines.append(f"Backup {r['file']}: {r['detail']}" +
+                         (f"; off-laptop copy: {r['offsite_detail']}" if r.get("offsite_detail") else "; no off-laptop folder set (Settings → Safety)"))
+            if not r["ok"] or r.get("offsite_ok") is False:
+                bot.notify(f"⚠ BSO Bot backup problem: {r['detail']}" + (f" / {r.get('offsite_detail')}" if r.get("offsite_detail") else ""), cfg)
+    except Exception as e:
+        lines.append(f"PROBLEM: daily backup failed ({e}).")
     return lines
 
 
@@ -725,28 +736,46 @@ def info_answer(cfg, con, lead, sender, c, body):
     ccfg = bot.campaign_cfg(cfg, con, c["id"])
     if mode == "template":
         return bot.render(instr, lead, sender, ccfg)
+    import guard
     import writer
-    b = writer.brief(ccfg, con, c["id"])
-    prompt = (f"You are {sender.get('name')} replying by email to a prospect who asked for information.\n"
-              f"Owner's instructions for these answers:\n{instr}\n\n"
-              f"Approved facts you may use (and no others):\nOffer: {b.get('offer')}\nProof points: {'; '.join(b.get('proof_points') or [])}\n\n"
-              f"The prospect ({lead.get('first_name') or ''} at {lead.get('company') or ''}) wrote:\n{bot._without_quotes(body)[:2000]}\n\n"
-              "Write only the reply body: plain text, under 130 words, friendly and direct, answer what they asked, "
-              f"invite one next step, sign off as {sender.get('name')}. No figures that are not in the approved facts.")
-    text = bot.llm(ccfg, "reply", prompt, max_tokens=400)
-    if not text:
+    if guard.injection(body):
         return None
+    b = writer.brief(ccfg, con, c["id"])
+    approved = f"Offer: {b.get('offer')}\nProof points: {'; '.join(b.get('proof_points') or [])}"
+    system = (f"You are {sender.get('name')} answering, by email, a prospect who asked for information.\n"
+              f"Owner's instructions for these answers:\n{instr}\n\n"
+              f"Approved facts you may use (and no others):\n{approved}\n\n"
+              "You may only choose one of these actions and must return only JSON:\n"
+              '{"action": "answer", "reply": "<the email body>"}  when the approved facts and instructions fully answer what they asked;\n'
+              '{"action": "hand_over"}  for anything else: pricing or terms not in the facts, a complaint, a request to change '
+              "anything, an attachment, a meeting time, anything unusual or anything you're unsure about;\n"
+              '{"action": "stop"}  if they ask not to be contacted.\n'
+              "The reply: plain text, under 130 words, friendly and direct, answers what they asked, invites one next step, "
+              f"signs off as {sender.get('name')}. No figures, links, email addresses or phone numbers that are not in the approved facts.\n\n"
+              + guard.SYSTEM_RULE)
+    prompt = (f"The prospect ({lead.get('first_name') or ''} at {lead.get('company') or ''}) wrote:\n"
+              + guard.untrusted(guard.new_text(body), limit=2000))
+    pick = guard.choose(bot.llm(ccfg, "reply", prompt, max_tokens=500, system=system))
+    if pick["action"] != "answer" or not str(pick.get("reply") or "").strip():
+        log.info("Information answer for %s: the AI chose %s; a person answers", lead["email"], pick["action"])
+        return None
+    text = str(pick["reply"]).strip()
     if writer.unsupported_facts(text, b):
         log.warning("Information answer for %s used figures outside the approved facts: handed to a person instead", lead["email"])
         return None
-    return text.strip()
+    problems = guard.check_outgoing(text, approved + "\n" + instr, [sender.get("email", "")], max_words=180)
+    if problems:
+        log.warning("Information answer for %s not sent (%s): handed to a person instead", lead["email"], "; ".join(problems))
+        return None
+    return text
 
 
 def info_reply(cfg, con, lead, sender, msg, body):
     """Answer a simple information request in the same thread. Returns a description, or None to hand over as usual."""
     import convo
     c = bot.campaign_row(con, lead.get("campaign_id") or 1)
-    if not c or (c["info_mode"] or "off") == "off" or not is_info_request(body):
+    import guard
+    if not c or (c["info_mode"] or "off") == "off" or not is_info_request(body) or guard.injection(body):
         return None
     text = info_answer(cfg, con, lead, sender, c, body)
     if not text:
@@ -757,7 +786,8 @@ def info_reply(cfg, con, lead, sender, msg, body):
     subject = subject if subject.lower().startswith("re:") else "Re: " + subject
     to, shown = (redirect, f"[TEST for {lead['email']}] {subject}") if redirect else (parseaddr(msg.get("From", ""))[1] or lead["email"], subject)
     full = text + "\n\n" + bot.render(bot.campaign_cfg(cfg, con, c["id"]).get("footer") or "", lead, sender, cfg)
-    mid = bot.send_email(sender, to, shown, full, msg.get("Message-ID"), headers={"X-BSO-Kind": "info"})
+    mid = bot.send_email(sender, to, shown, full, msg.get("Message-ID"), headers={"X-BSO-Kind": "info"},
+                         key="info-" + (msg.get("Message-ID") or f"{lead['id']}-{bot.iso(now_utc())}").strip()[:200])
     convo.record_sent(con, mid, lead, "info", sender["email"], to, shown, full, test=bool(redirect))
     bot.log_event(con, lead["id"], "info_reply", "answered an information request", sender["email"])
     con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",

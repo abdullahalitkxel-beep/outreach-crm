@@ -822,8 +822,14 @@ def report(cfg, con):
             "intake": [dict(r) for r in con.execute("SELECT at, frm, subject, files, added, rejected, detail FROM intake_log ORDER BY id DESC LIMIT 20")],
             "activity": [dict(r) for r in con.execute("SELECT at, kind, detail FROM auto_log ORDER BY id DESC LIMIT 60")],
             "alerts": [dict(r) for r in con.execute("SELECT at, kind, text FROM alerts ORDER BY id DESC LIMIT 20")],
+            "breakers": _safety().open_breakers(con), "backup": _safety().status(con),
             "queue": [dict(r) for r in con.execute("SELECT l.email, l.next_send_at, c.name campaign FROM leads l LEFT JOIN campaigns c ON c.id=COALESCE(l.campaign_id,1) "
                                                    "WHERE l.status='active' AND l.step=0 AND l.next_send_at>? ORDER BY l.next_send_at LIMIT 30", (iso(now_utc()),))]}
+
+
+def _safety():
+    import safety
+    return safety
 
 
 # ---------------------------------------------------------------- commands from the Master Console
@@ -890,6 +896,10 @@ def apply_command(cfg, con, cmd):
         con.execute("UPDATE spot_checks SET status=?, note=? WHERE id=?", (cmd.get("status") or "ok", cmd.get("note") or "", cmd.get("id")))
         con.commit()
         return "spot check recorded"
+    if kind == "resume_breaker":
+        if not _safety().resume_breaker(con, int(cmd.get("id") or 0), "Master Console"):
+            raise ValueError("That pause was already lifted.")
+        return "safety breaker pause lifted"
     if kind == "resume_inbox":
         con.execute("UPDATE inbox_health SET paused=0, login_failures=0, resumed_at=? WHERE email=?", (iso(now_utc()), str(cmd.get("email", "")).lower()))
         con.commit()

@@ -465,7 +465,8 @@ def return_date(text, today=None):
 def temperature(label, body, lead=None, title="", engaged=0, ai=None, cold_days=90):
     """('hot'|'warm'|'cold'|'closed', score 0-100, reason, check_back date or None)."""
     text = body or ""
-    if label == "unsubscribe" or CLOSED_RE.search(text):
+    import guard
+    if label == "unsubscribe" or guard.stop_reason("", text):           # the same stop rules everywhere, decided in code
         return "closed", 0, "asked not to be contacted", None
     base = {"meeting_request": 80, "interested": 55, "question": 50, "referral": 45, "other": 42, "not_interested": 15,
             "out_of_office": 30}.get(label, 35)

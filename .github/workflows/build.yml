@@ -119,6 +119,12 @@ jobs:
       - name: Test the app doesn't quit while its window is hidden or asleep
         run: python tests/watchdog_test.py
 
+      - name: Test the 200-reply set (stops in code, no AI instructions from replies, keyword sorting floors)
+        run: python tests/reply_eval_test.py
+
+      - name: Test sending safety (no double sends after a crash, replies first, breaker, backups that restore)
+        run: python tests/safety_test.py
+
       - name: Test from source
         run: python tests/smoke_test.py app.py
 
@@ -151,6 +157,8 @@ jobs:
           --hidden-import crm_role_templates
           --hidden-import hub_bot
           --hidden-import updater
+          --hidden-import guard
+          --hidden-import safety
           --hidden-import xlrd
           --hidden-import pypdf
           --collect-submodules holidays

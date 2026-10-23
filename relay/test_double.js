@@ -74,12 +74,20 @@ const DriveApp = {
 };
 
 const ContentService = {
-  MimeType: { JSON: 'application/json' },
+  MimeType: { JSON: 'application/json', TEXT: 'text/plain' },
   createTextOutput: (s) => ({ content: s, setMimeType() { return this; } }),
+};
+const HtmlService = { createHtmlOutput: (s) => ({ content: s, html: true, setTitle() { return this; } }) };
+const ScriptApp = { getService: () => ({ getUrl: () => `http://127.0.0.1:${port}/exec` }) };
+const params = (url, body, type) => {
+  const p = {};
+  new URL(url, 'http://x').searchParams.forEach((v, k) => { p[k] = v; });
+  if ((type || '').includes('x-www-form-urlencoded')) new URLSearchParams(body).forEach((v, k) => { p[k] = v; });
+  return p;
 };
 
 const code = fs.readFileSync(path.join(__dirname, 'Code.gs'), 'utf8').replace('__ADMIN_KEY_HASH__', adminHash);
-const ctx = vm.createContext({ Utilities, PropertiesService, CacheService, LockService, DriveApp, ContentService, JSON, Date, Math, Number, String, Error, parseInt, Object });
+const ctx = vm.createContext({ Utilities, PropertiesService, CacheService, LockService, DriveApp, ContentService, HtmlService, ScriptApp, JSON, Date, Math, Number, String, Error, parseInt, Object });
 vm.runInContext(code, ctx, { filename: 'Code.gs' });
 
 const pending = {};
@@ -89,7 +97,7 @@ http.createServer((req, res) => {
     req.on('data', (d) => { body += d; });
     req.on('end', () => {
       let out;
-      try { out = ctx.doPost({ postData: { contents: body } }).content; } catch (e) { out = JSON.stringify({ error: String(e), code: 500 }); }
+      try { out = ctx.doPost({ postData: { contents: body }, parameter: params(req.url, body, req.headers['content-type']) }).content; } catch (e) { out = JSON.stringify({ error: String(e), code: 500 }); }
       const k = crypto.randomUUID();
       pending[k] = out;
       res.writeHead(302, { Location: `http://127.0.0.1:${port}/echo?k=${k}` });
@@ -101,8 +109,9 @@ http.createServer((req, res) => {
     res.end(pending[k] || '{}');
     delete pending[k];
   } else if (req.method === 'GET' && req.url.startsWith('/exec')) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(ctx.doGet().content);
+    const o = ctx.doGet({ parameter: params(req.url, '', '') });
+    res.writeHead(200, { 'Content-Type': o.html ? 'text/html' : 'application/json' });
+    res.end(o.content);
   } else if (req.url === '/_files') {      // test helper: what is in the Drive folder
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(Object.values(items).filter((i) => !i.trashed).map((i) => ({ kind: i.kind, name: i.name }))));

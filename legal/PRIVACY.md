@@ -86,6 +86,10 @@ It never sends your email passwords, API keys, inbox logins, your lead list, you
 
 The Software checks GitHub (github.com, operated by GitHub, Inc.) for new releases about every 6 hours. The request contains no personal data. It installs only releases signed by BlacSwanken's build system, backs up its database first and keeps the backup on your computer. In team mode it may add BlacSwanken's code-signing certificate to your Windows user's trusted certificates, after Windows asks you to confirm.
 
+## 7b. Unsubscribe links and backups
+
+When your organisation's Google relay is version 5 or later, cold emails sent by the Software include an unsubscribe link to that relay. The link carries a random code, not the recipient's address. When a recipient uses it, the relay stores the code and the time in your organisation's Google Drive; only the computer that sent the email can match the code to an address, and it then stops emailing that person. The Software also keeps backup copies of its database on your computer and, if your organisation chooses a backup folder, a copy sealed with your team's key in that folder.
+
 ## 8. Children
 
 The Software is a business tool and is not intended for anyone under 18.

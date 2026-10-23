@@ -39,6 +39,7 @@ app.jinja_env.globals.update(logo=brand.logo_svg, logo_css=brand.MARK_CSS)
 STATUS_LABELS = {
     "active": "In sequence", "paused": "Paused", "done": "Sequence finished", "replied": "Replied", "nurture": "Nurture (check back later)",
     "not_interested": "Not interested", "unsubscribed": "Unsubscribed", "bounced": "Bounced",
+    "held": "Held (its list was paused by the safety breaker)",
 }
 JOB_LABELS = {"run": "Run bot (draft + send approved + check replies)", "check": "Check replies",
               "apollo-preview": "Preview Apollo searches (free)", "apollo-pull": "Find leads in Apollo"}
@@ -1056,7 +1057,7 @@ def campaign_stats(cid):
     q = lambda sql, *a: one(sql, *a)
     lead_ids = "SELECT id FROM leads WHERE COALESCE(campaign_id,1)=?"
     sent = q(f"SELECT COUNT(*) FROM events WHERE type='sent' AND detail NOT LIKE '%handover%' AND lead_id IN ({lead_ids})", cid)
-    replies = q(f"SELECT COUNT(*) FROM events WHERE type='reply' AND lead_id IN ({lead_ids})", cid)
+    replies = q(f"SELECT COUNT(*) FROM events WHERE type='reply' AND detail!='out_of_office' AND lead_id IN ({lead_ids})", cid)   # auto-replies aren't replies
     good = q(f"SELECT COUNT(*) FROM events WHERE type='reply' AND detail IN ('interested','meeting_request','question','referral') AND lead_id IN ({lead_ids})", cid)
     return {"leads": q("SELECT COUNT(*) FROM leads WHERE COALESCE(campaign_id,1)=?", cid),
             "waiting": q("SELECT COUNT(*) FROM leads WHERE COALESCE(campaign_id,1)=? AND status='active' AND step=0", cid),
@@ -1112,7 +1113,7 @@ def campaign_list(cid, what):
         items = rows(full + f" LIMIT {per} OFFSET {(page - 1) * per}", *(args + largs))
     else:
         cond = {"leads": "1=1", "waiting": "l.status='active' AND l.step=0", "in_sequence": "l.status='active' AND l.step>0",
-                "replies": "l.id IN (SELECT lead_id FROM events WHERE type='reply')",
+                "replies": "l.id IN (SELECT lead_id FROM events WHERE type='reply' AND detail!='out_of_office')",
                 "positive": "l.id IN (SELECT lead_id FROM events WHERE type='reply' AND detail IN ('interested','meeting_request','question','referral'))",
                 "handed": "l.id IN (SELECT lead_id FROM events WHERE type='handover')", "bounces": "l.status='bounced'",
                 "hot": "l.temperature='hot'", "warm": "l.temperature='warm'", "cold": "l.temperature='cold'"}[what]

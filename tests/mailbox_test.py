@@ -67,7 +67,7 @@ check("Thursday 3pm works." in lp and "Great, invite sent." in lp and "Send repl
 check("new reply" not in w.get("/prospects?view=list").get_data(as_text=True), "opening the prospect marks the reply as read")
 
 sent = []
-bot.send_email = lambda s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None: sent.append(
+bot.send_email = lambda s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None: sent.append(
     dict(sender=s["email"], to=to, subject=subject, body=body, in_reply_to=in_reply_to, cc=cc, headers=headers)) or "<new@bso>"
 r = w.post(f"/lead/{lid}/reply", data={"body": "Hi Sarah, confirming Thursday 3pm.", "cc": ""})
 s0 = sent[-1]

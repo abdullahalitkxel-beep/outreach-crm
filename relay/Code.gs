@@ -6,6 +6,10 @@
  * The master console (BSO Master Console on the master's laptop) publishes the user list, limits and approval
  * decisions here, and collects the reported activity.
  *
+ * Version 5: one-click unsubscribe. Cold emails carry a link to this script with a random token (never the address).
+ *   A POST to it (Gmail and Yahoo's unsubscribe button, or the button on the page a click opens) records the token;
+ *   the BSO Bot collects the tokens when it syncs and stops emailing those people. Opening the link only shows the
+ *   button, so mail scanners that open links can't unsubscribe anyone by accident.
  * Version 4: sign-in hardening: lockouts grow with repeated failures (15 min, 1 h, 6 h), failed sign-ins are
  *   counted for the master console, and removed or erased laptops are told so.
  * Version 3: comments with @mentions go straight to each person's queue; supervisors can mark themselves away
@@ -17,14 +21,24 @@
  */
 var ADMIN_KEY_HASH = '__ADMIN_KEY_HASH__';
 var FOLDER_NAME = 'BSO Team Data';
-var RELAY_VERSION = 4;
+var RELAY_VERSION = 5;
+var MAX_UNSUBS = 5000;
+var UNSUB_TOKEN = /^[A-Za-z0-9_-]{16,64}$/;
 var MAX_PULL = 150;
 
-function doGet() {
+function doGet(e) {
+  var u = e && e.parameter ? String(e.parameter.u || '') : '';
+  if (u) return unsubPage_(u, false);
   return out_({ ok: true, product: 'BSO relay', version: RELAY_VERSION });
 }
 
 function doPost(e) {
+  var u = e && e.parameter ? String(e.parameter.u || '') : '';
+  if (u) {                                                   // one-click unsubscribe (RFC 8058) or the page's button
+    var ok = recordUnsub_(u);
+    return ContentService.createTextOutput(ok ? 'You are unsubscribed. You will not receive further emails from us.'
+                                              : 'This unsubscribe link is not valid.').setMimeType(ContentService.MimeType.TEXT);
+  }
   var req;
   try {
     req = JSON.parse(e.postData.contents);
@@ -48,6 +62,56 @@ function doPost(e) {
     if (err && err.code) return out_({ error: err.message, code: err.code });
     return out_({ error: 'Relay error: ' + err, code: 500 });
   }
+}
+
+// ------------------------------------------------------------------ one-click unsubscribe (version 5)
+
+function unsubPage_(u, done) {
+  var safe = UNSUB_TOKEN.test(u) ? u : '';
+  var url = ScriptApp.getService().getUrl();
+  var html = '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<div style="font-family:Arial,sans-serif;max-width:420px;margin:60px auto;padding:0 16px;color:#222">' +
+    (safe ? '<h2 style="font-weight:600">Unsubscribe</h2><p>Click the button to stop receiving emails from us.</p>' +
+            '<form method="post" action="' + url + '?u=' + safe + '" target="_top">' +
+            '<button style="padding:10px 18px;font-size:15px;cursor:pointer">Unsubscribe</button></form>'
+          : '<p>This unsubscribe link is not valid.</p>') + '</div>';
+  return HtmlService.createHtmlOutput(html).setTitle('Unsubscribe');
+}
+
+function recordUnsub_(u) {
+  if (!UNSUB_TOKEN.test(u)) return false;
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    var list = readUnsubs_();
+    for (var i = list.length - 1; i >= 0 && i >= list.length - 500; i--) {
+      if (list[i].t === u) return true;                       // already recorded
+    }
+    list.push({ t: u, at: new Date().toISOString() });
+    if (list.length > MAX_UNSUBS) list = list.slice(list.length - MAX_UNSUBS);
+    var text = JSON.stringify(list);
+    var it = folder_().getFilesByName('unsubs.json');
+    if (it.hasNext()) it.next().setContent(text);
+    else folder_().createFile('unsubs.json', text, 'application/json');
+    return true;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function readUnsubs_() {
+  var it = folder_().getFilesByName('unsubs.json');
+  if (!it.hasNext()) return [];
+  try { return JSON.parse(it.next().getBlob().getDataAsString()) || []; } catch (x) { return []; }
+}
+
+function unsubsSince_(since) {
+  var list = readUnsubs_(), out = [];
+  since = String(since || '');
+  for (var i = 0; i < list.length && out.length < 500; i++) {
+    if (String(list[i].at) > since) out.push(list[i]);
+  }
+  return out;
 }
 
 // ------------------------------------------------------------------ helpers
@@ -259,7 +323,8 @@ function sync_(req) {
     sub_('inbox').createFile(name, JSON.stringify({ user: f.key, at: new Date().toISOString(), data: payload }), 'application/json');
   }
   seen_(f.key, req.version);
-  return { policy: policy_(doc, f.u), decisions: (f.u.decisions || []).concat(readQueue_(f.key)), relay_version: RELAY_VERSION };
+  return { policy: policy_(doc, f.u), decisions: (f.u.decisions || []).concat(readQueue_(f.key)), relay_version: RELAY_VERSION,
+           unsubs: unsubsSince_(req.unsub_since) };   // tokens only: just the laptop that issued one knows the address
 }
 
 // ------------------------------------------------------------------ handovers (version 2)

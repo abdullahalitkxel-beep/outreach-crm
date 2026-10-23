@@ -63,6 +63,12 @@ _sync_lock = threading.Lock()
 
 def save_state(s):
     with _state_lock:                 # background check-ins and the window can save at the same time
+        try:                          # a background save started before the owner changed "Act as" must not undo that choice
+            disk = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
+            if float(disk.get("view_as_at") or 0) > float(s.get("view_as_at") or 0) and s.get("hub") == disk.get("hub"):
+                s = dict(s, view_as=disk.get("view_as"), view_as_at=disk["view_as_at"])
+        except Exception:
+            pass
         tmp = STATE.with_name(f"team.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(s), encoding="utf-8")
         for attempt in range(5):
@@ -1211,8 +1217,8 @@ def _sync(con, version=""):
         if wiping:
             packed.append({"id": "w", "type": "__wiped", "data": {"at": iso(now_utc())}})
         acked = list(s.get("ack", [])) + [f"ho:{x}" for x in s.get("ho_ack", []) if x is not None]
-        code, j = _post(s["hub"], "/api/v1/sync", {"events": packed, "drafts": drafts, "acked": acked, "version": version},
-                        token=env(TOKEN_KEY))
+        code, j = _post(s["hub"], "/api/v1/sync", {"events": packed, "drafts": drafts, "acked": acked, "version": version,
+                                                    "unsub_since": s.get("unsub_since", "")}, token=env(TOKEN_KEY))
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         return False, f"Can't reach the hub ({getattr(e, 'reason', e)})."
     if code == 401:
@@ -1238,6 +1244,16 @@ def _sync(con, version=""):
     s["drafts_sent"] = sorted(set(s.get("drafts_sent", [])) | {d["id"] for d in drafts})[-2000:]
     s["policy"] = j.get("policy") or s.get("policy", {})
     s["relay_version"] = int(j.get("relay_version") or (1 if relay.is_relay(s["hub"]) else 0))
+    unsubs = j.get("unsubs") or []
+    if unsubs:                                            # one-click unsubscribes collected by the relay
+        try:
+            import safety
+            stopped = safety.apply_unsubs(con, unsubs)
+            if stopped:
+                print(f"Unsubscribed by link: {len(stopped)} address(es)")
+            s["unsub_since"] = max(str(u.get("at") or "") for u in unsubs)
+        except Exception as e:
+            print("unsubscribes:", e)
     s["last_ok"] = iso(now_utc())
     if st_now:
         s["status_key"], s["status_at"] = st_now

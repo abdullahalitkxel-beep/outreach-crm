@@ -14,6 +14,9 @@ ROLE_TEMPLATES["botroom.html"] = r"""{% extends 'base.html' %}{% import 'macros.
  <div class="kpi"><small>Waiting in Review</small><b>{{ review_count or 0 }}</b></div>
  <div class="kpi"><small>Last run</small><b style="font-size:16px">{{ (last.finished_at or last.started_at or '')[:16].replace('T', ' ') if last else 'never' }}</b><span class="muted">{{ last.status if last }}</span></div>
 </div>
+{% if rp.breakers %}<div class="card" style="border-color:#c23934"><div class="card-h"><h2>Paused by the safety breaker</h2><span class="muted" style="margin-left:8px">too many bounces, complaints or stop requests; resuming is a person's decision</span></div><table class="tbl">
+{% for k in rp.breakers %}<tr><td>{{ {'campaign': 'Campaign', 'list': 'Imported list', 'restore': 'After a restore'}.get(k.kind, k.kind) }} <b>{{ k.key }}</b></td><td class="muted">{{ k.at[:16].replace('T', ' ') }}</td><td>{{ k.reason }}</td>
+<td><form method="post" action="{{ url_for('bot_breaker_resume', bid=k.id) }}" style="margin:0" onsubmit="return confirm('Resume? Fix the cause first: clean the list, check the email copy.')"><button class="btn sm">Resume</button></form></td></tr>{% endfor %}</table></div>{% endif %}
 <div class="card"><div class="card-h"><h2>Why not more emails today?</h2></div><div class="card-b">{% for k, w in rp.why_not %}<div>• {{ w }}</div>{% else %}<div class="muted">Nothing is holding sending back.</div>{% endfor %}</div></div>
 <div class="card"><div class="card-h"><h2>Campaigns</h2></div><table class="tbl"><tr><th>Campaign</th><th>Client</th><th>Autonomy</th><th class="r">Sent today</th><th class="r">Leads waiting</th><th class="r">New / day</th><th class="r">Days of stock</th></tr>
 {% for c in rp.campaigns %}<tr><td><a href="{{ url_for('campaign', cid=c.id) }}"><b>{{ c.name }}</b></a><br><span class="muted">{{ c.code }} · {{ c.status }}</span>{% if c.suggest %}<br><span class="badge b-warn">{{ c.suggest }}</span>{% endif %}</td><td>{{ c.client or '–' }}</td><td>{{ c.autonomy }}</td><td class="r">{{ c.sent_today }}</td>
@@ -22,6 +25,17 @@ ROLE_TEMPLATES["botroom.html"] = r"""{% extends 'base.html' %}{% import 'macros.
 {% if rp.spot_checks %}<div class="card"><div class="card-h"><h2>Spot checks</h2><span class="muted" style="margin-left:8px">emails the bot sent on its own, for a person to look at</span></div>
 {% for s in rp.spot_checks %}<div class="card-b" style="border-top:1px solid #eee"><b>{{ s.lead_email }}</b> <span class="muted">from {{ s.sender }} · quality {{ s.score }}</span><br><b>{{ s.subject }}</b><pre style="white-space:pre-wrap;font:inherit">{{ s.body }}</pre>
 <form method="post" action="{{ url_for('bot_spot', sid=s.id) }}" style="display:flex;gap:6px"><input name="note" placeholder="Note (optional)"><button class="btn sm" name="status" value="ok">Looks fine</button><button class="btn sm" name="status" value="problem">Problem</button></form></div>{% endfor %}</div>{% endif %}
+<div class="card"><div class="card-h"><h2>Backups</h2></div><div class="card-b">{% set bk = rp.backup or {} %}
+{% if bk %}<div>Last backup {{ bk.at[:16].replace('T', ' ') }} UTC: <span class="badge {{ 'b-ok' if bk.ok else 'b-bad' }}">{{ 'restore test passed' if bk.ok else 'problem' }}</span> <span class="muted">{{ bk.detail }}</span></div>
+<div>Off-laptop copy: {% if bk.offsite_ok %}<span class="badge b-ok">saved</span> <span class="muted">{{ bk.offsite }}</span>{% elif bk.offsite_detail %}<span class="badge b-bad">problem</span> {{ bk.offsite_detail }}{% else %}<span class="badge b-warn">not set up</span>{% endif %}</div>
+{% else %}<div class="muted">The first backup is made at the next run (then once a day).</div>{% endif %}
+<form method="post" action="{{ url_for('save_backup') }}" style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap"><input name="folder" value="{{ backup_folder }}" placeholder="Off-laptop folder, e.g. G:\My Drive\BSO backups" style="flex:1;min-width:260px">
+<button class="btn sm">Save folder</button><button class="btn sm" name="now" value="1">Back up now</button></form>
+<p class="muted" style="margin:6px 0 0">Pick a folder that leaves this laptop, such as one synced by Google Drive for desktop. The copy there is sealed with the team key, so only a BSO signed in to your team can open it.</p>
+{% if is_owner %}<details style="margin-top:8px"><summary>Restore a backup (owner only)</summary><form method="post" action="{{ url_for('save_restore') }}" style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
+<input name="path" placeholder="Full path of a .bsobak or .db backup" style="flex:1;min-width:260px" required><input name="confirm" placeholder="Type RESTORE" style="width:130px" required><button class="btn sm danger">Restore</button></form>
+<p class="muted" style="margin:6px 0 0">The current database is kept aside first. Use this on a replacement laptop (see the dead-laptop runbook).</p></details>{% endif %}
+</div></div>
 <div class="card"><div class="card-h"><h2>Alerts</h2></div><table class="tbl">{% for a in rp.alerts %}<tr><td class="muted">{{ a.at[:16] }}</td><td>{{ a.text }}</td></tr>{% else %}<tr><td class="muted">No alerts sent.</td></tr>{% endfor %}</table></div>
 {% endblock %}"""
 

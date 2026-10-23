@@ -60,7 +60,7 @@ for email_, cid in (("ann@acme.com", 1), ("bob@uk.co", c2["id"]), ("cat@later.co
 con.commit()
 
 sent = []
-def fake_send(s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None):
+def fake_send(s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None):
     if s["email"] in fail_for:
         raise smtplib.SMTPAuthenticationError(535, b"bad login")
     sent.append(dict(frm=s["email"], to=to, subject=subject, body=body))
@@ -113,7 +113,13 @@ for i in range(2):
     bot.log_event(con, 1, "bounce", "", "in2@getneosofttech.com")
 con.commit()
 notes = bot.guard_check(bot.load_config(crm.CONFIG_PATH), con, bot.load_senders(bot.load_config(crm.CONFIG_PATH)))
-check(any("in2@" in x for x in notes) and "in2@getneosofttech.com" in bot.guard_paused(con), "an inbox with 10% bounces is paused automatically")
+check(not notes and "in2@getneosofttech.com" not in bot.guard_paused(con), "2 bounces in 20 emails is too few to judge (it waits for 50)")
+for i in range(30):
+    bot.log_event(con, 1, "sent", "step 1", "in2@getneosofttech.com")
+bot.log_event(con, 1, "bounce", "", "in2@getneosofttech.com")
+con.commit()
+notes = bot.guard_check(bot.load_config(crm.CONFIG_PATH), con, bot.load_senders(bot.load_config(crm.CONFIG_PATH)))
+check(any("in2@" in x for x in notes) and "in2@getneosofttech.com" in bot.guard_paused(con), "an inbox with 6% bounces over 50 emails is paused automatically")
 con.execute("INSERT INTO leads(email, first_name, company, status, step, next_send_at, created_at, campaign_id) VALUES ('eve@x.com','Eve','X','active',0,'2026-01-01','2026-01-01',1)")
 con.commit()
 before = len(sent)

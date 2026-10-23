@@ -157,6 +157,13 @@ def main():
 
     import bot  # sets up the data folder (%APPDATA%\OutreachCRM) on first run
     _ensure_stdio(bot.DATA / "app.log")
+    if not _port_in_use():
+        try:
+            import safety
+            if safety.apply_pending_restore():       # a backup chosen in Status → Backups goes in before anything opens the database
+                print("BSO: restored the chosen backup")
+        except Exception as e:
+            print("restore:", e)
 
     background = "--background" in sys.argv     # started with Windows: no window, just the icon next to the clock
     if _port_in_use():  # already running: just open another window

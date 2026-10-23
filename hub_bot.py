@@ -212,6 +212,12 @@ def bot_resume():
     return redirect(url_for("bot_page", u=uid, msg="The inbox resumes at the bot's next check-in."))
 
 
+def bot_breaker():
+    con, uid = _bot_uid()
+    send_cmd(con, uid, {"cmd": "resume_breaker", "id": request.form.get("id", type=int)})
+    return redirect(url_for("bot_page", u=uid, msg="Resumes at the bot's next check-in."))
+
+
 def bot_template():
     con, uid = _bot_uid()
     rp = json.loads((con.execute("SELECT bot_report FROM users WHERE id=?", (uid,)).fetchone()["bot_report"]) or "{}")
@@ -556,7 +562,7 @@ def client_summary(s):
     return "\n".join(lines)
 
 
-OWNER_ONLY = {"devices_page", "device_action", "updates_save", "bot_kill"}
+OWNER_ONLY = {"devices_page", "device_action", "updates_save", "bot_kill", "bot_breaker"}
 ROUTES = [
     ("/bot", "bot_page", bot_page, ["GET"]),
     ("/bot/kill", "bot_kill", bot_kill, ["POST"]),
@@ -565,6 +571,7 @@ ROUTES = [
     ("/bot/campaign", "bot_campaign", bot_campaign, ["POST"]),
     ("/bot/spot", "bot_spot", bot_spot, ["POST"]),
     ("/bot/resume", "bot_resume", bot_resume, ["POST"]),
+    ("/bot/breaker", "bot_breaker", bot_breaker, ["POST"]),
     ("/bot/template.xlsx", "bot_template", bot_template, ["GET"]),
     ("/devices", "devices_page", devices_page, ["GET"]),
     ("/devices/<int:did>", "device_action", device_action, ["POST"]),
@@ -618,6 +625,13 @@ TEMPLATES["bot.html"] = """{% extends 'base.html' %}{% block title %}BSO Bot{% e
 <td class="r">{{ i.limit }}</td><td class="r">{{ i.sent_today }}</td><td class="muted">{{ i.paused or (i.why if i.ready else i.ready_detail) }}</td><td class="muted">{{ i.seed }}</td>
 <td>{% if i.paused %}<form method="post" action="{{ url_for('bot_resume', u=b.id) }}" style="margin:0">""" + CSRF + """<input type="hidden" name="email" value="{{ i.email }}"><button class="btn">Resume</button></form>{% endif %}</td></tr>
 {% else %}<tr><td colspan="7" class="muted">No inboxes reported yet.</td></tr>{% endfor %}</table></div>
+
+{% if rp.breakers %}<div class="card" style="border-color:#c23934"><div class="card-h"><h2>Paused by the safety breaker</h2><span class="muted" style="margin-left:8px">too many bounces, complaints or stop requests; resuming is your decision</span></div><table>
+{% for k in rp.breakers %}<tr><td>{{ {'campaign': 'Campaign', 'list': 'Imported list', 'restore': 'After a restore'}.get(k.kind, k.kind) }} <b>{{ k.key }}</b></td><td class="muted">{{ k.at[:16] }}</td><td>{{ k.reason }}</td>
+<td><form method="post" action="{{ url_for('bot_breaker', u=b.id) }}" style="margin:0" onsubmit="return confirm('Resume? Fix the cause first (clean the list, check the copy).')">""" + CSRF + """<input type="hidden" name="id" value="{{ k.id }}"><button class="btn">Resume</button></form></td></tr>{% endfor %}</table></div>{% endif %}
+<div class="card"><div class="card-h"><h2>Backups</h2></div><div class="card-b">{% set bk = rp.backup or {} %}{% if bk %}Last backup {{ bk.at[:16] }}: <span class="badge {{ 'b-ok' if bk.ok else 'b-bad' }}">{{ 'restore test passed' if bk.ok else 'problem' }}</span> {{ bk.detail }}<br>
+Off-laptop copy: {% if bk.offsite_ok %}<span class="badge b-ok">saved</span> {{ bk.offsite }}{% elif bk.offsite_detail %}<span class="badge b-bad">problem</span> {{ bk.offsite_detail }}{% else %}<span class="badge b-warn">not set up</span> set a backup folder on the bot (Status → Backups), for example a Google Drive for desktop folder{% endif %}
+{% else %}<span class="muted">No backup reported yet (the bot makes one a day).</span>{% endif %}</div></div>
 
 <div class="card"><div class="card-h"><h2>Spot checks</h2><span class="muted" style="margin-left:8px">emails the bot sent on its own, set aside for a person to look at</span></div>
 {% for s in rp.spot_checks or [] %}<div class="card-b" style="border-top:1px solid #eee"><b>{{ s.lead_email }}</b> <span class="muted">from {{ s.sender }} · quality {{ s.score }} · {{ s.at[:16] }}</span><br><b>{{ s.subject }}</b><pre style="white-space:pre-wrap;font:inherit">{{ s.body }}</pre>

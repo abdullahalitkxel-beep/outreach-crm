@@ -41,7 +41,7 @@ bot.fetch_site_text = lambda url, limit=4000: ""
 # ---- writing from the brief
 replies = []
 calls = []
-def fake_llm(c, key, prompt, max_tokens=200):
+def fake_llm(c, key, prompt, max_tokens=200, **k):
     calls.append(prompt)
     return replies.pop(0) if replies else None
 bot.llm = fake_llm

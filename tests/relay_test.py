@@ -134,6 +134,31 @@ try:
     team.sign_in(con, "ayesha", "new-ayesha-pass")
     check(team.sync(con)[0], "new password works")
 
+    # --- one-click unsubscribe through the relay (version 5)
+    import urllib.request, urllib.parse, safety  # noqa: E401
+    check(team.state().get("relay_version") == 5, "the laptop sees relay version 5")
+    h = safety.unsub_headers(con, "cole@neosoft-mail.com", "l1@acme.com")
+    con.commit()
+    m = re.match(r"<(http[^>]+)>, <mailto:cole@neosoft-mail.com\?subject=unsubscribe>", h["List-Unsubscribe"])
+    check(m and h.get("List-Unsubscribe-Post") == "List-Unsubscribe=One-Click" and "acme" not in h["List-Unsubscribe"],
+          "cold emails carry a one-click link (a random token, not the address) and a mailto: fallback")
+    link = m.group(1)
+    page = urllib.request.urlopen(link, timeout=10).read().decode()
+    check("<form method=\"post\"" in page and "Unsubscribe" in page and not con.execute("SELECT 1 FROM suppression WHERE email='l1@acme.com'").fetchone(),
+          "opening the link only shows a button: a mail scanner that opens links unsubscribes nobody")
+    req = urllib.request.Request(link, data=b"List-Unsubscribe=One-Click", method="POST",
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    out = urllib.request.urlopen(req, timeout=10).read().decode()
+    check("unsubscribed" in out, "Gmail's one-click POST is accepted by the relay")
+    req = urllib.request.Request(URL + "?u=bogus!!", data=b"List-Unsubscribe=One-Click", method="POST",
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    check("not valid" in urllib.request.urlopen(req, timeout=10).read().decode(), "a made-up token is refused")
+    check(team.sync(con)[0] and con.execute("SELECT reason FROM suppression WHERE email='l1@acme.com'").fetchone()[0] == "unsubscribe link"
+          and con.execute("SELECT status FROM leads WHERE email='l1@acme.com'").fetchone()[0] == "unsubscribed",
+          "the next sync stops all email to that person")
+    team.sync(con)
+    check(not con.execute("SELECT 1 FROM suppression WHERE email='l2@acme.com'").fetchone(), "nobody else is affected")
+
     # --- relay unreachable: laptop keeps working within the grace period
     team.built_in_hub = lambda: "http://127.0.0.1:1/exec"
     team.sign_out()
