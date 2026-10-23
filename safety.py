@@ -469,8 +469,19 @@ def _swap_in(tmp):
             a.close()
             b.close()
         for ext in ("-wal", "-shm"):
-            Path(str(live) + ext).unlink(missing_ok=True)
-    os.replace(tmp, live)
+            _retry(lambda: Path(str(live) + ext).unlink(missing_ok=True))
+    _retry(lambda: os.replace(tmp, live))
+
+
+def _retry(fn, tries=10):
+    """Windows: a file another program (an antivirus scan, a closing connection) holds for a moment can't be replaced yet."""
+    for i in range(tries):
+        try:
+            return fn()
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(0.2 * (i + 1))
 
 
 def due_backup(con, hours=6):

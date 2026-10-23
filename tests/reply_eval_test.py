@@ -23,6 +23,15 @@ import bot, guard  # noqa: E402,E401
 n = 0
 
 
+def _crash(t, v, tb):                       # an unexpected error shows up in GitHub's summary, not only in the log
+    import traceback
+    gh_error("".join(traceback.format_exception(t, v, tb)))
+    sys.__excepthook__(t, v, tb)
+
+
+sys.excepthook = _crash
+
+
 def gh_error(text):
     if os.getenv("GITHUB_ACTIONS"):
         print("::error title=reply_eval_test::" + text.replace("%", "%25").replace("\r", "").replace("\n", "%0A")[-3000:], flush=True)

@@ -11,6 +11,11 @@ os.environ["BSO_NO_SIGNIN"] = "1"
 import bot, crm, safety, guard  # noqa: E402,E401
 
 n = 0
+def _crash(t, v, tb):                       # an unexpected error shows up in GitHub's summary, not only in the log
+    import traceback
+    gh_error("".join(traceback.format_exception(t, v, tb)))
+    sys.__excepthook__(t, v, tb)
+sys.excepthook = _crash
 def gh_error(text):
     if os.getenv("GITHUB_ACTIONS"):
         print("::error title=safety_test::" + text.replace("%", "%25").replace("\r", "").replace("\n", "%0A")[-3000:], flush=True)
@@ -261,8 +266,12 @@ p2 = Path(tempfile.mkdtemp()) / "x.db"
 import shutil  # noqa: E402
 shutil.copyfile(bot.DATA / "backups" / local["file"], p2)
 safety.restore(p2, now=False)
-check((bot.DATA / "outreach.restore.db").exists() and safety.apply_pending_restore() and not (bot.DATA / "outreach.restore.db").exists(),
+waiting = (bot.DATA / "outreach.restore.db").exists()
+con.close()                                   # as at a real start: nothing has the database open yet (Windows can't replace an open file)
+bot._migrated.clear()
+check(waiting and safety.apply_pending_restore() and not (bot.DATA / "outreach.restore.db").exists(),
       "a restore chosen in the app waits and goes in when BSO starts again")
+con = bot.db_connect("outreach.db")
 
 # ---------------------------------------------------------------- bounces, auto-replies and the circuit breaker
 check(safety.bounce_kind("Undelivered Mail", "550 5.1.1 <x@y.com>: Recipient address rejected: User unknown") == "hard" and
