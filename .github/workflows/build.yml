@@ -17,6 +17,9 @@ jobs:
       STORE_PUBLISHER: ${{ vars.STORE_PUBLISHER }}
       STORE_PUBLISHER_DISPLAY: ${{ vars.STORE_PUBLISHER_DISPLAY }}
       PYTHONIOENCODING: utf-8
+      CODESIGN_PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
+      CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
+      UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -92,6 +95,18 @@ jobs:
       - name: Test AI writing from the brief and the learning engine
         run: python tests/learning_test.py
 
+      - name: Test the bot's autopilot (clients, domains, limits, arrival windows, stock, quality, kill switch)
+        run: python tests/autopilot_test.py
+
+      - name: Test the lead intake mailbox, template, alerts, digest and information answers
+        run: python tests/intake_test.py
+
+      - name: Test role layouts, the console's BSO Bot page, devices and the Scope room
+        run: python tests/console_bot_test.py
+
+      - name: Test automatic updates (signature check, staged roll-out, hold, minimum version)
+        run: python tests/updater_test.py
+
       - name: Test the AI line with thinking models
         run: python tests/llm_test.py
 
@@ -127,6 +142,17 @@ jobs:
           --hidden-import instantly
           --hidden-import discover
           --hidden-import health
+          --hidden-import autopilot
+          --hidden-import ops
+          --hidden-import crm_roles
+          --hidden-import crm_role_templates
+          --hidden-import hub_bot
+          --hidden-import updater
+          --hidden-import xlrd
+          --hidden-import pypdf
+          --collect-submodules holidays
+          --add-data "update_key.json;."
+          --add-data "assets/bso-publisher.cer;assets"
           --hidden-import waitress
           --hidden-import secretstore
           --hidden-import bs4
@@ -145,6 +171,19 @@ jobs:
           Write-Host "::notice title=File properties::$summary"
           if ($v.CompanyName -notmatch 'BlacSwanken') { throw "Publisher missing from file properties" }
 
+      - name: Sign the program with BlacSwanken's certificate
+        if: env.CODESIGN_PFX_BASE64 != ''
+        shell: pwsh
+        run: |
+          $pfx = "$env:RUNNER_TEMP\cs.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CODESIGN_PFX_BASE64))
+          $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          & $st.FullName sign /f $pfx /p $env:CODESIGN_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 dist\BSO\BSO.exe
+          $rc = $LASTEXITCODE
+          Remove-Item $pfx
+          if ($rc) { throw "signing BSO.exe failed" }
+          Write-Host "::notice title=Code signing::BSO.exe signed by BlacSwanken"
+
       - name: Test the built app
         run: python tests/smoke_test.py dist/BSO/BSO.exe
 
@@ -161,6 +200,29 @@ jobs:
           $pub = python -c "import yaml;c=yaml.safe_load(open('config.yaml',encoding='utf-8'));print((c.get('legal') or {}).get('company_name') or c.get('publisher') or 'BlacSwanken')"
           & $iscc "/DAppVersion=$ver" "/DPublisher=$pub" packaging\installer.iss
           if ($LASTEXITCODE) { throw "Inno Setup failed" }
+
+      - name: Sign the installer, and sign the release for automatic updates
+        shell: pwsh
+        run: |
+          if ($env:CODESIGN_PFX_BASE64) {
+            $pfx = "$env:RUNNER_TEMP\cs.pfx"
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CODESIGN_PFX_BASE64))
+            $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+            & $st.FullName sign /f $pfx /p $env:CODESIGN_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 dist\BSO-Setup.exe
+            $rc = $LASTEXITCODE
+            Remove-Item $pfx
+            if ($rc) { throw "signing BSO-Setup.exe failed" }
+          } else { Write-Host "::warning title=Code signing::CODESIGN_PFX_BASE64 secret not set: the installer is unsigned" }
+          if ($env:UPDATE_SIGNING_KEY) {
+            $key = "$env:RUNNER_TEMP\upd.pem"
+            Set-Content -Path $key -Value $env:UPDATE_SIGNING_KEY -NoNewline
+            openssl dgst -sha256 -sign $key -out dist\BSO-Setup.exe.sig dist\BSO-Setup.exe
+            $rc = $LASTEXITCODE
+            Remove-Item $key
+            if ($rc) { throw "release signature failed" }
+            python -c "import updater,sys; ok=updater.verify(open('dist/BSO-Setup.exe','rb').read(), open('dist/BSO-Setup.exe.sig','rb').read()); print('release signature ok' if ok else 'BAD'); sys.exit(0 if ok else 1)"
+            if ($LASTEXITCODE) { throw "the release signature doesn't match update_key.json" }
+          } else { Write-Host "::warning title=Automatic updates::UPDATE_SIGNING_KEY secret not set: this release isn't signed, so BSOs won't install it automatically" }
 
       - name: Test the installer (install, run, check Windows "Installed apps" entry, uninstall)
         shell: pwsh
@@ -250,6 +312,7 @@ jobs:
           name: BSO-windows
           path: |
             dist/BSO-Setup.exe
+            dist/BSO-Setup.exe.sig
             dist/BSO-Store.msix
 
       - name: Publish release (only after every test passed)
@@ -261,6 +324,9 @@ jobs:
           target_commitish: ${{ github.sha }}
           make_latest: true
           body: |
+            ${{ github.event.head_commit.message }}
+
+            ---
             **BSO-Setup.exe**: install on your PC (per-user, no admin rights needed). Shows the licence agreement and registers BlacSwanken as publisher.
             **BSO-Store.msix**: upload this to Microsoft Partner Center for the Store listing. (It isn't meant to be double-clicked; the Store signs it.)
             **privacy.html, terms.html, acceptable-use.html**: put these on blacswanken.com; the Store listing needs the privacy page's address.
@@ -269,6 +335,7 @@ jobs:
             Your data stays in %APPDATA%\OutreachCRM, so updating keeps everything.
           files: |
             dist/BSO-Setup.exe
+            dist/BSO-Setup.exe.sig
             dist/BSO-Store.msix
             build/legal-site/privacy.html
             build/legal-site/terms.html

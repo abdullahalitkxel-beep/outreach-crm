@@ -205,6 +205,7 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
 <main>
 {% if request.endpoint not in ('welcome', 'signin') %}<nav class="pgnav" aria-label="Page history"><a id="nav-back" class="pgbtn" href="#" title="Back (Alt + Left arrow)" style="display:none"><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg><span></span></a><a id="nav-fwd" class="pgbtn" href="#" title="Forward (Alt + Right arrow)" style="display:none"><span></span><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M4 11h12.2l-5.6-5.6L12 4l8 8-8 8-1.4-1.4 5.6-5.6H4z"/></svg></a></nav>{% endif %}
 {% if request.args.get('msg') %}<div class="toast {{ 'err' if request.args.get('err') }}">{{ request.args.get('msg') }}</div>{% endif %}
+{% if update and update.available and update.allowed and request.endpoint != 'settings' %}<div class="help" style="display:flex;gap:10px;align-items:center;margin-bottom:10px"><span>⬆ BSO {{ update.latest }} is available.</span><a href="{{ url_for('settings', tab='updates') }}">What's new</a><form method="post" action="{{ url_for('updates_page') }}" style="margin:0"><button class="btn sm brand" name="action" value="now">Update now</button> <button class="btn sm" name="action" value="tonight">Tonight</button></form></div>{% endif %}
 {% block body %}{% endblock %}
 </main>
 <div id="tour-dim"><div id="tour-spot"></div><div id="tour-pop"><h3></h3><p></p><div class="ft"><span></span>
@@ -809,7 +810,7 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
 {% call m.header('t-setup', '⚙', 'Settings', 'Set up your outreach') %}<a class="btn" href="{{ url_for('setup') }}">Getting Started checklist</a>{% endcall %}
 {% if result %}<div class="toast {{ '' if ok else 'err' }}">{{ result }}</div>{% endif %}
 <div class="settings">
-<nav class="snav">{% for k, lbl, n in [('inbox','Email inboxes','1'),('safety','Safety & automation','2'),('keys','AI & Apollo keys','3'),('emails','Your offer & emails','4'),('targeting','Lead targeting','5'),('schedule','Sending schedule','6'),('handover','Handover','7'),('team','Team','8')] %}
+<nav class="snav">{% for k, lbl, n in settings_tabs %}
  <a href="{{ url_for('settings', tab=k) }}" class="{{ 'on' if tab == k }}"><span class="sn">{{ n }}</span>{{ lbl }}</a>{% endfor %}</nav>
 <div class="spanel">
 
@@ -1048,7 +1049,7 @@ SETTINGS = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block 
  <p class="hint">Google Workspace / Gmail: smtp.gmail.com port 465, imap.gmail.com, and an <b>App password</b> (Google Account → Security → 2-Step Verification → App passwords). SiteGround: mail.yourdomain.com, ports 465 and 993, your mailbox password.</p>
  <button class="btn brand" style="margin-top:8px">Save &amp; test mailbox</button></form></div></div>
 
-{% elif tab == 'team' %}
+{{SETTINGS_EXTRA}}{% elif tab == 'team' %}
 {% if team.joined and not team.is_bot %}<div class="card" id="signout"><div class="card-h"><h2>Automatic sign-out</h2></div><div class="card-b">
  <form method="post" action="{{ url_for('save_idle') }}" style="display:flex;gap:8px;align-items:end;flex-wrap:wrap"><div><label>Sign me out after this long without using BSO</label>
  <select name="minutes">{% for v, l in [(5,'5 minutes'),(10,'10 minutes'),(15,'15 minutes'),(30,'30 minutes'),(60,'1 hour'),(120,'2 hours'),(240,'4 hours'),(480,'8 hours'),(0,'Never')] %}<option value="{{ v }}" {{ 'selected' if team.idle == v }}>{{ l }}</option>{% endfor %}</select></div>

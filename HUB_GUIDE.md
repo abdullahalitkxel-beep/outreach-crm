@@ -72,17 +72,28 @@ Later changes (a new inbox on the user's page, a new key or schedule in BSO setu
 
 ## Running BSO as a bot (recommended)
 
-Let one BSO run every campaign by itself and make every person a Lead Gen Supervisor:
-1. **Users → Add a user**, role **BSO Bot**. Sign in to BSO with it on the computer that will run the campaigns. It stays signed in after restarts; people's accounts always need their password.
-2. On that computer, in BSO: connect all sending inboxes (Settings → Email inboxes), then Settings → Safety & automation → **Run automatically** and **Start BSO when Windows starts**. While automatic runs are on, BSO keeps Windows awake. On a laptop also set Windows → Settings → System → Power → *Lid close action: Do nothing* (plugged in), and keep it plugged in and online.
-3. **Leads by email**: Settings → Lead targeting → *Leads by email*: choose the intake inbox and who may send files (e.g. omar@blacswanken.com). Email a CSV/Excel file (an Instantly export works) to that inbox; the bot imports it on its next run and replies with what it added.
-4. **More leads without anyone importing them** (BSO → Settings → Lead targeting):
-   - *Referrals*: when a reply says "talk to Sarah, sarah@acme.com", Sarah is added automatically and her first email opens "John suggested I reach out".
-   - *New leads from Instantly*: with your Instantly API key and filters, the bot imports fresh SuperSearch leads whenever fewer than N days of leads are left.
-   - *Find more contacts on the web*: the AI looks for decision-makers whose work email is published online; BSO only adds addresses it can see on the page named, at the company's domain (and verified by Instantly when that key is set).
-5. Add the people as **Lead Gen Supervisors**. Interested prospects go to them in turn.
+One BSO account, **BSO Bot**, runs cold outreach for every client on one always-on laptop. Nobody presses Run; people act only on exceptions. The full rules are in the *BSO Bot: Rules of Engagement* document.
 
-The Master Console's Overview shows a **Bot** card: online, last run, sent and replies today, prospects handed over, leads not yet emailed and days of leads left, with warnings when it hasn't run, a run failed, test mode is still on or leads are running out.
+**Set it up once**
+1. **Users → Add a user**, role **BSO Bot**, approval *The master approves every email*. Load its inboxes with **BSO setup** (spreadsheet), then sign in to BSO with it on the bot laptop. It stays signed in, starts with Windows, keeps Windows awake and checks every 3 minutes. Its screen lock never stops the work.
+2. Laptop: plugged in, sleep *Never*, lid *Do nothing*, BitLocker on, Windows Update active hours 07:00–23:00.
+3. In the bot's BSO, **Lead intake** page: connect the intake mailbox (e.g. leads@blacswanken.com). Only the owner's address is accepted, and only when the mail server confirms it (SPF/DKIM/DMARC).
+4. **Master Console → BSO Bot**: add the clients (with their line of business), their sending domains, and choose each campaign's domains, autonomy, arrival window and information answers. A domain belongs to one client only.
+5. Cold inboxes live only on the bot. Supervisors connect only their own mailbox on each client's brand domain (Settings → My mailbox & away).
+
+**How it runs**
+- Each inbox's daily limit follows its reputation (bounces, unsubscribes, blocklists, spam-placement tests, SPF/DKIM/DMARC), between 5 and 30. A new inbox (warmed up in Instantly) passes a readiness check, then sends at half volume for 5 working days. Bounce or login pauses resume by themselves after 24 hours at half volume; blocklisting waits for you.
+- First emails arrive between 08:45 and 10:30 in the lead's own time zone, on their working days, skipping public holidays; follow-ups use normal working hours; 6–20 minutes between two emails from one inbox.
+- Contact rules: 2 emails a day per recipient domain, one active sequence per company, 3 people per company per 30 days, never two first emails to one person within 7 days, 90 days between clients in the same line of business.
+- Autonomy per campaign: **Assisted** (every email waits for approval), **Supervised** (high-confidence emails go alone, 1 in 20 kept as a spot check), **Autonomous** (everything that passes the quality check, 1 in 50 spot checks).
+- Days of lead stock count the follow-ups owed first. Below 10 days you get an email with the lead template attached (repeated every 2 days, urgent below 3). Reply with the filled file; BSO sends a receipt and a file of rejected rows.
+- 08:00 daily digest; email **STOP ALL** / **START ALL** to the intake mailbox, or use **Stop all sending** on the BSO Bot page. You're emailed if the bot hasn't checked in for 2 hours.
+
+## Clients: the Scope room
+**Clients → New scope**: upload a client's scope document (PDF, Word, email or text). BSO fills a Scope card (every field with the sentence it came from), lists questions for the client, works out the leads, inboxes, time and AI cost the target needs, flags conflicts (LinkedIn or phone steps, consent rules by country, figures to back up), and proposes a campaign. **Approve** sends it to the bot (starting in Assisted). A new version shows what changed; progress against the scope appears on its page. Copy the client summary to confirm what was agreed.
+
+## Devices and updates (owner)
+**Devices** lists every laptop joined with a setup code. A second laptop for the same person waits for your approval. Every BSO checks GitHub every 6 hours and installs only releases signed by BlacSwanken's build system: your BSO first, supervisors 6 hours later, the bot 24 hours later when no email is due. **Hold** stops all updates; a **minimum version** forces an urgent fix. On joining, BSO trusts the BlacSwanken publisher certificate for that Windows user (Windows asks once).
 
 ## Who needs to be online? Nobody, at the same time
 

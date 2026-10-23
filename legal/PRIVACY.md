@@ -72,6 +72,7 @@ Team mode lets a manager oversee a group of people using the Software. Each time
 
 - a record each time you export leads, open the data folder, view a long list of leads, or are refused one of these, with the number of records involved;
 - whether this computer's drive is encrypted (BitLocker or Device encryption), and the idle-lock setting in force.
+- this computer's name, its Windows user name, the Software's version and whether BlacSwanken's publisher certificate is trusted (shown in your organisation's device list).
 
 Your organisation treats all leads and client conversations as company property. With full visibility, the Software sends your organisation the full text of the emails sent and received in each lead's conversation (including To, CC and BCC), lead lists, notes, tasks, reply classifications and run summaries; what was already stored on your computer is sent once for the company archive. If you are a lead gen supervisor, the Software reads your work mailbox's inbox, Sent and Trash folders for conversations with prospects (in any thread, with their other addresses and colleagues), blocks copying a client email to addresses outside the company and the client, and reports such attempts and deleted client emails. These reports are encrypted on your computer with a key only the Software and your organisation's console hold. When the AI features are on, business details of each lead (company, job title, industry, public website text) and reply texts are sent to Anthropic to write emails and sort replies.
 
@@ -80,6 +81,10 @@ Your organisation can also set up the Software for you from its console: the sen
 Your organisation may also add a few "trap" contacts to your lead list. They are not real people; the Software never emails them, and they let your organisation detect if a lead list is copied out. If your account is removed or your laptop disconnected, your organisation can have the Software erase its data (leads, prospects, emails, notes and saved passwords) from your computer at its next check-in, after your leads have been handed over. The Software locks itself after a period without use, set by your organisation.
 
 It never sends your email passwords, API keys, inbox logins, your lead list, your notes, or the text of any other replies. Your BSO sign-in password is sent over an encrypted connection only so it can be checked; only a scrambled (hashed) form of it is stored. The hub can tell the Software to pause sending, apply a daily limit, or approve, edit or reject a draft. Depending on how your organisation set it up, this information passes through and is stored in either a server your organisation runs or your organisation's own Google account (Google Apps Script and Google Drive, under Google's terms). Your organisation is the controller of the data it holds and is responsible for telling you how long it keeps it and for handling your requests about it; BlacSwanken does not host, see or process it. If you stop working with the team, your organisation removes your account; the hub's owner keeps what it already received. Your organisation may have its own policies, and we recommend that it tells you about team monitoring before you join, as the law in many places requires.
+
+## 7a. Updates
+
+The Software checks GitHub (github.com, operated by GitHub, Inc.) for new releases about every 6 hours. The request contains no personal data. It installs only releases signed by BlacSwanken's build system, backs up its database first and keeps the backup on your computer. In team mode it may add BlacSwanken's code-signing certificate to your Windows user's trusted certificates, after Windows asks you to confirm.
 
 ## 8. Children
 

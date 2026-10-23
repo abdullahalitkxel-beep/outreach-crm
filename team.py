@@ -28,7 +28,7 @@ from bot import add_task, DATA, SECRETS, env, log_event, now_utc, iso, set_stage
 
 TOKEN_KEY = "BSO_TEAM_TOKEN"
 STATE = Path(DATA) / "team.json"
-CONSENT_VERSION = "2"
+CONSENT_VERSION = "3"
 SHARED_TYPES = {"sent", "reply", "drafted", "approved", "rejected", "bounce", "error", "handover", "handover_in", "prospect_stage", "deal", "incident", "temperature"}
 PROSPECT_STAGES = ["new", "contacted", "meeting", "met", "proposal", "negotiation", "won", "lost"]
 DISCLOSURE = [
@@ -39,7 +39,10 @@ DISCLOSURE = [
     "their addresses or colleagues) is tracked, including emails sent from other apps. Copying a client email to an address outside the "
     "company and the client is blocked in BSO and reported; deleting a client email is reported (the company keeps its copy).",
     "Your manager can approve, edit or reject drafts, pause your account, set limits, and see when this computer last connected, "
-    "when you export or view large lists, and whether its drive is encrypted.",
+    "when you export or view large lists, and whether its drive is encrypted. The device list shows this computer's name, its Windows "
+    "user name and BSO version; a second computer for the same account waits for your manager's approval.",
+    "BSO updates itself from BlacSwanken's signed releases and, on joining, trusts BlacSwanken's publisher certificate for your Windows "
+    "user (Windows asks you once).",
     "If you leave the team, BSO hands its leads over to your colleagues and then erases its data from this computer.",
     "Never shared: your email passwords, API keys and inbox logins. Everything sent to the company is encrypted on the way.",
 ]
@@ -294,6 +297,12 @@ def sign_in(con, username, password, consent=False, hub=None):
     SIGNED_IN.clear()
     SIGNED_IN.update(user=username, name=pol.get("name", username), bot=pol.get("role") == "bot")
     _PW.update(user=username, pw=password, at=time.time())
+    if not s.get("cert_trusted"):
+        try:
+            import updater                      # BlacSwanken's publisher certificate: signed BSO installers show a verified publisher
+            threading.Thread(target=updater.trust_certificate, daemon=True).start()
+        except Exception as e:
+            print("certificate:", e)
     if first_time or not SECRETS.load().get(SETUP_KEY):
         if first_time:
             restore(con)
@@ -755,6 +764,11 @@ def erase_everything(con):
             sp.write_text(yaml.safe_dump({k: v for k, v in cur.items() if k == "legal_acceptance"}), encoding="utf-8")
     except Exception:
         pass
+    try:
+        import updater
+        updater.untrust_certificate()
+    except Exception:
+        pass
     hub = state().get("hub", "")
     save_state({"hub": hub, "revoked": True, "wiped": iso(now_utc())})
     _PW.clear()
@@ -909,7 +923,30 @@ def _apply_decisions(con, decisions):
             s["sup_as_of"] = d.get("as_of", "")
             if isinstance(d.get("security"), dict):
                 s["security"] = d["security"]
+            if "kill" in d:
+                s["kill"] = d.get("kill") or ""
+            if isinstance(d.get("updates"), dict):
+                s["updates"] = d["updates"]
             save_state(s)
+            continue
+        if action == "bot_cmd":
+            hid = d.get("handover_id")
+            if hid not in state().get("ho_seen", []):
+                cmd = open_team(d.get("cmd")) if isinstance(d.get("cmd"), str) else d.get("cmd")
+                s2 = state()
+                try:
+                    import autopilot
+                    import bot as _bot
+                    res = autopilot.apply_command(_bot.load_config(str(Path(DATA) / "config.yaml")), con, cmd if isinstance(cmd, dict) else {})
+                except Exception as e:
+                    res = f"refused: {e}"
+                s2 = state()
+                s2["cmd_results"] = (s2.get("cmd_results", []) + [{"id": hid, "at": iso(now_utc()), "result": str(res)[:300]}])[-50:]
+                s2["ho_seen"] = (s2.get("ho_seen", []) + [hid])[-1000:]
+                s2["report_due"] = True
+                save_state(s2)
+            if hid:
+                ho_done.append(hid)
             continue
         if action == "strategy":
             if isinstance(d.get("arms"), dict) or d.get("version"):
@@ -1096,6 +1133,25 @@ def _sync(con, version=""):
         except Exception as e:
             print("status:", e)
         packed += st_extra
+        rep_marks = None
+        if is_bot():                                      # the full picture the Master Console mirrors (every 5 minutes or after a change)
+            try:
+                import autopilot
+                import bot as _bot
+                rp = autopilot.report(_bot.load_config(str(Path(DATA) / "config.yaml")), con)
+                rp["cmd_results"] = s.get("cmd_results", [])[-20:]
+                rp["version"] = version or _app_version()
+                rkey = hashlib.sha256(json.dumps({k: v for k, v in rp.items() if k != "at"}, sort_keys=True, default=str).encode()).hexdigest()
+                due_rep = s.get("report_due") or rkey != s.get("report_key") or not s.get("report_at") or \
+                    now_utc() - datetime.fromisoformat(s["report_at"]).astimezone(timezone.utc) > timedelta(minutes=5)
+                if due_rep:
+                    body = seal_team(rp) if _team_key() else None
+                    packed.append({"id": "r", "type": "__botreport", "data": {"box": body} if body else rp})
+                    rep_marks = (iso(now_utc()), rkey)
+            except Exception as e:
+                print("bot report:", e)
+        packed.append({"id": "d", "type": "__device", "data": device_info()}) if not s.get("device_sent") or \
+            s.get("device_sent") < iso(now_utc() - timedelta(hours=6)) else None
         cms = con.execute("SELECT * FROM comments WHERE mine=1 AND synced=0 ORDER BY id LIMIT 50").fetchall()
         def _cm(c):
             d = {"uid": c["uid"], "lead_email": c["lead_email"], "lead_name": c["lead_name"], "company": c["company"], "text": c["text"], "at": c["at"],
@@ -1147,10 +1203,20 @@ def _sync(con, version=""):
         s["revoked"] = True
         save_state(s)
         return False, "Your manager disconnected this laptop. Ask for a new invite."
+    if code == 403 and "approval" in str(j.get("error", "")):
+        s["device_pending"] = True
+        save_state(s)
+        return False, j.get("error")
     if code != 200:
         return False, f"The hub returned an error ({code})."
     s = state() or s
     s.pop("revoked", None)
+    s.pop("device_pending", None)
+    if rep_marks:
+        s["report_at"], s["report_key"] = rep_marks
+        s.pop("report_due", None)
+    if any(p.get("type") == "__device" for p in packed):
+        s["device_sent"] = iso(now_utc())
     if events:
         s["last_event_id"] = events[-1]["id"]
     s["drafts_sent"] = sorted(set(s.get("drafts_sent", [])) | {d["id"] for d in drafts})[-2000:]
@@ -1206,6 +1272,8 @@ def gate(con, version=""):
     s, p = state(), policy()
     if s.get("revoked"):
         return False, "Your manager disconnected this laptop from the team. Open Settings → Team.", 0
+    if s.get("device_pending"):
+        return False, "This laptop is waiting for your manager's approval (Master Console → Devices).", 0
     if not p.get("enabled", True):
         return False, p.get("message") or "Your account is paused by your manager.", 0
     grace = int(p.get("grace_hours", 72) or 0)
@@ -1217,6 +1285,27 @@ def gate(con, version=""):
         except Exception:
             pass
     return True, "", int(p.get("daily_cap") or 0)
+
+
+def device_info():
+    """What the Master Console shows in its device list."""
+    import getpass
+    import platform
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = ""
+    return {"device": os.getenv("COMPUTERNAME") or socket.gethostname(), "windows_user": user, "os": platform.platform()[:80],
+            "disk_encrypted": disk_encrypted_cached(), "version": _app_version(), "at": iso(now_utc()),
+            "cert_trusted": state().get("cert_trusted")}
+
+
+def _app_version():
+    try:
+        import legal
+        return legal.app_version()
+    except Exception:
+        return ""
 
 
 def sent_today_total(con):

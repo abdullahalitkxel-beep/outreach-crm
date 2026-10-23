@@ -9,3 +9,6 @@ tzdata
 pystray
 pillow
 waitress
+holidays
+xlrd
+pypdf

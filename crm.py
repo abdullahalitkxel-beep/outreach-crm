@@ -263,6 +263,14 @@ def render(name, **ctx):
         nav.insert(1, ("prospects", "My prospects", fresh or None))
     active = {"lead": "leads", "new_lead": "leads", "import_page": "leads", "account": "accounts",
               "opp": "opportunities", "job": "setup", "jobs": "setup"}.get(request.endpoint, request.endpoint)
+    import crm_roles
+    if crm_roles.mode() != "full":
+        nav = crm_roles.nav(nav)
+        active = crm_roles.active_for(request.endpoint)
+        if crm_roles.mode() == "bot" and request.endpoint in ("job", "jobs"):
+            active = "bot_activity"
+    for k, v in crm_roles.ctx().items():
+        ctx.setdefault(k, v)
     ctx.setdefault("all_campaigns", rows("SELECT id, name, status FROM campaigns ORDER BY id"))
     return app.jinja_env.get_template(name).render(
         request=request, url_for=url_for, money=money, today=today(), status_labels=STATUS_LABELS,
@@ -1296,7 +1304,7 @@ def prospects():
             d["age"] = 0
     owned = {d["email"] for d in data}
     mentions = [m for m in rows("SELECT * FROM comments WHERE seen=0 AND mine=0 ORDER BY at DESC") if m["lead_email"] not in owned]
-    view = request.args.get("view") or "board"
+    view = getattr(g, "force_view", None) or request.args.get("view") or "board"
     return render("prospects.html", items=data, labels=PROSPECT_LABELS, counts=counts, mailbox_ok=bool(mailbox.conf(cfg())),
                   unseen_total=sum(d["unseen"] for d in data), view=view, mentions=mentions, away=team.state().get("away_until", ""))
 
@@ -1603,7 +1611,8 @@ def start_job(con, cmd, max_leads=None):
         return running["id"], True
     c = cfg()
     tm = c.get("test_mode") or {}
-    argv = bot_argv(cmd, max_leads, force=bool(tm.get("enabled") and tm.get("redirect_to")))
+    import autopilot
+    argv = bot_argv(cmd, max_leads, force=bool(tm.get("enabled") and tm.get("redirect_to")) and not autopilot.active(c))
     job_id = con.execute("INSERT INTO jobs(cmd, args, status, output, started_at) VALUES (?,?,?,?,?)",
                          (cmd, " ".join(argv[-4:]), "running", "", iso(now_utc()))).lastrowid
     con.commit()
@@ -1677,21 +1686,31 @@ def _autorun_loop():
     import time as _t
     last = 0.0
     awake = None
+    import autopilot
+    startup_checked = False
     while True:
         _t.sleep(30)
         try:
-            want = bool((load_config(CONFIG_PATH).get("autorun") or {}).get("enabled"))
+            c0 = load_config(CONFIG_PATH)
+            want = bool((c0.get("autorun") or {}).get("enabled")) or autopilot.active(c0)
             if want != awake:
                 keep_awake(want)
                 awake = want
+            if not startup_checked and autopilot.active(c0) and startup_supported():
+                startup_checked = True
+                if not startup_enabled():
+                    set_startup(True)          # the bot starts with Windows
         except Exception as e:
             print("keep awake:", e)
         try:
             if team.required() and not team.signed_in():
                 continue          # nothing runs until someone has signed in
             c = load_config(CONFIG_PATH)
+            on = bool((c.get("autorun") or {}).get("enabled"))
             minutes = int((c.get("autorun") or {}).get("every_minutes") or 0)
-            if (c.get("autorun") or {}).get("enabled") and minutes and _t.time() - last >= minutes * 60:
+            if autopilot.active(c):          # the bot: continuous, every few minutes, no Run button
+                on, minutes = True, int(autopilot.conf(c)["tick_minutes"])
+            if on and minutes and _t.time() - last >= minutes * 60:
                 con = db_connect(c.get("database", "outreach.db"))
                 with app.app_context():
                     start_job(con, "run")
@@ -2373,6 +2392,8 @@ def setup():
     next_idx = next((i for i, s in enumerate(steps) if not s["ok"]), len(steps))
     return render("setup.html", steps=steps, done=sum(s["ok"] for s in steps), next_idx=next_idx)
 
+
+import crm_roles  # noqa: E402,F401  (role layouts: the bot's control room and the supervisor's workspace)
 
 # ----------------------------------------------------------------
 

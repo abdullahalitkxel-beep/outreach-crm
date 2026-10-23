@@ -246,7 +246,7 @@ r = w.post("/signin", data={"username": "ayesha", "password": "nope", "consent":
 check(b"wrong" in r.data, "wrong password shows an error")
 r = w.post("/signin", data={"username": "ayesha", "password": "brand-new-pass-1", "consent": "1", "next": "/leads"})
 check(r.status_code == 302 and w.get("/leads").status_code == 200, "signing in opens the CRM")
-check(b"Signed in as" in w.get("/").data, "app shows who is signed in")
+check(b"Signed in as" in w.get("/", follow_redirects=True).data, "app shows who is signed in")
 w.post("/signout")
 check(w.get("/leads").status_code == 302, "sign-out locks the CRM again")
 

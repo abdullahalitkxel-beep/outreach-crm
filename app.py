@@ -177,6 +177,11 @@ def main():
     except Exception as e:
         print("reply watcher:", e)
     threading.Thread(target=crm._mailbox_loop, daemon=True).start()
+    try:
+        import updater                       # new versions from GitHub, signed by BlacSwanken's build system
+        updater.loop(lambda: None if crm.LAST_ACTIVE["t"] is None else (time.time() - crm.LAST_ACTIVE["t"]) / 60)
+    except Exception as e:
+        print("updater:", e)
     threading.Thread(target=watchdog, args=(crm, tray_ref), daemon=True).start()
     server = threading.Thread(target=lambda: crm.app.run(host="127.0.0.1", port=PORT, threaded=True, use_reloader=False),
                               daemon=True)

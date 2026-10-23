@@ -163,6 +163,8 @@ def init_db():
             con.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
     import vis as _vis
     _vis.ensure(con)
+    import hub_bot
+    hub_bot.ensure(con)
     con.row_factory = sqlite3.Row
     try:            # the console's key pair, for the sealed reports from every BSO (made once, ~2 seconds)
         _vis.keypair(_secret_store(), lambda k, d=None: _m_get(con, k, d), lambda k, v: _m_set(con, k, v))
@@ -1907,9 +1909,14 @@ def api_login():
     throttle_clear(k1)
     token = secrets.token_urlsafe(32)
     device = str(j.get("device", "laptop"))[:80]
+    prior = db().execute("SELECT approved FROM devices WHERE user_id=? AND name=? ORDER BY id DESC LIMIT 1", (u["id"], device)).fetchone()
+    others = db().execute("SELECT COUNT(*) FROM devices WHERE user_id=? AND name!=? AND revoked=0 AND approved=1", (u["id"], device)).fetchone()[0]
+    approved = 1 if (prior and prior["approved"]) or not others or meta_get("device_approval", "1") != "1" else 0
     db().execute("UPDATE devices SET revoked=1 WHERE user_id=? AND name=? AND revoked=0", (u["id"], device))
-    db().execute("INSERT INTO devices(user_id, token_hash, name, created_at, last_seen) VALUES(?,?,?,?,?)",
-                 (u["id"], sha(token), device, iso(), iso()))
+    db().execute("INSERT INTO devices(user_id, token_hash, name, created_at, last_seen, approved) VALUES(?,?,?,?,?,?)",
+                 (u["id"], sha(token), device, iso(), iso(), approved))
+    if not approved:
+        audit("device_waiting", f"{u['username']} / {device}: a second laptop waits for approval")
     if u["status"] == "invited":
         db().execute("UPDATE users SET status='active' WHERE id=?", (u["id"],))
     db().commit()
@@ -1922,7 +1929,10 @@ def api_login():
 def ingest(con, uid, j):
     """Store one report from a team laptop (events, drafts awaiting approval, delivered decisions). Returns events accepted."""
     n_ev = 0
+    import hub_bot
     for e in (j.get("events") or [])[:600]:
+        if hub_bot.ingest_extra(con, uid, e):
+            continue
         if isinstance(e, dict) and e.get("type") == "__handover":
             store_handover(con, uid, e.get("data") or {})
             continue
@@ -2258,7 +2268,9 @@ def supervisor_config(con):
     last = con.execute("SELECT MAX(at) FROM handovers").fetchone()[0] or ""
     ppl = [{"key": relay_key_for(u["username"] or u["email"]), "name": u["name"], "role": u["role"]}
            for u in con.execute("SELECT * FROM users WHERE status NOT IN ('disabled','removed','removing') AND role!='bot' ORDER BY name").fetchall()]
-    return {"action": "config", "local_id": None, "supervisors": sups, "people": ppl, "as_of": last, "security": security_cfg(con)}
+    import hub_bot
+    return dict({"action": "config", "local_id": None, "supervisors": sups, "people": ppl, "as_of": last, "security": security_cfg(con)},
+                **hub_bot.config_extra(con))
 
 
 SECURITY_DEFAULTS = {"idle_minutes": 15, "reauth_days": 7, "export_roles": "owner,manager", "big_list": 500, "canary_domain": "",
@@ -2333,6 +2345,10 @@ def api_sync():
     u, dev = api_user()
     if not u:
         return jsonify(error="unauthorized"), 401
+    if dev and "approved" in dev and not dev["approved"]:
+        db().execute("UPDATE devices SET last_seen=? WHERE id=?", (iso(), dev["id"]))
+        db().commit()
+        return jsonify(error="This laptop is waiting for your manager's approval (Master Console → Devices)."), 403
     j = request.get_json(silent=True) or {}
     con = db()
     n_ev = ingest(con, u["id"], j)
@@ -2479,6 +2495,11 @@ def _relay_loop():
                 if time.time() - last_watch > 1800:
                     last_watch = time.time()
                     canary_watch(con)
+                try:
+                    import hub_bot
+                    hub_bot.watch(con)
+                except Exception as e:
+                    print("bot watch:", e)
             finally:
                 con.close()
         except Exception as e:
@@ -2537,7 +2558,7 @@ BASE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name=
 <title>{% block title %}Master console{% endblock %} · BSO</title><style>""" + CSS + """{{ logo_css|safe }}</style></head><body>
 {% if me %}<div class="top">{{ logo(30, tile=True, uid='tp', weight='b', label='BSO')|safe }}<b>BSO Master console</b><small>{{ org }}</small><span class="sp"></span>
 <small>{{ me.name }} · {{ me.role }}</small><a href="{{ url_for('twofa') }}" style="color:#b9c3c9;font-size:12px">2-step sign-in</a><form method="post" action="{{ url_for('logout') }}" style="margin:0"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" style="padding:4px 10px">Sign out</button></form></div>
-<div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('conversations','Conversations','conversations'),('insights','Insights','insights'),('users','Users','users'),('approvals','Approvals','approvals'),('board','Prospect board','board'),('handovers','Handovers','handovers_page'),('activity','Activity','activity')] + ([('bso_setup','BSO setup','bso_setup'),('security','Security','security_page'),('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
+<div class="nav">{% for k, l, ep in [('dashboard','Overview','dashboard'),('conversations','Conversations','conversations'),('insights','Insights','insights'),('users','Users','users'),('approvals','Approvals','approvals'),('board','Prospect board','board'),('handovers','Handovers','handovers_page'),('activity','Activity','activity'),('bot','BSO Bot','bot_page'),('clients','Clients','scope_list')] + ([('bso_setup','BSO setup','bso_setup'),('devices','Devices','devices_page'),('security','Security','security_page'),('audit','Audit log','audit_page'),('settings','Settings','hub_settings')] if me.role == 'owner' else []) %}<a class="{{ 'on' if tab == k }}" href="{{ url_for(ep) }}">{{ l }}</a>{% endfor %}</div>{% endif %}
 <div class="wrap">{% if me %}<nav class="pgnav" style="display:flex;align-items:center;gap:8px;margin:0 0 12px;min-height:32px" aria-label="Page history"><a id="nav-back" class="pgbtn" href="#" title="Back (Alt + Left arrow)" style="display:none"><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg><span></span></a><a id="nav-fwd" class="pgbtn" href="#" title="Forward (Alt + Right arrow)" style="display:none"><span></span><svg width="14" height="14" viewBox="0 0 24 24" style="fill:currentColor;flex:none"><path d="M4 11h12.2l-5.6-5.6L12 4l8 8-8 8-1.4-1.4 5.6-5.6H4z"/></svg></a></nav>{% endif %}{% if request.args.get('err') %}<div class="err">{{ request.args.get('err') }}</div>{% endif %}{% if request.args.get('ok') %}<div class="note">{{ request.args.get('ok') }}</div>{% endif %}{% block body %}{% endblock %}</div><script src="/hub.js"></script><script>(function(){ /* back / forward through the pages opened in this window, each labelled with the page's name */
  var name=(document.title||'').split(' · ')[0].trim()||'Page', here=location.pathname+location.search, t={l:[],i:-1};
  try{ t=JSON.parse(sessionStorage.getItem('bso_hist')||'') || t; }catch(e){}
@@ -2936,6 +2957,10 @@ app.jinja_loader = DictLoader(T)
 
 
 # ---------------------------------------------------------------------------------------------- run
+
+import hub_bot as _hub_bot  # noqa: E402  (the BSO Bot, Devices and Clients pages)
+_hub_bot.install(sys.modules[__name__])
+
 
 def prepare(data=None):
     """Create the database, the secret key and (until an owner exists) the one-time setup key."""

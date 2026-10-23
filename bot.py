@@ -281,6 +281,8 @@ def db_connect(path):
         convo.ensure(con, _add_column)
         import report
         report.ensure(con, _add_column)
+        import autopilot
+        autopilot.ensure(con, _add_column)
         con.execute("CREATE INDEX IF NOT EXISTS sent_log_email ON sent_log(lead_email)")
         _test_triggers(con)
         con.commit()
@@ -949,7 +951,52 @@ def regenerate_draft(cfg, con, draft_id):
     con.commit()
 
 
+def _swap_sender(body, old, new):
+    """A draft moved to another inbox: sign it with the new inbox's name."""
+    if old.get("name") and new.get("name") and old["name"] != new["name"]:
+        return body.replace(old["name"], new["name"])
+    return body
+
+
+def rebalance_drafts(con, senders, capacity):
+    """Waiting first-email drafts were all assigned to one inbox (older versions): spread them over the inboxes
+    that have room today. Follow-ups stay with their inbox (same thread)."""
+    by = {s["email"].lower(): s for s in senders}
+    queued = {}
+    for d in con.execute("SELECT o.id, o.sender FROM outbox o WHERE o.status IN ('pending','approved') AND o.step=0 ORDER BY o.id").fetchall():
+        queued.setdefault((d["sender"] or "").lower(), []).append(d["id"])
+    room = {e: capacity.get(by[e]["email"], 0) - len(queued.get(e, [])) for e in by}
+    moved = 0
+    for e, ids in queued.items():
+        extra = len(ids) - max(0, capacity.get(by[e]["email"], 0)) if e in by else len(ids)
+        for did in ids[len(ids) - extra:] if extra > 0 else []:
+            d = con.execute("SELECT o.*, l.campaign_id FROM outbox o JOIN leads l ON l.id=o.lead_id WHERE o.id=?", (did,)).fetchone()
+            import autopilot
+            pick = {x["email"].lower() for x in autopilot.campaign_senders(con, campaign_row(con, d["campaign_id"] or 1), senders)}
+            to = max((x for x in by if room.get(x, 0) > 0 and x != e and x in pick), key=lambda x: room[x], default=None)
+            if not to:
+                break
+            old = by.get(e, {"name": ""})
+            con.execute("UPDATE outbox SET sender=?, body=? WHERE id=?", (by[to]["email"], _swap_sender(d["body"], old, by[to]), did))
+            room[to] -= 1
+            moved += 1
+    if moved:
+        con.commit()
+    return moved
+
+
+def pick_draft_sender(lead, senders, capacity, queued):
+    """For a new draft: the inbox with the most room left today once the drafts already waiting for it are counted."""
+    if lead.get("sender"):
+        return next((s for s in senders if s["email"] == lead["sender"]), None)
+    room = {s["email"]: capacity.get(s["email"], 0) - queued.get(s["email"].lower(), 0) for s in senders}
+    open_ = [s for s in senders if room[s["email"]] > 0]
+    return max(open_, key=lambda s: room[s["email"]]) if open_ else None
+
+
 def cmd_run(cfg, con, args):
+    import autopilot
+    import convo
     lg_ver = str((cfg.get("legal") or {}).get("version", "1.0"))
     if str((cfg.get("legal_acceptance") or {}).get("version")) != lg_ver and not args.dry_run:
         print("PROBLEM: Open BSO and accept the Terms of Use first.")
@@ -958,15 +1005,35 @@ def cmd_run(cfg, con, args):
     team_mod = None
     if not args.dry_run:
         import team as team_mod
+        if team_mod.joined() and not team_mod.is_bot() and (team_mod.policy() or {}).get("role"):
+            print("Cold email is sent only by the BSO Bot. This BSO handles your own prospects and conversations; "
+                  "the cold inboxes belong on the bot (Master Console → BSO setup).")
+            return
         ok, why, team_cap = team_mod.gate(con)
         if not ok:
             print("PROBLEM:", why)
             sys.exit(1)
-    if not args.force and not in_send_window(cfg):
+    ap_on = autopilot.active(cfg) and not args.dry_run
+    if ap_on:
+        try:
+            import ops
+            for line in ops.housekeeping(cfg, con):
+                print(line)
+        except Exception as e:
+            print(f"PROBLEM: housekeeping failed ({e}).")
+        k, kwhy = autopilot.killed(con)
+        if k:
+            print("Sending is stopped. " + kwhy)
+            return
+    elif not args.force and not in_send_window(cfg):
         print("Outside the sending window; nothing sent (use --force to override).")
         return
     if not args.dry_run and not args.no_check:
-        cmd_check(cfg, con, args)
+        last = con.execute("SELECT v FROM app_mode WHERE k='last_check'").fetchone()
+        if not ap_on or args.force or not last or last[0] < iso(now_utc() - timedelta(minutes=15)):
+            cmd_check(cfg, con, args)          # replies arrive live; the full check is a safety net every 15 minutes
+            con.execute("INSERT INTO app_mode(k, v) VALUES ('last_check', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (iso(now_utc()),))
+            con.commit()
 
     growth = []
     if not args.dry_run:
@@ -981,7 +1048,6 @@ def cmd_run(cfg, con, args):
         for g in growth:
             print(g)
 
-    steps = cfg["sequence"]
     senders = [s for s in load_senders(cfg) if s["password"] or args.dry_run]
     guard_notes = [] if args.dry_run else guard_check(cfg, con, senders)
     paused_inboxes = guard_paused(con)
@@ -989,12 +1055,18 @@ def cmd_run(cfg, con, args):
         senders = [s for s in senders if s["email"].lower() not in paused_inboxes]
         for e, why in paused_inboxes.items():
             print(f"Inbox {e} is paused by the deliverability guard: {why}")
+    if ap_on:                                       # today's limit follows each inbox's reputation
+        for s in senders:
+            s["daily_limit"], s["limit_why"] = autopilot.limit_for(cfg, con, s)
+        senders = [s for s in senders if s["daily_limit"] > 0] or senders[:0]
     if not senders:
-        print("No usable sender inboxes (check your .env passwords).")
+        print("No usable sender inboxes (check your inbox passwords, and that each inbox passed its readiness check).")
         return
     capacity = {s["email"]: s["daily_limit"] - sent_today(con, s["email"], cfg) for s in senders}
+    limits = {s["email"].lower(): s["daily_limit"] for s in senders}
 
     review = ((cfg.get("review") or {}).get("enabled", False) or (team_mod and team_mod.holds_approval())) and not args.dry_run
+    master_approves = bool(team_mod and team_mod.holds_approval())
     cap_left = None
     if team_cap:
         cap_left = max(0, team_cap - team_mod.sent_today_total(con))
@@ -1007,11 +1079,16 @@ def cmd_run(cfg, con, args):
         print("test_mode is on but redirect_to is empty; refusing to send.")
         return
 
-    # never queue more drafts than the inboxes can send today
-    queued = con.execute("SELECT COUNT(*) FROM outbox WHERE status IN ('pending','approved')").fetchone()[0]
-    draft_budget = max(0, sum(max(c, 0) for c in capacity.values()) - queued)
+    if not args.dry_run:
+        moved = rebalance_drafts(con, senders, capacity)
+        if moved:
+            print(f"Moved {moved} waiting draft(s) to inboxes with room today, so every inbox sends its share.")
+    queued = {}
+    for r in con.execute("SELECT lower(sender) e, COUNT(*) n FROM outbox WHERE status IN ('pending','approved') GROUP BY lower(sender)"):
+        queued[r["e"]] = r["n"]
+    draft_budget = max(0, sum(max(c, 0) for c in capacity.values()) - sum(queued.values()))
     if cap_left is not None:
-        draft_budget = min(draft_budget, max(0, cap_left - queued))
+        draft_budget = min(draft_budget, max(0, cap_left - sum(queued.values())))
 
     try:                                     # lead scoring from the approved strategy: the most promising new leads go first
         import learn
@@ -1027,20 +1104,38 @@ def cmd_run(cfg, con, args):
         "SELECT l.* FROM leads l LEFT JOIN campaigns c ON c.id=COALESCE(l.campaign_id,1) "
         "WHERE l.status='active' AND l.next_send_at<=? AND COALESCE(c.status,'active')='active' "
         "ORDER BY l.step DESC, COALESCE(l.fit_score, 50) DESC, l.id LIMIT ?",  # running sequences first, then the likeliest new leads; paused campaigns wait
-        (iso(now_utc()), args.limit),
+        (iso(now_utc()), args.limit if not ap_on else max(args.limit, 400)),
     ).fetchall()
-    all_senders, ccache = senders, {}
+    all_senders, ccache, stocks = senders, {}, {}
+    allowance = autopilot.campaign_allowance(cfg, con, limits, all_senders) if ap_on else {}
 
     def for_campaign(cid):
         if cid not in ccache:
-            pick = campaign_inboxes(con, cid)
-            ccache[cid] = (campaign_cfg(cfg, con, cid), [s for s in all_senders if not pick or s["email"].lower() in pick])
+            c = campaign_row(con, cid)
+            if ap_on:
+                pool = autopilot.campaign_senders(con, c, all_senders)
+            else:
+                pick = campaign_inboxes(con, cid)
+                pool = [s for s in all_senders if not pick or s["email"].lower() in pick]
+            ccache[cid] = (campaign_cfg(cfg, con, cid), pool, c)
         return ccache[cid]
 
-    sent = drafted = waiting = failed = 0
+    def usable(s):
+        if capacity.get(s["email"], 0) <= 0:
+            return False
+        if ap_on and not args.force:
+            if not autopilot.gap_ok(con, s["email"]):
+                return False
+            d = con.execute("SELECT cap FROM sending_domains WHERE domain=?", (autopilot.domain_of(s["email"]),)).fetchone()
+            if d and d["cap"] and autopilot.sent_today_domain(con, autopilot.domain_of(s["email"])) >= d["cap"]:
+                return False
+        return True
+
+    sent = drafted = waiting = failed = queued_first = held = 0
     problems = []
     lo, hi = cfg.get("delay_between_sends_seconds", [60, 180])
-    import convo
+    if ap_on:
+        lo, hi = 3, 12                       # different inboxes in turn; each inbox keeps its own 6-20 minute gap
     for row in due:
         lead = dict(row)
         idx = lead["step"]
@@ -1050,55 +1145,105 @@ def cmd_run(cfg, con, args):
             con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",
                         (lead["id"], "Emails paused: this person is part of an open conversation with their company.", iso(now_utc())))
             continue
-        ccfg, senders = for_campaign(lead.get("campaign_id") or 1)
+        cid = lead.get("campaign_id") or 1
+        ccfg, senders, c = for_campaign(cid)
         steps = ccfg["sequence"]
         if not senders:
-            problems.append(f"Campaign {lead.get('campaign_id')}: none of its inboxes can send right now.")
+            problems.append(f"Campaign {c['name'] if c else cid}: none of its inboxes can send right now.")
             continue
         if idx >= len(steps):
             con.execute("UPDATE leads SET status='done' WHERE id=?", (lead["id"],))
             continue
 
-        draft = None
-        if review:
-            draft = con.execute(
-                "SELECT * FROM outbox WHERE lead_id=? AND step=? AND status IN ('pending','approved')",
-                (lead["id"], idx)).fetchone()
-            if not draft:  # write it and wait for a human
-                if draft_budget <= 0:
-                    continue
-                sender = pick_sender(lead, senders, {s["email"]: 1 for s in senders})
-                subject, body, variant = compose(ccfg, con, lead, sender, idx)
-                hits = find_avoid(ccfg, subject, body)
-                if hits:
-                    problems.append(f"Step {idx + 1} email for {lead['email']} uses avoided phrases ({', '.join(hits)}); not drafted. "
-                                    "Edit the template in Settings → Your offer & emails.")
-                    continue
-                con.execute(
-                    "INSERT INTO outbox(lead_id, step, sender, subject, body, status, created_at, variant) "
-                    "VALUES (?,?,?,?,?,'pending',?,?)",
-                    (lead["id"], idx, sender["email"], subject, body, iso(now_utc()), variant))
-                log_event(con, lead["id"], "drafted", f"step {idx + 1}", sender["email"])
-                con.commit()
-                drafted += 1
-                draft_budget -= 1
+        timed = ap_on and not args.force
+        if timed and idx == 0:
+            why, until = autopilot.first_email_hold(cfg, con, lead, c)
+            if why:
+                nxt = autopilot.plan_arrival(cfg, c, lead, until)
+                con.execute("UPDATE leads SET next_send_at=? WHERE id=?", (iso(nxt), lead["id"]))
+                autopilot.note(con, "hold", why.split(" on ")[0] if " on " in why else re.sub(r"\d+", "N", why), lead["id"], cid)
+                print(f"HOLD: {lead['email']}: {why}; next try {iso(nxt)[:16]}")
+                held += 1
                 continue
-            if draft["status"] == "pending":
-                waiting += 1
-                continue
+
+        draft = con.execute("SELECT * FROM outbox WHERE lead_id=? AND step=? AND status IN ('pending','approved')", (lead["id"], idx)).fetchone() \
+            if not args.dry_run else None
+        alone = False
+        if draft and draft["status"] == "pending":
+            waiting += 1
+            continue
+        if draft:                                             # approved: send it, from an inbox with room
             sender = next((s for s in senders if s["email"] == draft["sender"]), None)
-            if not sender or capacity[sender["email"]] <= 0:
+            if idx == 0 and (not sender or not usable(sender)):
+                other = next((s for s in sorted(senders, key=lambda s: -capacity.get(s["email"], 0)) if usable(s)), None)
+                if other:
+                    con.execute("UPDATE outbox SET sender=?, body=? WHERE id=?", (other["email"], _swap_sender(draft["body"], sender or {}, other), draft["id"]))
+                    draft = con.execute("SELECT * FROM outbox WHERE id=?", (draft["id"],)).fetchone()
+                    sender = other
+            if not sender or not usable(sender):
                 continue
             subject, body, variant = draft["subject"], draft["body"], draft["variant"]
+            score = draft["quality"] if "quality" in draft.keys() else None
         else:
-            sender = pick_sender(lead, senders, capacity)
+            will_draft = (master_approves or autopilot.autonomy_of(c) == "assisted") if ap_on else review
+            if timed and not will_draft:                      # it would go straight out: only compose it when it may land
+                if idx == 0 and not autopilot.in_window(cfg, c, lead):
+                    con.execute("UPDATE leads SET next_send_at=? WHERE id=?", (iso(autopilot.plan_arrival(cfg, c, lead)), lead["id"]))
+                    queued_first += 1
+                    continue
+                if idx > 0 and not autopilot.in_hours(cfg, lead):
+                    continue
+                if idx == 0:
+                    if cid not in stocks:
+                        stocks[cid] = autopilot.new_today_quota(autopilot.stock(cfg, con, c, limits, all_senders, allowance))
+                    if autopilot.first_emails_today(con, cid) >= stocks[cid] or autopilot.sent_today_campaign(con, cid) >= allowance.get(cid, 0):
+                        continue
+            if review or ap_on:
+                if will_draft:
+                    pool = [s for s in senders if capacity.get(s["email"], 0) > 0]
+                else:
+                    pool = [s for s in senders if usable(s)]
+                sender = pick_draft_sender(lead, pool if not lead.get("sender") else senders, capacity, queued)
+                if lead.get("sender") and sender and ap_on and not will_draft and not usable(sender):
+                    continue                                   # the follow-up's inbox is resting or full: next tick
+            else:
+                sender = pick_sender(lead, senders, capacity)
             if not sender:
                 continue
             subject, body, variant = compose(ccfg, con, lead, sender, idx)
             hits = find_avoid(ccfg, subject, body)
             if hits:
-                problems.append(f"Step {idx + 1} email for {lead['email']} uses avoided phrases ({', '.join(hits)}); not sent. "
+                problems.append(f"Step {idx + 1} email for {lead['email']} uses avoided phrases ({', '.join(hits)}); not drafted or sent. "
                                 "Edit the template in Settings → Your offer & emails.")
+                continue
+            score, why_q = autopilot.quality(cfg, con, ccfg, lead, subject, body) if ap_on else (None, [])
+            alone = ap_on and not master_approves and autopilot.may_send_alone(cfg, c, score) if ap_on else not review
+            if not alone:
+                if draft_budget <= 0:
+                    continue
+                con.execute(
+                    "INSERT INTO outbox(lead_id, step, sender, subject, body, status, created_at, variant, quality, quality_notes, orig_body) "
+                    "VALUES (?,?,?,?,?,'pending',?,?,?,?,?)",
+                    (lead["id"], idx, sender["email"], subject, body, iso(now_utc()), variant, score, "; ".join(why_q) or None, body))
+                log_event(con, lead["id"], "drafted", f"step {idx + 1}" + (f" (quality {score})" if score is not None else ""), sender["email"])
+                queued[sender["email"].lower()] = queued.get(sender["email"].lower(), 0) + 1
+                con.commit()
+                drafted += 1
+                draft_budget -= 1
+                continue
+
+        if timed:                                             # when it may land
+            if idx == 0:
+                if not autopilot.in_window(cfg, c, lead):
+                    nxt = autopilot.plan_arrival(cfg, c, lead)
+                    con.execute("UPDATE leads SET next_send_at=? WHERE id=?", (iso(nxt), lead["id"]))
+                    queued_first += 1
+                    continue
+                if cid not in stocks:
+                    stocks[cid] = autopilot.new_today_quota(autopilot.stock(cfg, con, c, limits, all_senders, allowance))
+                if autopilot.first_emails_today(con, cid) >= stocks[cid] or autopilot.sent_today_campaign(con, cid) >= allowance.get(cid, 0):
+                    continue                                   # today's new starts are done; capacity is kept for follow-ups
+            elif not autopilot.in_hours(cfg, lead):
                 continue
 
         reply_to = lead["first_msg_id"] if idx > 0 else None
@@ -1145,6 +1290,10 @@ def cmd_run(cfg, con, args):
             guard_login(cfg, con, sender["email"], True)
         if args.dry_run:
             continue
+        if ap_on:
+            autopilot.after_send(cfg, con, sender["email"])
+            if alone and autopilot.maybe_spot_check(cfg, con, c, lead, sender["email"], subject, body, score or 0):
+                print(f"Spot check: the email to {lead['email']} was set aside for a person to look at.")
         if draft:
             con.execute("UPDATE outbox SET status='sent', sent_at=? WHERE id=?", (iso(now_utc()), draft["id"]))
 
@@ -1160,7 +1309,8 @@ def cmd_run(cfg, con, args):
             "WHERE id=?",
             (nxt, sender["email"], next_at, status, msg_id, subject, lead["id"]),
         )
-        log_event(con, lead["id"], "sent", f"step {idx + 1}" + (" (test)" if redirect else ""), sender["email"], variant)
+        log_event(con, lead["id"], "sent", f"step {idx + 1}" + (" (test)" if redirect else "") + (" (sent on its own)" if alone and ap_on else ""),
+                  sender["email"], variant)
         if lead["stage"] == "new":
             set_stage(con, lead["id"], "contacted")
         con.commit()
@@ -1181,8 +1331,12 @@ def cmd_run(cfg, con, args):
         except Exception as e:  # reporting must never break sending
             log.warning("Team sync failed: %s", e)
     msg = f"{'Previewed' if args.dry_run else 'Sent'} {sent} email(s)."
-    if review:
+    if review or drafted or waiting:
         msg += f" Drafted {drafted} new for review; {waiting} waiting for your approval in the CRM."
+    if queued_first:
+        msg += f" {queued_first} first email(s) queued for their arrival window."
+    if held:
+        msg += f" {held} held back by the contact rules."
     if failed:
         msg += f" {failed} failed to send (details above)."
     print(msg)
@@ -1565,6 +1719,15 @@ def handle_message(cfg, con, sender, msg, folder="INBOX"):
     con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'email')",
                 (lead["id"], f"[{label} reply, {temp}]\n{body[:2000]}", iso(now_utc())))
     icon = convo.TEMP_ICON[temp]
+    if label in ("question", "interested", "other") and temp != "hot":
+        try:
+            import ops
+            answered = ops.info_reply(cfg, con, lead, sender, msg, body)
+        except Exception as e:
+            log.warning("Information answer failed, handing over as usual: %s", e)
+            answered = None
+        if answered:
+            return done(f"{icon} {answered}{extra_note}{where}", lead["id"])
     if (label in HANDOVER_LABELS or temp == "hot") and handover(cfg, con, lead, sender, msg, body, label, temp, reason):
         return done(f"{icon} {temp} {label.replace('_', ' ')} reply from {lead['email']}{who_sent}: handed over{extra_note}{where}", lead["id"])
     pb = convo.playbook(cfg)[temp]
@@ -1882,6 +2045,9 @@ HEADER_ALIASES = {
     "companyname": "company", "jobtitle": "title", "company domain": "website", "companydomain": "website",
     "linkedin profile": "linkedin", "linkedinurl": "linkedin", "location": "city", "company_name": "company",
     "job_title": "title", "website url": "website",
+    "campaign_code": "campaign_code", "campaign code": "campaign_code", "campaign": "campaign_code",
+    "company_size": "company_size", "company size": "company_size", "employees": "company_size",
+    "linkedin_url": "linkedin", "notes": "notes", "time zone": "timezone", "timezone": "timezone",
 }
 ROLE_INBOXES = {"info", "hello", "help", "support", "sales", "contact", "admin", "office",
                 "team", "hr", "careers", "jobs", "marketing", "billing", "noreply", "no-reply"}
@@ -1988,11 +2154,22 @@ def read_rows(path_or_file, filename=""):
     if name.endswith((".xlsx", ".xlsm")):
         import openpyxl
         wb = openpyxl.load_workbook(path_or_file, read_only=True, data_only=True)
-        rows = wb.active.iter_rows(values_only=True)
+        ws = next((w for w in wb.worksheets if w.title.strip().lower() == "leads"), wb.active)   # BSO's template: the Leads sheet
+        rows = ws.iter_rows(values_only=True)
         header = next(rows, None) or []
         for r in rows:
             if any(c not in (None, "") for c in r):
                 yield dict(zip(header, r))
+    elif name.endswith(".xls"):
+        import xlrd                      # older Excel files
+        data = path_or_file.read() if hasattr(path_or_file, "read") else Path(path_or_file).read_bytes()
+        book = xlrd.open_workbook(file_contents=data)
+        sh = next((book.sheet_by_name(n) for n in book.sheet_names() if n.strip().lower() == "leads"), book.sheet_by_index(0))
+        header = [str(c).strip() for c in sh.row_values(0)] if sh.nrows else []
+        for i in range(1, sh.nrows):
+            r = sh.row_values(i)
+            if any(c not in (None, "") for c in r):
+                yield dict(zip(header, [str(int(c)) if isinstance(c, float) and c.is_integer() else c for c in r]))
     else:
         if isinstance(path_or_file, (str, Path)):
             with open(path_or_file, newline="", encoding="utf-8-sig") as f:
@@ -2043,11 +2220,25 @@ def cmd_suppress(cfg, con, args):
 def cmd_selfcheck(cfg, con, args):
     """Verify every library the app loads on demand is present (used by the Windows build test)."""
     problems = []
-    for mod in ("anthropic", "bs4", "openpyxl", "yaml", "requests", "dotenv", "flask", "apollo", "legal", "secretstore", "pystray", "PIL"):
+    mods = ["anthropic", "bs4", "openpyxl", "yaml", "requests", "dotenv", "flask", "apollo", "legal", "secretstore", "pystray", "PIL",
+            "autopilot", "ops", "updater", "crm_roles", "hub_bot"]
+    if getattr(sys, "frozen", False):
+        mods += ["xlrd", "pypdf", "holidays"]          # older Excel files, scope PDFs, public holidays by country
+    for mod in mods:
         try:
             __import__(mod)
         except Exception as e:
             problems.append(f"{mod}: {e}")
+    try:
+        import autopilot
+        import updater
+        assert updater._key(), "update_key.json missing"
+        assert not autopilot.working_day("GB", date(2026, 12, 25))
+        if getattr(sys, "frozen", False):
+            import holidays
+            assert date(2026, 12, 25) in holidays.country_holidays("GB", years=2026)
+    except Exception as e:
+        problems.append(f"bot rules / updates: {e}")
     try:
         ZoneInfo(cfg["schedule"]["timezone"])
         in_send_window(cfg)
