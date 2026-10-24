@@ -258,6 +258,16 @@ check(local["file"].endswith(".bsobak") and b"gap.com" not in kept and b"SQLite 
 check(not list((bot.DATA / "backups").glob("*.db")) and (bot.DATA / "backups" / "daily-20260101-0600.bsobak").exists(),
       "plain backups left by an older version are encrypted (and the plain files removed)")
 check(not list((bot.DATA / "backups").glob(".*.tmp")), "no plain temporary copy is left behind")
+real_tk = safety._team_key
+safety._team_key = lambda: os.urandom(32)          # the team key changes (console rebuilt, re-joined)
+try:
+    check(safety.open_sealed_any(bot.DATA / "backups" / local["file"])[1][:15] == b"SQLite format 3",
+          "copies kept on this laptop still open after the team key changes (sealed with the laptop's own key)")
+finally:
+    safety._team_key = real_tk
+(bot.DATA / "backups" / ".daily-20260101-0000.tmp").write_bytes(b"plain")
+safety.sweep_plain_leftovers()
+check(not (bot.DATA / "backups" / ".daily-20260101-0000.tmp").exists(), "a plain copy left by a crash is removed at the next backup")
 con.close()
 bot._migrated.clear()
 detail = safety.restore(bot.DATA / "backups" / local["file"])

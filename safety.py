@@ -398,9 +398,9 @@ def _local_key(create=True):
 
 
 def _seal_key():
-    """Backups on this laptop are sealed with the team key when there is one (a replacement laptop can open them),
-    otherwise with this laptop's own key."""
-    return _team_key() or _local_key()
+    """Files that stay on this laptop are sealed with this laptop's own key, which never changes (a new team key can't
+    lock them out). Copies that leave the laptop (Google Drive, a backup folder) are sealed with the team key."""
+    return _local_key()
 
 
 def _open_keys():
@@ -453,6 +453,17 @@ def open_sealed_any(path):
     raise RuntimeError("That file isn't a BSO backup of this team or this laptop, or it is damaged.")
 
 
+def sweep_plain_leftovers(startup=False):
+    """A crash between making a plain temporary copy and encrypting it could leave one behind: remove them."""
+    d = _data()
+    found = list((d / "backups").glob(".*.tmp")) if (d / "backups").exists() else []
+    if startup:                                   # only when nothing else is running: a restore's working copies too
+        found += [p for p in d.glob("tmp*.db")] + [p for p in d.glob("*.db.part")]
+    for p in found:
+        _shred(p)
+    return len(found)
+
+
 def encrypt_old_backups():
     """Backups made before 1.1 were plain database copies: encrypt them in place (once)."""
     d = _data() / "backups"
@@ -477,6 +488,7 @@ def backup(con, folder=None, key=None, manual=False, drive="background", on_driv
     out_dir = _data() / "backups"
     out_dir.mkdir(exist_ok=True)
     stamp = _now().strftime("%Y%m%d-%H%M%S")                # UTC with seconds: two backups never share a name
+    sweep_plain_leftovers()
     encrypt_old_backups()
     plain = out_dir / f".daily-{stamp}.tmp"                  # plain only while it is tested, then encrypted
     con.commit()
@@ -505,8 +517,10 @@ def backup(con, folder=None, key=None, manual=False, drive="background", on_driv
     except Exception as e:
         res.update(ok=False, detail=f"{detail}; the encrypted copy on this laptop failed: {e}")
         ok = False
+    week_ago = (_now() - timedelta(days=7)).strftime("%Y%m%d")
     for old in sorted(out_dir.glob("daily-*.bsobak"))[:-KEEP_BACKUPS]:
-        old.unlink(missing_ok=True)
+        if old.name[6:14] < week_ago:              # by age as well as count: hourly retries never shrink a week of history
+            old.unlink(missing_ok=True)
     key = key if key is not None else _team_key()
     sealed = None
     if (folder or drive_ready()) and key and ok:
@@ -815,6 +829,10 @@ def cancel_restore():
 
 def apply_pending_restore():
     """Called when BSO starts: a restore chosen in the app is put in place before the database is opened."""
+    try:
+        sweep_plain_leftovers(startup=True)
+    except Exception:
+        pass
     if not pending_restore():
         return False
     _, raw = open_sealed_any(_data() / "outreach.restore.bsobak")

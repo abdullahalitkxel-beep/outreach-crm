@@ -2978,6 +2978,8 @@ def main(argv=None):
     {"import": cmd_import, "run": cmd_run, "check": cmd_check,
      "stats": cmd_stats, "suppress": cmd_suppress,
      "apollo-preview": cmd_apollo_preview, "selfcheck": cmd_selfcheck, "apollo-pull": cmd_apollo_pull}[args.cmd](cfg, con, args)
+    if lock:                     # the work is done: the next run may start while a backup upload finishes in the background
+        lock.close()
 
 
 if __name__ == "__main__":
