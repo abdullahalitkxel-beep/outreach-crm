@@ -419,7 +419,7 @@ def limit_for(cfg, con, s, today=None):
     ap = conf(cfg)
     r = rep(con, s["email"])
     if not r["ready"]:
-        return 0, r["ready_detail"] or "readiness check not done yet"
+        return 0, r["ready_detail"] or "its setup check (DNS records, warm-up, a test email) hasn't run yet"
     today = today or date.today()
     full = int(r["full_limit"] or min(int(s.get("full_limit") or s.get("daily_limit") or ap["start_limit"]), ap["ceiling"]))
     full = max(ap["floor"], min(ap["ceiling"], full))
@@ -774,7 +774,7 @@ def why_not(cfg, con, senders=None):
         waiting = con.execute("SELECT COUNT(*) FROM outbox o JOIN leads l ON l.id=o.lead_id WHERE o.status='pending' AND COALESCE(l.campaign_id,1)=?",
                               (c["id"],)).fetchone()[0]
         if waiting:
-            out.append(("review", f"\"{c['name']}\": {waiting} email(s) waiting for approval in Review ({autonomy_of(c)})"))
+            out.append(("review", f"\"{c['name']}\": {waiting} email(s) waiting for your approval in Review"))
         nxt = con.execute("SELECT MIN(next_send_at) FROM leads WHERE COALESCE(campaign_id,1)=? AND status='active' AND step=0 AND next_send_at>?",
                           (c["id"], iso(now_utc()))).fetchone()[0]
         if nxt:

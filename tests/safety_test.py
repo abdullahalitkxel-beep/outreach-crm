@@ -228,7 +228,8 @@ detail = safety.restore(sorted(off.glob("*.bsobak"))[-1], key=key)
 con = bot.db_connect("outreach.db")
 check(con.execute("SELECT COUNT(*) FROM leads").fetchone()[0] == leads_before and "restore test passed" in detail,
       "a lost database comes back from the off-laptop copy")
-check(list((bot.DATA / "backups").glob("before-restore-*.db")), "the database it replaced is kept aside")
+check(list((bot.DATA / "backups").glob("before-restore-*.bsobak")) and not list((bot.DATA / "backups").glob("*.db")),
+      "the database it replaced is kept aside, encrypted")
 try:
     safety.restore(sorted(off.glob("*.bsobak"))[-1], key=os.urandom(32))
     check(False, "wrong key refused")
@@ -248,7 +249,15 @@ for e, step, due in (("g1@gap.com", 1, "2026-10-10T00:00:00Z"), ("g2@gap.com", 0
     con.execute("INSERT INTO leads(email, first_name, company, status, step, next_send_at, created_at) VALUES (?,?,?,?,?,?,'2026-01-01')",
                 (e, "G", "Gap", "active", step, due))
 con.commit()
+plain_old = bot.DATA / "backups" / "daily-20260101-0600.db"          # a plain copy left by version 1.0
+__import__("shutil").copyfile(bot.DATA / "outreach.db", plain_old)
 local = safety.backup(con)
+kept = (bot.DATA / "backups" / local["file"]).read_bytes()
+check(local["file"].endswith(".bsobak") and b"gap.com" not in kept and b"SQLite format" not in kept,
+      "the copy kept on this laptop is encrypted too")
+check(not list((bot.DATA / "backups").glob("*.db")) and (bot.DATA / "backups" / "daily-20260101-0600.bsobak").exists(),
+      "plain backups left by an older version are encrypted (and the plain files removed)")
+check(not list((bot.DATA / "backups").glob(".*.tmp")), "no plain temporary copy is left behind")
 con.close()
 bot._migrated.clear()
 detail = safety.restore(bot.DATA / "backups" / local["file"])
@@ -262,15 +271,15 @@ check(autopilot.killed(con)[0] and "restored" in autopilot.killed(con)[1], "afte
 rb = [b for b in safety.open_breakers(con) if b["kind"] == "restore"]
 check(rb and safety.resume_breaker(con, rb[0]["id"]) and con.execute("SELECT status FROM leads WHERE email='g2@gap.com'").fetchone()[0] == "active",
       "releasing the held first emails is one click")
-p2 = Path(tempfile.mkdtemp()) / "x.db"
+p2 = Path(tempfile.mkdtemp()) / "x.bsobak"
 import shutil  # noqa: E402
 shutil.copyfile(bot.DATA / "backups" / local["file"], p2)
 safety.restore(p2, now=False)
-waiting = (bot.DATA / "outreach.restore.db").exists()
+waiting = (bot.DATA / "outreach.restore.bsobak").exists() and b"SQLite" not in (bot.DATA / "outreach.restore.bsobak").read_bytes()
 con.close()                                   # as at a real start: nothing has the database open yet (Windows can't replace an open file)
 bot._migrated.clear()
-check(waiting and safety.apply_pending_restore() and not (bot.DATA / "outreach.restore.db").exists(),
-      "a restore chosen in the app waits and goes in when BSO starts again")
+check(waiting and safety.apply_pending_restore() and not (bot.DATA / "outreach.restore.bsobak").exists(),
+      "a restore chosen in the app waits (encrypted) and goes in when BSO starts again")
 con = bot.db_connect("outreach.db")
 safety.restore(p2, now=False)
 check(safety.pending_restore() and (safety.cancel_restore() or True) and not safety.pending_restore() and not safety.apply_pending_restore(),
@@ -279,15 +288,15 @@ safety.restore(p2, now=False)
 meta = json.loads((bot.DATA / "outreach.restore.json").read_text())
 meta["at"] = "2020-01-01T00:00:00Z"
 (bot.DATA / "outreach.restore.json").write_text(json.dumps(meta))
-check(safety.pending_restore() is None and not (bot.DATA / "outreach.restore.db").exists(),
+check(safety.pending_restore() is None and not (bot.DATA / "outreach.restore.bsobak").exists(),
       "a restore forgotten for hours expires instead of replacing days of work at the next start")
 import sealbox, zlib, team  # noqa: E401,E402
 old = Path(tempfile.mkdtemp()) / "BSO-backup-20260101-0600.bsobak"
-old.write_text(sealbox.seal(key, zlib.compress((bot.DATA / "backups" / local["file"]).read_bytes())), encoding="ascii")
+old.write_text(sealbox.seal(key, zlib.compress(safety.open_sealed_any(bot.DATA / "backups" / local["file"])[1])), encoding="ascii")
 check(safety.restore(old, key=key, now=False) and safety.pending_restore(), "a backup made before origins were recorded still restores")
 safety.cancel_restore()
 theirs = Path(tempfile.mkdtemp()) / "BSO-backup-20260101-0700.bsobak"
-theirs.write_text(sealbox.seal(key, safety._pack((bot.DATA / "backups" / local["file"]).read_bytes(), {"user": "cole.reed"})), encoding="ascii")
+theirs.write_text(sealbox.seal(key, safety._pack(safety.open_sealed_any(bot.DATA / "backups" / local["file"])[1], {"user": "cole.reed"})), encoding="ascii")
 real_signed = team.signed_in
 team.signed_in = lambda: "bsobot"
 try:

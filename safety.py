@@ -19,7 +19,9 @@ One-click unsubscribe
 
 Backups
     Every 6 hours the database is copied (SQLite online backup) and checked (integrity, the copy opens, row counts
-    match). A compressed copy sealed with the team key then leaves the laptop: to the owner's Google Drive through the
+    match). Every backup file is encrypted wherever it is: the copies kept on this laptop (sealed with the team key, or
+    with this laptop's own key when it isn't in a team; older plain copies are encrypted on the next backup), the
+    copy kept aside before a restore or an update, and the copies that leave the laptop. A copy sealed with the team key leaves the laptop: to the owner's Google Drive through the
     team relay (version 6 or later, nothing to set up), read back and checked there, and also to a backup folder when
     one is set. restore() puts a backup back; drive_fetch() downloads one from Google Drive first.
 """
@@ -377,6 +379,93 @@ def _save_status(res, con=None):
             c.close()
 
 
+# ---------------------------------------------------------------- every backup file is encrypted, wherever it is
+
+LOCAL_KEY = "BSO_BACKUP_KEY"
+
+
+def _local_key(create=True):
+    """This laptop's own backup key (kept in the encrypted secret store), for a BSO not signed in to a team."""
+    try:
+        import bot
+        k = bot.SECRETS.load().get(LOCAL_KEY)
+        if not k and create:
+            k = secrets.token_hex(32)
+            bot.SECRETS.set(LOCAL_KEY, k)
+        return bytes.fromhex(k) if k else None
+    except Exception:
+        return None
+
+
+def _seal_key():
+    """Backups on this laptop are sealed with the team key when there is one (a replacement laptop can open them),
+    otherwise with this laptop's own key."""
+    return _team_key() or _local_key()
+
+
+def _open_keys():
+    return [k for k in (_team_key(), _local_key(create=False)) if k]
+
+
+def _write_sealed(dest, text):
+    tmp = Path(str(dest) + ".part")
+    tmp.write_text(text, encoding="ascii")
+    _retry(lambda: os.replace(tmp, dest))
+
+
+def seal_db_file(db_path, dest, origin=None):
+    """Encrypt a database copy into dest (.bsobak) and delete the plain copy."""
+    raw = Path(db_path).read_bytes()
+    key = _seal_key()
+    if not key:
+        raise RuntimeError("no key to encrypt the backup with")
+    _write_sealed(dest, _fast_seal(key, _pack(raw, origin or _origin())))
+    _shred(db_path)
+    return Path(dest)
+
+
+def _shred(path):
+    """Delete a plain database copy, overwriting it first so the old bytes don't linger on disk."""
+    p = Path(path)
+    try:
+        n = p.stat().st_size
+        with open(p, "r+b") as f:
+            while n > 0:
+                k = min(n, 1 << 20)
+                f.write(b"\0" * k)
+                n -= k
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+    _retry(lambda: p.unlink(missing_ok=True))
+
+
+def open_sealed_any(path):
+    """(origin, database bytes) of a sealed backup, trying the team key and this laptop's own key."""
+    text = Path(path).read_text(encoding="ascii")
+    import sealbox
+    for k in _open_keys():
+        try:
+            return _unpack(zlib.decompress(sealbox.open_(k, text)))
+        except Exception:
+            continue
+    raise RuntimeError("That file isn't a BSO backup of this team or this laptop, or it is damaged.")
+
+
+def encrypt_old_backups():
+    """Backups made before 1.1 were plain database copies: encrypt them in place (once)."""
+    d = _data() / "backups"
+    done = 0
+    for p in list(d.glob("*.db")) if d.exists() else []:
+        try:
+            seal_db_file(p, p.with_suffix(".bsobak"), {"at": _iso(datetime.fromtimestamp(p.stat().st_mtime, timezone.utc)), "user": "", "converted": True})
+            done += 1
+        except Exception as e:
+            print("encrypting an old backup:", p.name, e)
+    return done
+
+
 DRIVE_LIMIT_S = 300                 # a Google Drive copy gives up after 5 minutes; the next backup tries again
 
 
@@ -388,23 +477,41 @@ def backup(con, folder=None, key=None, manual=False, drive="background", on_driv
     out_dir = _data() / "backups"
     out_dir.mkdir(exist_ok=True)
     stamp = _now().strftime("%Y%m%d-%H%M%S")                # UTC with seconds: two backups never share a name
-    dest = out_dir / f"daily-{stamp}.db"
+    encrypt_old_backups()
+    plain = out_dir / f".daily-{stamp}.tmp"                  # plain only while it is tested, then encrypted
     con.commit()
-    b = sqlite3.connect(str(dest))
+    b = sqlite3.connect(str(plain))
     try:
         con.backup(b)
     finally:
         b.close()
     live = _counts(con)
-    res = {"at": _iso(_now()), "file": dest.name, "size_mb": round(dest.stat().st_size / 1e6, 1), "manual": bool(manual)}
-    ok, detail = check_copy(dest, live)
+    origin = _origin()
+    res = {"at": _iso(_now()), "file": f"daily-{stamp}.bsobak", "size_mb": round(plain.stat().st_size / 1e6, 1), "manual": bool(manual)}
+    try:
+        ok, detail = check_copy(plain, live)
+        raw = plain.read_bytes()
+    finally:
+        _shred(plain)
     res.update(ok=ok, detail=detail)
-    for old in sorted(out_dir.glob("daily-*.db"))[:-KEEP_BACKUPS]:
+    try:                                                     # the copy kept on this laptop: encrypted too
+        lkey = _seal_key()
+        if not lkey:
+            raise RuntimeError("no key to encrypt it with")
+        local_sealed = _fast_seal(lkey, _pack(raw, origin))
+        _write_sealed(out_dir / res["file"], local_sealed)
+        if _check_sealed_text(local_sealed, lkey)[0] is False and ok:
+            raise RuntimeError("the encrypted copy didn't open")
+    except Exception as e:
+        res.update(ok=False, detail=f"{detail}; the encrypted copy on this laptop failed: {e}")
+        ok = False
+    for old in sorted(out_dir.glob("daily-*.bsobak"))[:-KEEP_BACKUPS]:
         old.unlink(missing_ok=True)
     key = key if key is not None else _team_key()
     sealed = None
     if (folder or drive_ready()) and key and ok:
-        sealed = _fast_seal(key, _pack(dest.read_bytes(), _origin()))
+        sealed = local_sealed if key == lkey else _fast_seal(key, _pack(raw, origin))
+    del raw
     if folder:
         try:
             if not key:
@@ -458,12 +565,16 @@ def backup(con, folder=None, key=None, manual=False, drive="background", on_driv
                 if cur.get("drive") == res["drive"]:             # a newer backup hasn't replaced this one meanwhile
                     cur.update(out)
                     _save_status(cur)
+                print(f"Google Drive copy {res['drive']}: {out.get('drive_detail')}", flush=True)
                 if out.get("drive_ok") is False and on_drive_fail:
                     try:
                         on_drive_fail(f"⚠ BSO backup problem: {out['drive_detail']}")
                     except Exception:
                         pass
-            threading.Thread(target=run, daemon=True, name="drive-backup").start()
+            # Not a daemon thread: a run (a process that ends when its work is done) waits for the upload to finish
+            # before it exits, at most DRIVE_LIMIT_S; sending isn't held up, since the run carries on meanwhile.
+            print("Google Drive copy: uploading in the background (at most 5 minutes)", flush=True)
+            threading.Thread(target=run, daemon=False, name="drive-backup").start()
     return res
 
 
@@ -499,6 +610,8 @@ def check_copy(path, live=None):
     except Exception as e:
         return False, f"restore test failed: {e}"
     finally:
+        for f in tmpdir.glob("*"):
+            _shred(f)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -520,7 +633,7 @@ def _check_sealed_text(text, key, live=None):
         Path(tmp).write_bytes(raw)
         return check_copy(tmp, live)
     finally:
-        os.unlink(tmp)
+        _shred(tmp)
 
 
 # ---------------------------------------------------------------- Google Drive copies through the team relay (version 6)
@@ -580,11 +693,21 @@ def drive_list():
 
 
 def drive_download(name, deadline=None):
-    first = _drive_call("backup_get", {"name": name, "part": 0}, deadline=deadline)
-    data = [first.get("data") or ""]
-    for i in range(1, int(first.get("parts") or 1)):
-        data.append(_drive_call("backup_get", {"name": name, "part": i}, deadline=deadline).get("data") or "")
-    return "".join(data)
+    """All parts of one backup. If the copy changes on Drive while it downloads (a new backup reusing its slot), the
+    download is tried once more, then refused with a clear message."""
+    for attempt in range(2):
+        first = _drive_call("backup_get", {"name": name, "part": 0}, deadline=deadline)
+        n = int(first.get("parts") or 1)
+        data, same = [first.get("data") or ""], True
+        for i in range(1, n):
+            got = _drive_call("backup_get", {"name": name, "part": i}, deadline=deadline)
+            if int(got.get("parts") or 0) != n or got.get("name") != name:
+                same = False
+                break
+            data.append(got.get("data") or "")
+        if same:
+            return "".join(data)
+    raise RuntimeError("That copy changed on Google Drive while it was downloading (a newer backup replaced it). Choose it again or pick another.")
 
 
 def drive_fetch(name):
@@ -609,7 +732,7 @@ def check_sealed(path, key, live=None):
         Path(tmp).write_bytes(raw)
         return check_copy(tmp, live)
     finally:
-        os.unlink(tmp)
+        _shred(tmp)
 
 
 PENDING_HOURS = 6
@@ -618,7 +741,7 @@ PENDING_HOURS = 6
 def restore(src, key=None, now=True):
     """Put a backup back as this laptop's database (the current one is kept aside). src is a .db copy or a sealed .bsobak.
     A sealed backup made under another sign-in is refused: it is someone else's (or another laptop's) work.
-    now=False (the app, which has the database open): the checked copy waits as outreach.restore.db and is swapped in
+    now=False (the app, which has the database open): the checked copy waits, encrypted, as outreach.restore.bsobak and is swapped in
     by apply_pending_restore() the next time BSO starts, before anything opens the database; it expires after
     PENDING_HOURS so a forgotten restore can't replace days of work later."""
     src = Path(src)
@@ -627,13 +750,15 @@ def restore(src, key=None, now=True):
     data = _data()
     origin = {}
     if src.suffix == ".bsobak":
-        key = key if key is not None else _team_key()
-        if not key:
-            raise RuntimeError("Sign in to the team first: this backup is sealed with the team key.")
-        try:
-            origin, raw = open_sealed(src, key, with_origin=True)
-        except Exception:
-            raise RuntimeError("That file isn't a BSO backup of this team, or it is damaged.")
+        if key is not None:
+            try:
+                origin, raw = open_sealed(src, key, with_origin=True)
+            except Exception:
+                raise RuntimeError("That file isn't a BSO backup of this team, or it is damaged.")
+        else:
+            if not _open_keys():
+                raise RuntimeError("Sign in to the team first: this backup is sealed with the team key.")
+            origin, raw = open_sealed_any(src)
         try:
             import team
             me = team.signed_in()
@@ -649,12 +774,12 @@ def restore(src, key=None, now=True):
     Path(tmp).write_bytes(raw)
     ok, detail = check_copy(tmp)
     if not ok:
-        os.unlink(tmp)
+        _shred(tmp)
         if "not a database" in detail:
             raise RuntimeError("That file isn't a BSO backup.")
         raise RuntimeError("That backup didn't pass the restore test: " + detail)
-    if not now:
-        os.replace(tmp, data / "outreach.restore.db")
+    if not now:                                   # waits for the restart encrypted, like every other copy
+        seal_db_file(tmp, data / "outreach.restore.bsobak", origin)
         (data / "outreach.restore.json").write_text(json.dumps({"at": _iso(_now()), "source": src.name, "detail": detail,
                                                                 "origin": origin}), encoding="utf-8")
         return detail
@@ -664,7 +789,13 @@ def restore(src, key=None, now=True):
 
 def pending_restore():
     """The restore waiting for BSO to restart, or None (expired ones are removed)."""
-    p, m = _data() / "outreach.restore.db", _data() / "outreach.restore.json"
+    p, m = _data() / "outreach.restore.bsobak", _data() / "outreach.restore.json"
+    old = _data() / "outreach.restore.db"                 # left by 1.0.x: encrypt it while it waits
+    if old.exists() and not p.exists():
+        try:
+            seal_db_file(old, p)
+        except Exception:
+            pass
     if not p.exists():
         return None
     try:
@@ -678,7 +809,7 @@ def pending_restore():
 
 
 def cancel_restore():
-    for n in ("outreach.restore.db", "outreach.restore.json"):
+    for n in ("outreach.restore.bsobak", "outreach.restore.db", "outreach.restore.json"):
         (_data() / n).unlink(missing_ok=True)
 
 
@@ -686,7 +817,12 @@ def apply_pending_restore():
     """Called when BSO starts: a restore chosen in the app is put in place before the database is opened."""
     if not pending_restore():
         return False
-    _swap_in(str(_data() / "outreach.restore.db"))
+    _, raw = open_sealed_any(_data() / "outreach.restore.bsobak")
+    fd, tmp = tempfile.mkstemp(suffix=".db", dir=str(_data()))
+    os.close(fd)
+    Path(tmp).write_bytes(raw)
+    _swap_in(tmp)
+    (_data() / "outreach.restore.bsobak").unlink(missing_ok=True)
     (_data() / "outreach.restore.json").unlink(missing_ok=True)
     print("restore:", settle_gap())
     return True
@@ -749,7 +885,8 @@ def _swap_in(tmp):
     data = _data()
     live = data / "outreach.db"
     if live.exists():
-        keep = data / "backups" / f"before-restore-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+        stem = f"before-restore-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        keep = data / "backups" / f".{stem}.tmp"
         keep.parent.mkdir(exist_ok=True)
         a, b = sqlite3.connect(str(live)), sqlite3.connect(str(keep))
         try:
@@ -757,6 +894,7 @@ def _swap_in(tmp):
         finally:
             a.close()
             b.close()
+        seal_db_file(keep, keep.with_name(stem + ".bsobak"))   # the database it replaces is kept aside, encrypted
         for ext in ("-wal", "-shm"):
             _retry(lambda: Path(str(live) + ext).unlink(missing_ok=True))
     _retry(lambda: os.replace(tmp, live))
@@ -774,20 +912,23 @@ def _retry(fn, tries=10):
 
 
 def due_backup(con, hours=6):
-    r = con.execute("SELECT v FROM app_mode WHERE k='backup_status'").fetchone()
-    try:
-        last = json.loads(r[0])["at"] if r else None
-    except Exception:
-        last = None
+    st = status(con)
+    last = st.get("at")
+    if st.get("drive_ok") is False and not st.get("manual"):
+        hours = 1                                        # the Google Drive copy failed: try again within the hour
     return not last or last < _iso(_now() - timedelta(hours=hours))
 
 
 def status(con):
     r = con.execute("SELECT v FROM app_mode WHERE k='backup_status'").fetchone()
     try:
-        return json.loads(r[0]) if r else {}
+        st = json.loads(r[0]) if r else {}
     except Exception:
         return {}
+    if st.get("drive") and st.get("drive_ok") is None and st.get("at", "") < _iso(_now() - timedelta(seconds=DRIVE_LIMIT_S + 300)):
+        st.update(drive_ok=False, drive_detail="the Google Drive upload didn't finish (BSO closed or the connection dropped); "
+                                               "the next backup tries again within the hour")
+    return st
 
 
 # ---------------------------------------------------------------- bounces: permanent or temporary

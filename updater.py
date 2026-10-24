@@ -270,14 +270,16 @@ def backup_db():
         return None
     out = Path(DATA) / "backups"
     out.mkdir(exist_ok=True)
-    dest = out / f"pre-update-{current()}-{datetime.now().strftime('%Y%m%d-%H%M')}.db"
-    a, b = sqlite3.connect(str(src)), sqlite3.connect(str(dest))
+    stem = f"pre-update-{current()}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    tmp = out / f".{stem}.tmp"
+    a, b = sqlite3.connect(str(src)), sqlite3.connect(str(tmp))
     try:
         a.backup(b)
     finally:
         a.close()
         b.close()
-    return dest
+    import safety
+    return safety.seal_db_file(tmp, out / f"{stem}.bsobak")     # encrypted, like every backup
 
 
 def _previous_installer():

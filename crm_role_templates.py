@@ -2,7 +2,7 @@
 
 ROLE_TEMPLATES = {}
 
-ROLE_TEMPLATES["botroom.html"] = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}Status{% endblock %}{% block body %}
+ROLE_TEMPLATES["botroom.html"] = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}{{ 'BSO Bot' if here_is_bot else 'This computer' }}{% endblock %}{% block body %}
 {% set here = 'BSO Bot' if here_is_bot else 'This computer' %}
 {% call m.header('t-home', '●', here, ('Sending' if not rp.killed else 'Sending stopped') if here_is_bot else 'not the BSO Bot laptop') %}
 {% if not pending %}<form method="post" action="{{ url_for('bot_kill_local') }}" style="margin:0" onsubmit="return confirm('{{ ('Start sending again? Test mode is ' ~ ('ON: emails go to your test address' if test_mode_on else 'OFF: real people will receive emails')) if rp.killed else ('Stop all sending from this computer, for every client?') }}')">
@@ -15,7 +15,7 @@ ROLE_TEMPLATES["botroom.html"] = r"""{% extends 'base.html' %}{% import 'macros.
 {% elif rp.killed %}<div class="help" style="border-color:#c23934;display:block">Sending is stopped: {{ rp.killed_why }}</div>{% endif %}
 {% if not here_is_bot %}<div class="help" style="display:block"><b>This page shows this computer, not the BSO Bot laptop.</b> The bot sends from its own laptop; to see it or stop it, open the Master Console → <b>BSO Bot</b>. Nothing here changes what the bot laptop does.</div>{% endif %}
 <div class="kpis">
- <div class="kpi"><small>Sent today</small><b>{{ sent }}</b><span class="muted">{{ ('today\'s limit: ' ~ cap) if cap else 'no inbox may send yet' }}</span></div>
+ <div class="kpi"><small>Sent today</small><b>{{ sent }}</b><span class="muted">{{ ('today\'s limit: ' ~ cap) if cap else ('no inbox may send more today' if sent else 'no inbox may send yet') }}</span></div>
  <div class="kpi"><small>Inboxes sending</small><b>{{ rp.inboxes|selectattr('limit')|list|length }}</b><span class="muted">of {{ rp.inboxes|length }}</span></div>
  <div class="kpi"><small>Waiting in Review</small><b>{{ review_count or 0 }}</b></div>
  <div class="kpi"><small>Last run</small><b style="font-size:16px">{{ local_time(last.finished_at or last.started_at) if last else 'never' }}</b><span class="muted">{{ last.status if last }}</span></div>
@@ -41,16 +41,16 @@ ROLE_TEMPLATES["botroom.html"] = r"""{% extends 'base.html' %}{% import 'macros.
 <details style="margin-top:6px"><summary class="muted">Also copy to a folder (optional)</summary><form method="post" action="{{ url_for('save_backup') }}" style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap"><label style="flex:1;min-width:260px">Folder <input name="folder" value="{{ backup_folder }}" placeholder="e.g. D:\BSO backups (empty: none)" style="width:100%"></label><button class="btn sm" style="align-self:flex-end">Save folder</button></form></details>
 {% if can_restore and not pending %}<details style="margin-top:8px" {{ 'open' if drive is not none or drive_err }}><summary>Restore a backup</summary>
 <p class="muted" style="margin:6px 0">For a replacement laptop, or to undo a serious mistake. The database here is kept aside first, and sending stays stopped until you start it.</p>
-{% if drive_ready and drive is none %}<a class="btn sm" href="{{ url_for('botroom', drive=1) }}">Show backups on Google Drive</a>{% if drive_err %} <span class="badge b-bad">problem</span> {{ drive_err }}{% endif %}{% endif %}
-{% if drive is not none or not drive_ready %}<form method="post" action="{{ url_for('save_restore') }}" style="display:grid;gap:8px;margin-top:6px;max-width:640px" onsubmit="return confirm('Restore this backup? Everything since it was made is replaced (the current database is kept aside).')">
-{% if drive is not none %}<label><input type="radio" name="source" value="drive" {{ 'checked' if drive }} {{ 'disabled' if not drive }}> From Google Drive</label>
-<select name="drive_name" aria-label="Backup on Google Drive" {{ 'disabled' if not drive }}>{% for b in drive %}<option value="{{ b.name }}">{{ backup_label(b) }}</option>{% else %}<option value="">No backups on Google Drive yet</option>{% endfor %}</select>{% endif %}
-<label><input type="radio" name="source" value="file" {{ 'checked' if not drive }}> From a backup file on this computer</label>
+<form method="post" action="{{ url_for('save_restore') }}" style="display:grid;gap:8px;margin-top:6px;max-width:640px" onsubmit="return window.confirm('Restore this backup? Everything since it was made is replaced (the current database is kept aside, encrypted).')">
+{% if drive_ready %}<label class="opt"><input type="radio" name="source" value="drive" {{ 'checked' if drive }} {{ 'disabled' if not drive }}> From Google Drive</label>
+{% if drive is none %}<div><a class="btn sm" href="{{ url_for('botroom', drive=1) }}">Show backups on Google Drive</a>{% if drive_err %} <span class="badge b-bad">problem</span> {{ drive_err }}{% endif %}</div>
+{% else %}<select name="drive_name" aria-label="Backup on Google Drive" {{ 'disabled' if not drive }}>{% for b in drive %}<option value="{{ b.name }}">{{ backup_label(b) }}</option>{% else %}<option value="">No backups on Google Drive yet</option>{% endfor %}</select>{% endif %}{% endif %}
+<label class="opt"><input type="radio" name="source" value="file" {{ 'checked' if not drive }}> From a backup file on this computer</label>
 <input name="path" aria-label="Backup file path" placeholder="Full path of a .bsobak file, e.g. D:\BSO backups\BSO-backup-20261024-060000.bsobak">
-<label>Type <b>RESTORE</b> to confirm <input name="confirm" autocomplete="off" style="width:140px" required></label>
-<div><button class="btn sm danger">Restore</button></div></form>{% endif %}</details>{% endif %}
+<label class="opt">Type <b>RESTORE</b> to confirm <input name="confirm_word" autocomplete="off" style="width:140px" required></label>
+<div><button class="btn sm danger">Restore</button></div></form></details>{% endif %}
 </div></div>
-<div class="card"><div class="card-h"><h2>Alerts</h2></div><table class="tbl">{% for a in rp.alerts %}<tr><td class="muted">{{ a.at[:16] }}</td><td>{{ a.text }}</td></tr>{% else %}<tr><td class="muted">No alerts sent.</td></tr>{% endfor %}</table></div>
+<div class="card"><div class="card-h"><h2>Alerts</h2></div><table class="tbl">{% for a in rp.alerts %}<tr><td class="muted">{{ local_time(a.at) }}</td><td>{{ a.text }}</td></tr>{% else %}<tr><td class="muted">No alerts sent.</td></tr>{% endfor %}</table></div>
 {% endblock %}"""
 
 ROLE_TEMPLATES["botdomains.html"] = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}Domains & inboxes{% endblock %}{% block body %}

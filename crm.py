@@ -2442,6 +2442,21 @@ def save_schedule():
 def restart_app():
     """Start a fresh BSO and close this one (a restore waiting for a restart goes in as the new one starts)."""
     import subprocess
+    import time as _t
+    import bot as _bot
+    for jid, p in list(PROCS.items()):            # a run must not keep sending into the database about to be replaced
+        STOP_JOBS[jid] = True
+        try:
+            if p:
+                p.kill()
+        except Exception:
+            pass
+    for _ in range(40):                            # and the run lock must be free before the swap
+        if not _bot.run_in_progress():
+            break
+        _t.sleep(0.5)
+    else:
+        return redirect(url_for("botroom", msg="A bot run is still finishing. Wait a minute and click Restart BSO now again."))
     cmd = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, str(Path(__file__).resolve().parent / "app.py")]
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     try:
@@ -2492,7 +2507,8 @@ def setup_steps():
     s5 = one("SELECT COUNT(*) FROM outbox WHERE status IN ('approved','sent')") > 0
     s6 = one("SELECT COUNT(*) FROM events WHERE type='sent'") > 0
     s7 = one("SELECT COUNT(*) FROM events WHERE type='reply'") > 0
-    s8 = not tm.get("enabled") and s6
+    tested = bool((rows("SELECT v FROM app_mode WHERE k='tester'") or [{"v": ""}])[0]["v"]) if one("SELECT COUNT(*) FROM sqlite_master WHERE name='app_mode'") else False
+    s8 = not tm.get("enabled") and s6 and tested           # live only after a test send went to the test address
     test_on = bool(tm.get("enabled"))
     review_on = bool((c.get("review") or {}).get("enabled"))
 
@@ -2526,7 +2542,7 @@ def setup_steps():
                    if tm.get("enabled") else "") +
                   "Click the button, then check that inbox: did it land in <b>Inbox or Spam</b>? Does the formatting look right? "
                   "Follow-ups will arrive in the same thread on later runs.",
-             action="run", button="▶ Send approved emails",
+             action="run", button="▶ Send approved emails", always_block=not test_on,
              blocked=(None if s5 and test_on else 5 if not s5 else
                       "Test mode is off: this button would email real people. Turn test mode on (Settings → Safety) to send yourself a test.")),
         dict(id="replies", ok=s7, title="Check that reply detection works",

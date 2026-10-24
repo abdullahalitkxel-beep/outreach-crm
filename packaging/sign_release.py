@@ -25,7 +25,10 @@ def main(installer, version):
     from cryptography.hazmat.primitives.asymmetric import padding
     pem = (os.getenv("UPDATE_SIGNING_KEY") or "").strip()
     if not pem:
-        print("::warning title=Automatic updates::UPDATE_SIGNING_KEY secret not set: this release isn't signed, so BSOs won't install it automatically")
+        if os.getenv("GITHUB_REF") == "refs/heads/main":     # a release BSOs would silently skip must not be published
+            print("::error title=Release signature::UPDATE_SIGNING_KEY secret not set: a release must be signed for automatic updates")
+            return 1
+        print("::warning title=Automatic updates::UPDATE_SIGNING_KEY secret not set: this build isn't signed")
         return 0
     pw = os.getenv("UPDATE_SIGNING_KEY_PASSWORD") or None
     try:

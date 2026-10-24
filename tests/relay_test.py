@@ -180,6 +180,15 @@ try:
     check(raw and not any("acme" in json.dumps(f) for f in raw), "Drive holds only the sealed copy")
     p = safety.drive_fetch(r["drive"])
     check(safety.check_sealed(p, team._team_key())[0], "a replacement laptop with the same sign-in downloads it and it opens")
+    time.sleep(1.1)                               # a new name (seconds in the name)
+    con.commit()
+    code = ("import sys; sys.path.insert(0, %r); import bot, safety; safety.DRIVE_PART = 2000; "
+            "con = bot.db_connect('outreach.db'); r = safety.backup(con); print('started', r.get('drive'))") % str(root)
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300, env=dict(os.environ))
+    name = (re.search(r"started (BSO-backup-\S+)", out.stdout) or [None, None])[1]
+    names = [b["name"] for b in safety.drive_list()]
+    check(name and name in names and "Google Drive copy " + name in out.stdout,
+          "a run that ends right after its backup still finishes the Google Drive upload before it exits")
     try:
         safety.drive_fetch("../../evil")
         check(False, "odd names refused")

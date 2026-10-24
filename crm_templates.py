@@ -136,7 +136,7 @@ clip-path:polygon(0 0,calc(100% - 10px) 0,100% 50%,calc(100% - 10px) 100%,0 100%
 .tabs button.on{border-bottom-color:var(--brand);font-weight:700}
 .tabpane{display:none}.tabpane.on{display:block}
 /* help + toast */
-.help.tip{display:flex}.help{display:block;gap:10px;background:var(--brand-l);border:1px solid #b0c7e6;border-radius:var(--r);padding:10px 14px;margin-bottom:12px}
+.help.tip{display:flex}label.opt{display:flex;align-items:center;gap:8px;text-align:left}label.opt input[type=radio],label.opt input[type=checkbox]{width:auto;margin:0}.help{display:block;gap:10px;background:var(--brand-l);border:1px solid #b0c7e6;border-radius:var(--r);padding:10px 14px;margin-bottom:12px}
 .help b{color:var(--brand-d)}.help .x{margin-left:auto;background:none;border:0;cursor:pointer;color:var(--muted);font-size:16px;line-height:1}
 .help ol,.help ul{margin:4px 0 0;padding-left:18px}
 .toast{background:#2e844a;color:#fff;border-radius:var(--r);padding:10px 14px;margin-bottom:12px;box-shadow:var(--sh)}
@@ -765,11 +765,11 @@ SETUP = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block tit
 <div class="step {{ 'ok' if s.ok else ('next' if loop.index0 == next_idx) }}" id="{{ s.id }}"><div class="n">{{ '✓' if s.ok else loop.index }}</div><div class="bd">
  <h3>{{ s.title }}</h3><p>{{ s.text|safe }}</p>
  {% if s.todo and not s.ok %}<ul style="margin:0 0 8px;padding-left:18px">{% for t in s.todo %}<li>{{ t|safe }}</li>{% endfor %}</ul>{% endif %}
- {% if s.action %}<form method="post" action="{{ url_for('job_start') }}" style="display:inline"><input type="hidden" name="cmd" value="{{ s.action }}">{% if s.arg %}<input type="hidden" name="max" value="{{ s.arg }}">{% endif %}
-  <button class="btn {{ 'brand' if not s.ok and loop.index0 == next_idx }}" {{ 'disabled' if s.blocked and not s.ok }}>{{ s.button }}</button></form>{% endif %}
+ {% if s.action %}<form method="post" action="{{ url_for('job_start') }}" style="display:inline"{% if s.action == 'run' and not test_mode_on %} onsubmit="return window.confirm('Test mode is OFF: real people will receive these emails. Continue?')"{% endif %}><input type="hidden" name="cmd" value="{{ s.action }}">{% if s.arg %}<input type="hidden" name="max" value="{{ s.arg }}">{% endif %}
+  <button class="btn {{ 'brand' if not s.ok and loop.index0 == next_idx }}" {{ 'disabled' if (s.blocked and not s.ok) or s.always_block }}>{{ s.button }}</button></form>{% endif %}
  {% if s.link %}<a class="btn {{ 'brand' if not s.ok and loop.index0 == next_idx }}" href="{{ s.link }}">{{ s.link_text }}</a>{% endif %}
  {% if s.sample %}<form method="post" action="{{ url_for('sample_remove' if s.has_sample else 'sample_load') }}" style="display:inline"><button class="btn">{{ 'Remove sample leads' if s.has_sample else 'Add sample leads' }}</button></form>{% endif %}
- {% if s.blocked and not s.ok %}<span class="muted"> {{ s.blocked if s.blocked is string else 'Finish step ' ~ s.blocked ~ ' first.' }}</span>{% endif %}
+ {% if s.blocked and (not s.ok or s.always_block) %}<span class="muted"> {{ s.blocked if s.blocked is string else 'Finish step ' ~ s.blocked ~ ' first.' }}</span>{% endif %}
 </div></div>{% endfor %}</div>
 {% endblock %}"""
 

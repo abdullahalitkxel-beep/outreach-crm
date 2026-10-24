@@ -248,8 +248,8 @@ def save_restore():
     import safety
     if not can_restore():
         return redirect(url_for("botroom", msg="Only the owner or the BSO Bot account can restore a backup."))
-    if request.form.get("confirm", "").strip() != "RESTORE":
-        return redirect(url_for("botroom", msg="Type RESTORE in capital letters to confirm. Nothing was changed."))
+    if request.form.get("confirm_word", "").strip() != "RESTORE":
+        return redirect(url_for("botroom", msg="Type RESTORE in capital letters to confirm. Nothing was changed.", err=1))
     src = request.form.get("source", "drive" if request.form.get("drive_name") else "file")
     path = request.form.get("path", "").strip().strip('"')
     try:
@@ -261,7 +261,7 @@ def save_restore():
             raise RuntimeError("Paste the full path of the backup file.")
         detail = safety.restore(path, now=False)
     except Exception as e:
-        return redirect(url_for("botroom", msg=f"Not restored: {e}"))
+        return redirect(url_for("botroom", msg=f"Not restored: {e}", err=1))
     autopilot.set_kill(crm.db(), True, "a backup is waiting to be restored: restart BSO to put it in place")
     return redirect(url_for("botroom", msg=f"Backup checked ({detail}). Sending is stopped. Now click Restart BSO now."))
 

@@ -589,8 +589,7 @@ function backupPut_(req) {
   var slot = withLock_(function () {                        // which slot this upload goes to (decided at part 0)
     var mf = manifest_(folder);
     if (part === 0) {
-      var sl = manual ? 'm0' : 'r' + (Number(mf.m.next || 0) % 4);
-      if (!manual) mf.m.next = (Number(mf.m.next || 0) + 1) % 4;
+      var sl = manual ? 'm0' : newestSlot_(mf.m);
       mf.m.slots[sl] = { name: name, parts: parts, complete: false, size: 0, at: new Date().toISOString() };
       saveManifest_(folder, mf);
       return sl;
@@ -599,22 +598,38 @@ function backupPut_(req) {
     fail_(409, 'Start the backup again from its first part.');
   });
   writePart_(folder, slot, part, data);
-  if (part === parts - 1) withLock_(function () {
+  if (part !== parts - 1) return { ok: true, slot: slot };
+  var size = 0;
+  for (var i = 0; i < parts; i++) { var t = readPart_(folder, slot, i); if (t === null) fail_(409, 'A part is missing: start the backup again.'); size += t.length; }
+  var keep = withLock_(function () {                        // mark it complete; decide what to keep longer
     var mf = manifest_(folder), e = mf.m.slots[slot];
-    if (!e || e.name !== name) return;
-    var size = 0;
-    for (var i = 0; i < parts; i++) { var t = readPart_(folder, slot, i); if (t === null) return; size += t.length; }
+    if (!e || e.name !== name) return [];
     e.complete = true; e.size = size;
-    if (!manual) {                                          // the first backup of a day and of a week is kept longer
-      var day = name.substr(11, 8), now = new Date(Date.UTC(+day.substr(0, 4), +day.substr(4, 2) - 1, +day.substr(6, 2)));
-      var dn = Math.floor(now.getTime() / 86400000), d = 'd' + (dn % 14), w = 'w' + (Math.floor(dn / 7) % 8);
-      var ds = mf.m.slots[d], ws = mf.m.slots[w];
-      if (!ds || !ds.complete || ds.name.substr(11, 8) !== day) { copySlot_(folder, slot, d, e); mf.m.slots[d] = JSON.parse(JSON.stringify(e)); }
-      if (!ws || !ws.complete || Math.floor(dayNum_(ws.name) / 7) !== Math.floor(dn / 7)) { copySlot_(folder, slot, w, e); mf.m.slots[w] = JSON.parse(JSON.stringify(e)); }
-    }
     saveManifest_(folder, mf);
+    if (manual) return [];
+    var dn = dayNum_(name), d = 'd' + (dn % 14), w = 'w' + (Math.floor(dn / 7) % 8), ds = mf.m.slots[d], ws = mf.m.slots[w], out = [];
+    if (!ds || !ds.complete || dayNum_(ds.name) !== dn) out.push(d);                         // the first backup of a day
+    if (!ws || !ws.complete || Math.floor(dayNum_(ws.name) / 7) !== Math.floor(dn / 7)) out.push(w);   // and of a week
+    return out;
   });
+  var copied = JSON.parse(JSON.stringify({ name: name, parts: parts, complete: true, size: size, at: new Date().toISOString() }));
+  for (var j = 0; j < keep.length; j++) {                  // copying takes a while: outside the lock, then recorded
+    var to = keep[j];
+    withLock_(function () { var mf = manifest_(folder); if (mf.m.slots[to]) mf.m.slots[to].complete = false; saveManifest_(folder, mf); });
+    copySlot_(folder, slot, to, copied);
+    withLock_(function () { var mf = manifest_(folder); mf.m.slots[to] = JSON.parse(JSON.stringify(copied)); saveManifest_(folder, mf); });
+  }
   return { ok: true, slot: slot };
+}
+
+function newestSlot_(m) {        // an unfinished slot first (a failed upload never costs a second good copy), else the oldest
+  var best = null;
+  for (var i = 0; i < 4; i++) {
+    var k = 'r' + i, e = m.slots[k];
+    if (!e || !e.complete) return k;
+    if (best === null || e.name < m.slots[best].name) best = k;
+  }
+  return best;
 }
 
 function dayNum_(name) {
