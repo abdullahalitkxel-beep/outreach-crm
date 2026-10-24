@@ -788,7 +788,7 @@ def info_reply(cfg, con, lead, sender, msg, body):
     to, shown = (redirect, f"[TEST for {lead['email']}] {subject}") if redirect else (parseaddr(msg.get("From", ""))[1] or lead["email"], subject)
     full = text + "\n\n" + bot.render(bot.campaign_cfg(cfg, con, c["id"]).get("footer") or "", lead, sender, cfg)
     mid = bot.send_email(sender, to, shown, full, msg.get("Message-ID"), headers={"X-BSO-Kind": "info"},
-                         key="info-" + (msg.get("Message-ID") or f"{lead['id']}-{bot.iso(now_utc())}").strip()[:200])
+                         key="info-" + (msg.get("Message-ID") or f"{lead['id']}-" + __import__("hashlib").sha256(body.encode()).hexdigest()[:16]).strip()[:200])
     convo.record_sent(con, mid, lead, "info", sender["email"], to, shown, full, test=bool(redirect))
     bot.log_event(con, lead["id"], "info_reply", "answered an information request", sender["email"])
     con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",

@@ -65,6 +65,18 @@ def ingest_extra(con, uid, e):
             if isinstance(h, str) and len(h) == 16 and all(c in "0123456789abcdef" for c in h):
                 con.execute("INSERT OR IGNORE INTO dnc(h, at, user_id) VALUES (?,?,?)", (h, H.iso(), uid))
         return True
+    if t == "__dnc_del":                               # the owner took a mistaken stop back: off the list, and off everyone's
+        _dnc_table(con)
+        hs = [h for h in ((e.get("data") or {}).get("h") or [])[:500]
+              if isinstance(h, str) and len(h) == 16 and all(c in "0123456789abcdef" for c in h)]
+        for h in hs:
+            con.execute("DELETE FROM dnc WHERE h=?", (h,))
+        if hs:
+            for u in con.execute("SELECT id FROM users WHERE id!=? AND status='active' AND last_seen IS NOT NULL", (uid,)).fetchall():
+                con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (u["id"], json.dumps({"action": "dnc_del", "h": hs})))
+            con.execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)",
+                        (H.iso(), f"user {uid}", "dnc_removed", f"{len(hs)} address code(s) taken off the team's do-not-contact list"))
+        return True
     if t == "__dnc_req":                               # a laptop without the whole list (new, rebuilt or restored): start it from 0
         _dnc_table(con)
         con.execute("DELETE FROM notices WHERE user_id=? AND delivered=0 AND item LIKE ?", (uid, '{"action": "dnc"%'))
@@ -104,6 +116,7 @@ def dnc_catch_up(con, uid):
         con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (uid, json.dumps({"action": "dnc", "h": [], "to": upto, "last": True})))
     if asked:
         H._m_set(con, f"dnc_req_{uid}", "")
+    con.commit()                                       # the notice must exist when the laptop acknowledges it
 
 
 def dnc_acked(con, uid, item):
@@ -136,8 +149,11 @@ def config_extra(con):
             inboxes += [i["email"].lower() for i in json.loads(u[0]).get("inboxes", [])]
         except Exception:
             pass
+    if not m("dnc_list"):                              # this console's do-not-contact list identity (a new console gets a new one)
+        import secrets as _secrets
+        H._m_set(con, "dnc_list", _secrets.token_hex(8))
     return {"kill": m("bot_kill"), "updates": {"hold": m("upd_hold") == "1", "min_version": m("upd_min"), "release_now": m("upd_now")},
-            "bot_inboxes": sorted(set(inboxes))}
+            "bot_inboxes": sorted(set(inboxes)), "dnc_list": m("dnc_list")}
 
 
 def watch(con):

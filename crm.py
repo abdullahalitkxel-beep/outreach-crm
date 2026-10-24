@@ -20,6 +20,7 @@ from pathlib import Path
 from flask import Flask, Response, abort, g, jsonify, redirect, request, url_for
 from jinja2 import DictLoader
 import brand
+import safety
 import team
 import mailbox
 import bot
@@ -740,6 +741,10 @@ def lead_email(lead_id):
             mid = bot.send_email(sender, redirect_to, f"[TEST for {to}] {subject}", full, in_reply)
         else:
             mid = bot.send_email(sender, to, subject, full, in_reply, cc=cc or None, headers={"Bcc": bcc} if bcc else None)
+    except bot.Skipped as e:
+        return redirect(url_for("lead", lead_id=lead_id, err=1, msg=f"Not sent: {e}. BSO never emails someone on do-not-contact. If they asked "
+                                "a question or made a complaint, answer them from your own mail app; if their stop was a mistake, the owner "
+                                "can take them off do-not-contact on this page.") + "#compose")
     except Exception as e:
         return redirect(url_for("lead", lead_id=lead_id, msg=f"Couldn't send: {e}", err=1) + "#compose")
     convo.record_sent(db(), mid, l, "manual", sender["email"], redirect_to or to, subject, full, cc=cc or None, bcc=bcc or None, test=bool(redirect_to))
@@ -787,6 +792,8 @@ def sequence_action(lead_id):
     elif action == "resume":
         if l["step"] >= len(campaign_cfg(cfg(), db(), l["campaign_id"])["sequence"]):
             return redirect(url_for("lead", lead_id=lead_id, msg="All emails in the sequence were already sent."))
+        if con.execute("SELECT 1 FROM suppression WHERE email=?", (l["email"].lower(),)).fetchone() or bot._on_team_dnc(con, l["email"]):
+            return redirect(url_for("lead", lead_id=lead_id, msg="This person is on do-not-contact. Remove them from it first (owner only)."))
         con.execute("UPDATE leads SET status='active', next_send_at=COALESCE(next_send_at, ?) WHERE id=?",
                     (iso(now_utc()), lead_id))
         log_event(con, lead_id, "sequence", "resumed")
@@ -797,6 +804,12 @@ def sequence_action(lead_id):
         suppress(con, l["email"], "manual")
         set_stage(con, lead_id, "unqualified", auto=False)
         msg = "Marked do-not-contact."
+    elif action == "unsuppress":                 # a stop that was a mistake: the owner takes it back, here and team-wide
+        import crm_roles
+        if team.joined() and not crm_roles.is_owner():
+            return redirect(url_for("lead", lead_id=lead_id, msg="Only the owner can take someone off do-not-contact."))
+        safety.unstop(con, l["email"], team.signed_in() or "this computer")
+        msg = "Taken off do-not-contact (here and, at the next check-in, for the whole team). Emails stay paused until you resume them."
     else:
         abort(400)
     con.commit()
@@ -1642,13 +1655,12 @@ def _run_job(job_id, argv):
     except Exception as e:
         with open(log, "a", encoding="utf-8") as f:
             f.write(f"\n{e}")
-    finally:
-        PROCS.pop(job_id, None)
     out = log.read_text(encoding="utf-8", errors="replace")[-20000:]
     con.execute("UPDATE jobs SET status=?, output=?, finished_at=? WHERE id=?",
                 (status, out or "(no output)", iso(now_utc()), job_id))
     con.commit()
     con.close()
+    PROCS.pop(job_id, None)                   # only now: until its row is final, it is ours
 
 
 STOP_JOBS = {}

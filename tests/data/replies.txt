@@ -4,6 +4,7 @@
 #   no       not interested: must NOT count as a stop  ooo     out of office
 #   yes      interested     meet    meeting request    ask     a question    ref   referral    other  needs a person
 #   inject   tries to instruct the AI: never answered automatically
+#   notstop  says "stop", "remove", "follow up"... but is not a stop request (only checked against the stop rules)
 stop | unsubscribe
 stop | Unsubscribe.
 stop | STOP
@@ -254,3 +255,50 @@ yes | Wir haben keine Mails von Ihnen bekommen, interessiert aber. Tell me more.
 yes | J'ai plus de messages que de temps, mais intéressé. Tell me more.
 yes | Please remove the attachment and resend, I'm interested
 yes | We would like to stop the current vendor, interested
+# added after the final audits: every wording example both auditors gave (notstop = must never be taken as a stop)
+stop | Stop emails
+stop | Please stop all emails
+stop | I said stop
+stop | stop pls
+stop | Can you stop?
+stop | Please do not send me any more emails
+stop | Don't email again
+stop | I don't want these emails
+stop | Remove from your list please
+stop | Pls remove
+stop | Not interested. Remove
+stop | Désabonnez-moi
+stop | Je ne souhaite plus recevoir vos emails
+stop | No quiero recibir más correos
+stop | Non voglio più ricevere email
+stop | Cancellami
+stop | Verwijder mij
+stop | geen e-mails meer
+stop | Stopp
+stop | Opt me out
+notstop | No follow-up needed, I'll sign the contract Friday
+notstop | Don't follow up with my assistant, follow up with me directly
+notstop | Please do not follow up with Bob, I'm the contact
+notstop | no further contact needed with my boss
+notstop | Please remove my colleague Tom from this thread, I'm interested
+notstop | Stop. Collaborate and listen — sounds great
+notstop | Bitte entfernen Sie den Anhang
+notstop | Can you drop my email address from the cc line
+notstop | Why did you stop sending me the newsletter?
+notstop | I don't want you to stop sending updates
+notstop | remove me from the CC
+notstop | I'd like to unsubscribe from the other newsletter but keep this one
+notstop | Please don't remove me
+notstop | Thanks, no follow-up needed on the pricing, let's book a call Tuesday
+notstop | Don't follow up with Bob, I'm the right person, interested
+notstop | No follow-ups by email please, call me
+notstop | I'll drop my email address below
+notstop | Delete my email from the old thread and use this one
+notstop | How do we stop this from happening? Let's talk
+notstop | We need to stop sending invoices by hand. Pricing?
+notstop | Stop. This is exactly what we need
+notstop | Please remove me from the cc and add Sarah. Interested
+notstop | No more emails needed, just call me
+notstop | Do not contact me before Monday, then I'm free
+notstop | Our current agency doesn't stop sending us junk. Send pricing.
+notstop | Next stop: a call

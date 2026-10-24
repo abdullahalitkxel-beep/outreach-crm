@@ -426,8 +426,10 @@ tasks_before = con.execute("SELECT COUNT(*) FROM tasks WHERE lead_id=(SELECT id 
 crm.write_settings({"test_mode": {"enabled": False, "redirect_to": ""}})          # even with the test address cleared first
 bot.sync_mode(con, cfg())
 check(row("hot@real.com")["status"] == "replied" and tasks_before > 0 and
-      con.execute("SELECT COUNT(*) FROM tasks WHERE lead_id=(SELECT id FROM leads WHERE email='hot@real.com')").fetchone()[0] == tasks_before,
+      con.execute("SELECT COUNT(*) FROM tasks WHERE lead_id=(SELECT id FROM leads WHERE email='hot@real.com')").fetchone()[0] >= tasks_before,
       "going live keeps a real person's interested reply: their state and their follow-up task stay (no cold email to them)")
+check(con.execute("SELECT priority FROM tasks WHERE subject LIKE '%arrived while test mode was on%' AND lead_id=(SELECT id FROM leads WHERE email='hot@real.com')").fetchone()[0] == "high",
+      "…and a person gets an urgent task: BSO's automatic answer for them went to the test inbox")
 check(row("mine@test.com")["status"] == "active" and not con.execute("SELECT 1 FROM suppression WHERE email='mine@test.com'").fetchone(),
       "…and still undoes your own test stop (the test address was remembered)")
 sent_body.clear()
@@ -501,4 +503,148 @@ crm_con.commit()
 check(crm.clear_stale_jobs() == 0, "a run still going after a restart (it holds the lock) isn't mistaken for a leftover")
 lock.close()
 check(crm.clear_stale_jobs() >= 1, "once it has ended, its row is closed")
+
+# ---------------------------------------------------------------- 10. after the final audits
+import re as _re  # noqa: E402
+t0 = time.time()
+bot.FIND_EMAILS_RE.findall("a" * 200_000 + "@")
+check(time.time() - t0 < 2, f"a hostile 200 KB string can't freeze reply handling ({time.time() - t0:.2f}s)")
+big = EmailMessage()
+big["From"] = "x@y.com"
+big.set_content("A" * 5_000_000)
+check(len(bot.get_full_text(big)) <= bot.MAX_BODY, "huge emails are read only up to a limit")
+
+lead("col@acme2.com", step=1)
+con.execute("UPDATE leads SET first_msg_id='<c1@d1.com>', sender='a@d1.com' WHERE email='col@acme2.com'")
+con.commit()
+m = EmailMessage()
+m["From"] = "Boss <boss@acme2.com>"
+m["Subject"] = "Re: Quick question"
+m["In-Reply-To"] = "<c1@d1.com>"
+m["Message-ID"] = "<boss1@acme2>"
+m.set_content("Please remove me from your list.")
+bot.handle_message(cfg(), con, {"email": "a@d1.com", "name": "A"}, m)
+con.commit()
+check(con.execute("SELECT 1 FROM suppression WHERE email='boss@acme2.com'").fetchone() and
+      not con.execute("SELECT 1 FROM suppression WHERE email='col@acme2.com'").fetchone() and row("col@acme2.com")["status"] == "paused",
+      "a colleague in the thread who asks to be removed is stopped; the lead is paused for a person, not put on do-not-contact")
+lead("bot@post.com", step=1)
+con.execute("UPDATE leads SET first_msg_id='<b1@d1.com>', sender='a@d1.com' WHERE email='bot@post.com'")
+con.commit()
+m = EmailMessage()
+m["From"] = "Bo <bot@post.com>"
+m["Subject"] = "Re: Quick question"
+m["In-Reply-To"] = "<b1@d1.com>"
+m["Message-ID"] = "<bp1@post>"
+m.set_content("On Mon, 19 Oct 2026, A <a@d1.com> wrote:\n> Hi Bo\n> Not relevant? Reply \"unsubscribe\" and I won't email again.\n\n"
+              "Please take me off your list.\n\nThanks,\nBo\n\nThis email and any attachments are confidential (GDPR notice).")
+bot.handle_message(cfg(), con, {"email": "a@d1.com", "name": "A"}, m)
+con.commit()
+check(row("bot@post.com")["status"] == "unsubscribed" and
+      not con.execute("SELECT COUNT(*) FROM tasks WHERE lead_id=(SELECT id FROM leads WHERE email='bot@post.com') AND subject LIKE '%legal%'").fetchone()[0],
+      "a stop written below the quoted email is honoured in the real email path; the disclaimer under the signature isn't a legal complaint")
+
+tm_id = lead("tm@x.com")
+con.commit()
+try:
+    bot.send_email({"email": "a@d1.com", "name": "A", "smtp_host": "h"}, "q@q.com", "s", "b", lead_id=tm_id, test_mode=True)
+    check(False, "mode switch")
+except bot.Skipped as e:
+    check("test mode was switched" in str(e), "if test mode is switched during a run, that run sends nothing more")
+
+con.execute("INSERT INTO inbox_read(email, ok_at, fail_at) VALUES ('f@x.com', ?, ?) ON CONFLICT(email) DO UPDATE SET ok_at=excluded.ok_at, fail_at=excluded.fail_at",
+            (bot.iso(bot.now_utc() - timedelta(minutes=10)), bot.iso(bot.now_utc() - timedelta(minutes=5))))
+con.execute("INSERT INTO inbox_read(email, ok_at) VALUES ('p@x.com', ?) ON CONFLICT(email) DO UPDATE SET ok_at=excluded.ok_at, fail_at=NULL",
+            (bot.iso(bot.now_utc()),))
+con.execute("INSERT INTO msg_pending(key, at, tries, inbox) VALUES ('<pp@x>', ?, 0, 'p@x.com')", (bot.iso(bot.now_utc()),))
+con.commit()
+u = safety.unread(con, [{"email": "f@x.com"}, {"email": "p@x.com"}])
+check("f@x.com" in u and "p@x.com" in u, "an inbox whose last read failed, or with an email still being handled, doesn't send")
+con.execute("DELETE FROM msg_pending WHERE key='<pp@x>'")
+
+lead("hang@x.com", step=1)
+con.commit()
+FakeIMAP.boxes["a@d1.com"] = [b"From: H <hang@x.com>\r\nTo: a@d1.com\r\nSubject: Re: hi\r\nMessage-ID: <hang1@x>\r\n\r\nStop emailing me.\r\n"]
+con.execute("INSERT INTO seen_messages VALUES ('<hang1@x>')")
+con.execute("INSERT INTO msg_pending(key, at, tries, inbox) VALUES ('<hang1@x>', '2020-01-01T00:00:00Z', ?, 'a@d1.com')", (safety.MAX_TRIES - 1,))
+con.commit()
+try:
+    bot.process_inbox(cfg(), con, s)
+except RuntimeError:
+    pass
+check(not con.execute("SELECT 1 FROM msg_pending WHERE key='<hang1@x>'").fetchone() and row("hang@x.com")["status"] == "unsubscribed",
+      "an email that froze or killed BSO every time is settled after 3 tries (a stop in it is honoured, a person gets a task)")
+
+con.execute("INSERT INTO seen_messages VALUES ('<lost1@x>')")
+con.execute("INSERT INTO inbox_log(inbox, msg_id, decision, at) VALUES ('a@d1.com','<lost1@x>','error: Header object','2026-10-20')")
+con.execute("DELETE FROM app_mode WHERE k='recovered_errors_v1'")
+con.commit()
+safety.ensure(con)
+con.commit()
+check(not con.execute("SELECT 1 FROM seen_messages WHERE msg_id='<lost1@x>'").fetchone(), "emails earlier versions lost to an error are read again, once")
+
+hc2 = sqlite3.connect(str(hub.DB_PATH))
+hc2.row_factory = sqlite3.Row
+hc2.execute("UPDATE notices SET delivered=1 WHERE user_id=1")
+hub._m_set(hc2, "dnc_upto_1", "1000")
+hub.decisions_for(hc2, 1)
+hc2.close()                                       # the request ends without a commit of its own
+hc3 = sqlite3.connect(str(hub.DB_PATH))
+check(hc3.execute("SELECT COUNT(*) FROM notices WHERE user_id=1 AND delivered=0 AND item LIKE '{\"action\": \"dnc\"%'").fetchone()[0] == 1,
+      "the next part of the list is saved by the console, so its acknowledgement moves the bot on (direct console mode)")
+hc3.close()
+
+sent_body.clear()
+_team._post = lambda url, path, payload, token=None, timeout=20: (sent_body.update(payload) or (200, {"policy": {}}))
+_team.joined = lambda: True
+st = _team.state()
+st.pop("dnc_ready", None)
+st["dnc_req_at"] = bot.iso(bot.now_utc() - timedelta(minutes=40))
+st["dnc_part_at"] = bot.iso(bot.now_utc() - timedelta(minutes=2))
+_team.save_state(st)
+_team._sync(con)
+check(not [e for e in sent_body.get("events", []) if e.get("type") == "__dnc_req"], "while parts of the list keep arriving, the bot doesn't restart the transfer")
+st = _team.state()
+st["dnc_part_at"] = bot.iso(bot.now_utc() - timedelta(minutes=40))
+_team.save_state(st)
+sent_body.clear()
+_team._sync(con)
+check([e for e in sent_body.get("events", []) if e.get("type") == "__dnc_req"], "…only when nothing has arrived for 30 minutes")
+
+lead("oops@good.com", step=1)
+con.commit()
+bot.suppress(con, "oops@good.com", "unsubscribe")
+con.execute("INSERT OR IGNORE INTO team_dnc(h, at) VALUES (?, 'x')", (_team.dnc_hash("oops@good.com"),))
+con.commit()
+safety.unstop(con, "oops@good.com", "owner")
+check(not con.execute("SELECT 1 FROM suppression WHERE email='oops@good.com'").fetchone() and row("oops@good.com")["status"] == "paused"
+      and _team.dnc_hash("oops@good.com") in _team.state().get("dnc_del_pending", []),
+      "the owner can take a mistaken stop back: off do-not-contact here, paused until resumed, and queued for the whole team")
+sent_body.clear()
+_team._sync(con)
+dels = [e for e in sent_body.get("events", []) if e.get("type") == "__dnc_del"]
+check(dels and _team.dnc_hash("oops@good.com") in dels[0]["data"]["h"] and not _team.state().get("dnc_del_pending"), "the removal goes to the console")
+hc4 = sqlite3.connect(str(hub.DB_PATH))
+hc4.row_factory = sqlite3.Row
+hc4.execute("INSERT OR IGNORE INTO dnc(h, at, user_id) VALUES (?, 'x', 1)", (_team.dnc_hash("oops@good.com"),))
+hub_bot.ingest_extra(hc4, 1, dels[0])
+hc4.commit()
+check(not hc4.execute("SELECT 1 FROM dnc WHERE h=?", (_team.dnc_hash("oops@good.com"),)).fetchone() and
+      hc4.execute("SELECT COUNT(*) FROM notices WHERE user_id=2 AND item LIKE '%dnc_del%'").fetchone()[0] == 1,
+      "the console takes it off the team list and tells every other laptop")
+lead("oops2@good.com", step=1)
+bot.suppress(con, "oops2@good.com", "on the team's do-not-contact list")
+con.commit()
+_team._apply_decisions(con, [{"action": "dnc_del", "h": [_team.dnc_hash("oops2@good.com")], "handover_id": "nt:9991"}])
+check(not con.execute("SELECT 1 FROM suppression WHERE email='oops2@good.com'").fetchone() and row("oops2@good.com")["status"] == "paused",
+      "another laptop takes it off too (only stops that came from the team list)")
+con.execute("CREATE TABLE IF NOT EXISTS dnc_reported (email TEXT PRIMARY KEY)")
+con.execute("INSERT OR IGNORE INTO dnc_reported VALUES ('r@x.com')")
+con.commit()
+st = _team.state()
+st["dnc_list"] = "old-console"
+_team.save_state(st)
+_team._apply_decisions(con, [{"action": "config", "dnc_list": "new-console"}])
+check(not con.execute("SELECT 1 FROM dnc_reported").fetchone(), "a replaced console gets every stop reported again")
+_team._post, _team.joined = real_post, real_joined2
 print(f"\nAll {n} stop checks passed.")

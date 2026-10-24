@@ -60,7 +60,7 @@ for email_, cid in (("ann@acme.com", 1), ("bob@uk.co", c2["id"]), ("cat@later.co
 con.commit()
 
 sent = []
-def fake_send(s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None, statuses=None, check_dnc=True):
+def fake_send(s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None, statuses=None, check_dnc=True, **_kw):
     if s["email"] in fail_for:
         raise smtplib.SMTPAuthenticationError(535, b"bad login")
     sent.append(dict(frm=s["email"], to=to, subject=subject, body=body))

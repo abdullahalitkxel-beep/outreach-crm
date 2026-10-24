@@ -183,12 +183,9 @@ def ensure(con):
     if not con.execute("SELECT 1 FROM app_mode WHERE k='recovered_errors_v1'").fetchone():
         # Earlier versions marked an email done even when handling it failed (a stop request could be lost that way).
         # Those emails are read again: they are taken out of the "already seen" list once.
-        try:
-            con.execute("DELETE FROM seen_messages WHERE key IN (SELECT msg_id FROM inbox_log WHERE decision LIKE 'error:%' AND msg_id IS NOT NULL) "
-                        "AND key NOT IN (SELECT msg_id FROM received WHERE msg_id IS NOT NULL)")
-        except sqlite3.Error:
-            pass
-        con.execute("INSERT OR REPLACE INTO app_mode(k, v) VALUES ('recovered_errors_v1', ?)", (_iso(_now()),))
+        n = con.execute("DELETE FROM seen_messages WHERE msg_id IN (SELECT msg_id FROM inbox_log WHERE decision LIKE 'error:%' "
+                        "AND msg_id IS NOT NULL) AND msg_id NOT IN (SELECT msg_id FROM received WHERE msg_id IS NOT NULL)").rowcount
+        con.execute("INSERT OR REPLACE INTO app_mode(k, v) VALUES ('recovered_errors_v1', ?)", (f"{_iso(_now())} {n} email(s) to read again",))
 
 
 def read_ok(con, email):
@@ -205,11 +202,15 @@ def unread(con, senders, minutes=READ_FRESH_MIN):
     """{email: why} for inboxes whose replies haven't been read recently. They don't send cold email until they are."""
     cut = _iso(_now() - timedelta(minutes=minutes))
     rows = {r["email"]: r for r in con.execute("SELECT * FROM inbox_read")}
+    pending = {(r[0] or "").lower() for r in con.execute("SELECT DISTINCT inbox FROM msg_pending")}
     out = {}
     for s in senders:
         e = s["email"].lower()
         r = rows.get(e)
-        if r and r["ok_at"] and r["ok_at"] >= cut:
+        if e in pending:
+            out[e] = "an email in it (perhaps a stop request) is still being handled; it sends once that is done"
+            continue
+        if r and r["ok_at"] and r["ok_at"] >= cut and (not r["fail_at"] or r["fail_at"] < r["ok_at"]):
             continue
         why = f"its replies couldn't be read ({r['error']})" if r and r["error"] else "its replies haven't been read yet"
         out[e] = why + "; it sends once they are, so no stop request is missed"
@@ -660,11 +661,21 @@ def message_failed(cfg, con, sender, key, msg, err):
     tries = con.execute("SELECT tries FROM msg_pending WHERE key=?", (key,)).fetchone()[0]
     if tries < MAX_TRIES:
         return True
+    settle(cfg, con, sender, key, msg, err)
+    return False
+
+
+def settle(cfg, con, sender, key, msg, err):
+    """An email that could never be handled: if it reads like a stop request the sender is stopped anyway; a person
+    always gets a task to read it."""
+    import bot
+    import guard
+    from email.utils import parseaddr
     con.execute("DELETE FROM msg_pending WHERE key=?", (key,))
     frm = parseaddr(guard.text(msg.get("From", "")))[1].lower()
     subj = guard.text(msg.get("Subject", ""))
     try:
-        body = bot.get_text_body(msg)
+        body = bot.get_full_text(msg)
     except Exception:
         body = ""
     stop = guard.stop_reason(subj, body) if frm else None
@@ -677,7 +688,6 @@ def message_failed(cfg, con, sender, key, msg, err):
         convo.log_inbox(con, sender["email"], msg, f"error after {MAX_TRIES} tries: {err}"[:200], None, "INBOX")
     except Exception:
         pass
-    return False
 
 
 # ---------------------------------------------------------------- the last check before an email goes out
@@ -740,3 +750,43 @@ def _db_path():
     """The database this BSO uses (the 'database' setting, outreach.db by default)."""
     import bot
     return getattr(bot, "DB_FILE", None) or (_data() / "outreach.db")
+
+
+# ---------------------------------------------------------------- taking a mistaken stop back
+
+def unstop(con, email, who="owner"):
+    """Remove an address from do-not-contact here and queue its removal from the team's list. The lead is set to
+    paused: a person resumes it on purpose."""
+    import bot
+    import team
+    email = (email or "").lower().strip()
+    con.execute("DELETE FROM suppression WHERE email=?", (email,))
+    con.execute("DELETE FROM dnc_reported WHERE email=?", (email,))
+    h = team.dnc_hash(email)
+    try:
+        con.execute("DELETE FROM team_dnc WHERE h=?", (h,))
+    except sqlite3.OperationalError:
+        pass
+    for (lid,) in con.execute("SELECT id FROM leads WHERE email=? AND status IN ('unsubscribed','bounced')", (email,)).fetchall():
+        con.execute("UPDATE leads SET status='paused' WHERE id=?", (lid,))
+        bot.log_event(con, lid, "unstopped", f"taken off do-not-contact by {who}")
+    con.commit()
+    try:
+        s = team.state()
+        if s:
+            s["dnc_del_pending"] = sorted(set(s.get("dnc_del_pending") or []) | {h})
+            team.save_state(s)
+    except Exception:
+        pass
+
+
+def test_mode_now():
+    """Whether this database is in test mode right now (read fresh)."""
+    c = sqlite3.connect(str(_db_path()), timeout=30)
+    try:
+        r = c.execute("SELECT v FROM app_mode WHERE k='test'").fetchone()
+        return bool(r and r[0] == "1")
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        c.close()

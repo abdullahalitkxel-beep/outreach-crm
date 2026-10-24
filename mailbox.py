@@ -357,6 +357,9 @@ def send_reply(cfg, con, lead_id, body, cc="", bcc=""):
         else:
             mid = bot.send_email(sender, to, subject, body.strip(), last["msg_id"] if last else None, cc=cc or None,
                                  headers={"Bcc": bcc} if bcc else None)
+    except bot.Skipped as e:
+        return False, (f"Not sent: {e}. BSO never emails someone on do-not-contact. If they asked a question or made a complaint, "
+                       "answer them from your own mail app.")
     except Exception as e:
         return False, f"Couldn't send: {e}"
     con.execute("INSERT OR IGNORE INTO messages(lead_id, msg_id, direction, at, frm, to_, cc, bcc, subject, body, seen, via) VALUES (?,?,?,?,?,?,?,?,?,?,1,'bso')",

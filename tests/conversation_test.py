@@ -34,7 +34,7 @@ cfg = crm.cfg()
 con = bot.db_connect(cfg.get("database", "outreach.db"))
 bot.sync_mode(con, cfg)
 sent = []
-bot.send_email = lambda s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None, statuses=None, check_dnc=True: sent.append(dict(to=to, subject=subject, body=body, headers=headers)) or f"<out{len(sent)}@x>"
+bot.send_email = lambda s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None, statuses=None, check_dnc=True, **_kw: sent.append(dict(to=to, subject=subject, body=body, headers=headers)) or f"<out{len(sent)}@x>"
 bot.notify = lambda *a, **k: None
 sender = {"email": INBOX, "name": "Cole Reed"}
 

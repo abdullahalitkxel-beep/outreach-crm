@@ -36,7 +36,15 @@ def check_now(config_path, email):
         con = bot.db_connect(cfg.get("database", "outreach.db"))
         try:
             bot.sync_mode(con, cfg)
-            n = bot.recheck_once(cfg, con, s) + bot.process_inbox(cfg, con, s)
+            import safety
+            try:
+                n = bot.recheck_once(cfg, con, s) + bot.process_inbox(cfg, con, s)
+            except Exception as e:
+                safety.read_fail(con, s["email"], e)        # a failed live read counts too: the inbox waits until it's done
+                con.commit()
+                raise
+            safety.read_ok(con, s["email"])
+            con.commit()
             if n:
                 after_new_mail(con)
             return n

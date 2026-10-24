@@ -84,7 +84,7 @@ try:
     cfg["test_mode"] = {"enabled": False}
     sender = {"email": "cole.reed@getneosofttech.com", "name": "Cole Reed", "password": "x", "smtp_host": "h", "imap_host": "h"}
     sent = []
-    bot.send_email = lambda s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None, statuses=None, check_dnc=True: sent.append(
+    bot.send_email = lambda s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None, statuses=None, check_dnc=True, **_kw: sent.append(
         dict(to=to, subject=subject, body=body, in_reply_to=in_reply_to, cc=cc)) or "<id@x>"
     bot.notify = lambda *a, **k: None
     for i, (email, first, comp) in enumerate((("sarah@acme.com", "Sarah", "Acme Inc"), ("tom@globex.com", "Tom", "Globex"),

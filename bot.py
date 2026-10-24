@@ -97,7 +97,7 @@ SECRETS.apply_to_environ()
 log = logging.getLogger("outreach")
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-FIND_EMAILS_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+FIND_EMAILS_RE = re.compile(r"[\w.+-]{1,64}@[\w-]{1,63}\.[\w.-]{1,190}")      # bounded: a hostile email can't make it run for hours
 CORE_FIELDS = {"email", "first_name", "company", "website"}
 REPLY_LABELS = ["interested", "meeting_request", "question", "not_interested", "unsubscribe", "out_of_office", "referral", "other"]
 HANDOVER_LABELS = ("interested", "meeting_request", "question")
@@ -412,6 +412,19 @@ def clear_test_results(con, tester=None):
             con.execute(f"UPDATE leads SET {', '.join(k + '=?' for k in data)} WHERE id=?", (*data.values(), r["lead_id"]))
             n += 1
     keep = ",".join(str(int(x)) for x in real_leads) or "-1"
+    # A real person wrote while test mode was on: BSO's automatic actions for them (handover intro, briefing, answers)
+    # went to the test inbox, not to them or the supervisor. Undo the pretend handover and give a person a task.
+    for lid in real_leads:
+        test_ho = [r[0] for r in con.execute("SELECT rowid FROM handover_out WHERE lead_id=? AND rowid IN "
+                                             "(SELECT CAST(rid AS INTEGER) FROM test_rows WHERE tbl='handover_out')", (lid,)).fetchall()]
+        if test_ho:
+            con.execute(f"DELETE FROM handover_out WHERE rowid IN ({','.join('?' * len(test_ho))})", test_ho)
+            con.execute("UPDATE leads SET handed_to=NULL, handed_at=NULL WHERE id=?", (lid,))
+        lr = con.execute("SELECT email, first_name, status FROM leads WHERE id=?", (lid,)).fetchone()
+        if lr and lr["status"] not in ("unsubscribed", "bounced"):
+            add_task(con, f"Real reply from {lr['first_name'] or lr['email']} arrived while test mode was on: BSO's automatic answer or "
+                          "handover went to your test inbox, not to them or a supervisor. Please read it and answer now.", lead_id=lid)
+            con.execute("UPDATE tasks SET priority='high', kind='respond' WHERE id=last_insert_rowid()")
     for t in TEST_TRACKED:
         if t == "suppression":
             for (e,) in con.execute("SELECT rid FROM test_rows WHERE tbl='suppression'").fetchall():
@@ -900,7 +913,7 @@ INTERNAL_KINDS = {"brief", "forward", "intake", "readiness", "seed"}     # BSO's
 
 
 def send_email(sender, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None,
-               statuses=("active",), check_dnc=True):
+               statuses=("active",), check_dnc=True, test_mode=None):
     """key: a name for this one email (e.g. "lead12-step2"). With a key the email is written in the send journal before
     the mail server is contacted, and a key that was already sent is never sent again (its first Message-ID is returned)."""
     try:
@@ -939,6 +952,8 @@ def send_email(sender, to, subject, body, in_reply_to=None, dry_run=False, cc=No
         why = safety.why_not_send(lead_id, statuses)
         if why:
             raise Skipped(why)
+        if test_mode is not None and safety.test_mode_now() != bool(test_mode):
+            raise Skipped("test mode was switched on or off during this run; the next run carries on in the new mode")
     if check_dnc and str((headers or {}).get("X-BSO-Kind", "")) not in INTERNAL_KINDS:
         import safety                         # every email to anyone outside: nobody on do-not-contact, whoever sends it and why
         bad = safety.blocked_recipients([to, cc, (headers or {}).get("Bcc")])
@@ -1312,7 +1327,7 @@ def _autopilot_round(cfg, con, args, due, for_campaign, usable, capacity, limits
     def deliver(p):
         try:
             return send_email(p["sender"], p["to"], p["shown"], p["full_body"], p["lead"]["first_msg_id"] if p["idx"] > 0 else None, False,
-                              headers=p["headers"], key=p["key"], lead_id=p["lead"]["id"]), None
+                              headers=p["headers"], key=p["key"], lead_id=p["lead"]["id"], test_mode=bool(redirect)), None
         except Exception as e:
             return None, e
     if to_send:
@@ -1378,8 +1393,10 @@ def cmd_run(cfg, con, args):
         if not ok:
             print("PROBLEM:", why)
             sys.exit(1)
+    if not args.dry_run:
+        sync_mode(con, cfg)                     # the mode this run sends in is the database's mode, checked again before each email
     dnc_wait = False
-    if not args.dry_run and team_mod.joined() and team_mod.works_as_bot() and not team_mod.dnc_ready() and \
+    if not args.dry_run and team_mod.joined() and not team_mod.dnc_ready() and \
             (cfg.get("team_dnc") or {}).get("required", True) and team_mod.dnc_must_wait(con):
         dnc_wait = True                # a new, rebuilt or restored bot: no FIRST emails until it has the team's whole list
         print("Waiting for the team's do-not-contact list from the Master Console: follow-ups and replies carry on, "
@@ -1659,7 +1676,7 @@ def cmd_run(cfg, con, args):
                 con.commit()
                 msg_id = send_email(sender, to, shown_subject, full_body, reply_to, args.dry_run,
                                     headers=None if args.dry_run else unsub_headers(con, sender, lead, bool(redirect)), key=send_key(lead, idx, redirect),
-                                    lead_id=None if args.dry_run else lead["id"])
+                                    lead_id=None if args.dry_run else lead["id"], test_mode=bool(redirect))
             except Skipped as e:
                 print(f"Not sent to {lead['email']}: {e}")
                 if draft:
@@ -1807,7 +1824,7 @@ def nurture_tick(cfg, con, senders, redirect):
         con.commit()
         try:
             mid = send_email(sender, to, subj, body, lead.get("first_msg_id"), headers=unsub_headers(con, sender, lead, bool(redirect)), key=f"outbox{d['id']}",
-                             lead_id=lead["id"], statuses=("nurture", "active", "replied", "done", "paused"))
+                             lead_id=lead["id"], statuses=("nurture", "active", "replied", "done", "paused"), test_mode=bool(redirect))
         except Skipped as e:
             print(f"Check-back email to {lead['email']} not sent: {e}")
             con.execute("UPDATE outbox SET status='cancelled' WHERE id=?", (d["id"],))
@@ -1823,9 +1840,14 @@ def nurture_tick(cfg, con, senders, redirect):
 
 # ---------------------------------------------------------------- inbox
 
-def get_text_body(msg):
+MAX_BODY = 200_000          # characters of an email BSO reads: a huge or hostile email can't freeze reply handling
+
+
+def get_full_text(msg):
+    """The whole text of an email (quoted parts included), as plain text, at most MAX_BODY characters."""
+    import html as _html
     parts = msg.walk() if msg.is_multipart() else [msg]
-    plain = html = ""
+    plain = html_text = ""
     for p in parts:
         if p.get_content_disposition() == "attachment":
             continue
@@ -1833,16 +1855,27 @@ def get_text_body(msg):
         if ctype not in ("text/plain", "text/html"):
             continue
         try:
-            text = p.get_payload(decode=True).decode(p.get_content_charset() or "utf-8", "replace")
+            raw = p.get_payload(decode=True) or b""
         except Exception:
             continue
+        raw = raw[:MAX_BODY * 4]
+        try:
+            text = raw.decode(p.get_content_charset() or "utf-8", "replace")
+        except LookupError:                      # an unknown charset name ("x-unknown"): read it as UTF-8
+            text = raw.decode("utf-8", "replace")
         if ctype == "text/plain" and not plain:
             plain = text
-        elif ctype == "text/html" and not html:
-            html = re.sub(r"<[^>]+>", " ", text)
-    text = plain or html
+        elif ctype == "text/html" and not html_text:
+            html_text = re.sub(r"(?i)<br\s*/?>|</p>|</div>", "\n", text)
+            html_text = _html.unescape(re.sub(r"<[^>]+>", " ", html_text))
+    text = (plain or html_text)[:MAX_BODY]
+    return text.replace("\u00a0", " ")
+
+
+def get_text_body(msg):
+    text = get_full_text(msg)
     # drop the quoted thread (forwarded chains stay: they show who passed our email on). Decisions about the
-    # reply (stop requests, labels) use guard.new_text(), which also cuts Outlook-style quoting and our footer.
+    # reply (stop requests, labels) use the full text through guard.new_text(), which cuts quoting properly.
     lines = []
     for line in text.splitlines():
         if line.startswith(">") or re.match(r"^On .+wrote:\s*$", line.strip()):
@@ -2016,6 +2049,7 @@ def handle_message(cfg, con, sender, msg, folder="INBOX"):
     inbox = sender["email"]
     frm = parseaddr(msg.get("From", ""))[1].lower()
     body = get_text_body(msg)
+    full = get_full_text(msg)                 # stop requests are judged on the whole email (a stop may be written below the quote)
 
     def done(decision, lead_id=None):
         convo.log_inbox(con, inbox, msg, decision, lead_id, folder)
@@ -2065,13 +2099,24 @@ def handle_message(cfg, con, sender, msg, folder="INBOX"):
     if m["path"]:
         convo.add_path_contacts(con, lead, m["path"])
     who_sent = "" if frm == lead["email"] else f" from {frm}"
-    stop = guard.stop_reason(msg.get("Subject", ""), body)
+    stop = guard.stop_reason(msg.get("Subject", ""), full)
+    tester = str(((cfg.get("test_mode") or {}).get("redirect_to")) or "").lower()
+    is_test_reply = "[TEST for" in str(msg.get("Subject", "")) or (tester and frm == tester)
+    own_address = frm == lead["email"] or bool(con.execute("SELECT 1 FROM lead_addresses WHERE email=? AND lead_id=?", (frm, lead["id"])).fetchone())
+    if stop and not own_address and not is_test_reply and lead["status"] not in ("unsubscribed", "bounced"):
+        # someone else in the thread (a colleague) asked to be removed: stop them, pause the lead, a person decides about the lead
+        suppress(con, frm, "asked not to be contacted")
+        cancel_drafts(con, lead["id"])
+        con.execute("UPDATE leads SET status='paused' WHERE id=? AND status='active'", (lead["id"],))
+        convo.record_received(con, msg, lead["id"], inbox, folder, frm, body, "unsubscribe", "closed", m["how"], m["path"])
+        add_task(con, f"{frm} (in {lead['first_name'] or lead['email']}'s thread) asked not to be contacted. They are stopped; "
+                      f"{lead['email']} is paused until you decide.", lead_id=lead["id"])
+        return done(f"stop request from {frm} (not the lead): {frm} stopped, {lead['email']} paused for a person{where}", lead["id"])
     if stop and lead["status"] not in ("unsubscribed", "bounced"):      # decided in code: no AI can overrule a stop
         suppress(con, lead["email"], "unsubscribe" if stop == "unsubscribe" else "legal or complaint wording")
         log_event(con, lead["id"], "complaint" if stop == "legal" or guard.complaint(msg.get("Subject", ""), body) else "unsubscribed",
                   "reply asked to stop", sender["email"])
-        tester = str(((cfg.get("test_mode") or {}).get("redirect_to")) or "").lower()
-        if frm != lead["email"] and frm != tester:          # your own test reply never blocks your own address
+        if frm != lead["email"] and not is_test_reply:      # your own test reply (any of your addresses) never blocks you
             suppress(con, frm, "asked not to be contacted")
         cancel_drafts(con, lead["id"])
         if stop == "legal":
@@ -2088,7 +2133,7 @@ def handle_message(cfg, con, sender, msg, folder="INBOX"):
         convo.record_received(con, msg, lead["id"], inbox, folder, frm, body, how=m["how"], path=m["path"])
         return done(f"ignored: {lead['email']} is on do-not-contact", lead["id"])
 
-    a = analyze_reply(cfg, msg, body)
+    a = analyze_reply(cfg, msg, full)
     label = a["label"]
     x = json.loads(lead.get("extra") or "{}")
     engaged = con.execute("SELECT COUNT(*) FROM received WHERE lead_id=?", (lead["id"],)).fetchone()[0] + \
@@ -2147,7 +2192,7 @@ def handle_message(cfg, con, sender, msg, folder="INBOX"):
         con.execute("UPDATE leads SET status='unsubscribed' WHERE id=?", (lead["id"],))
         set_stage(con, lead["id"], "unqualified")
         suppress(con, lead["email"], label if label in ("unsubscribe", "not_interested") else "asked not to be contacted")
-        if frm != lead["email"] and frm != str(((cfg.get("test_mode") or {}).get("redirect_to")) or "").lower():
+        if frm != lead["email"] and not is_test_reply:
             suppress(con, frm, "asked not to be contacted")
         return done(f"{label.replace('_', ' ')} from {lead['email']}{who_sent}: closed, on do-not-contact{extra_note}{where}", lead["id"])
     if temp == "cold":
@@ -2440,9 +2485,20 @@ def process_inbox(cfg, con, sender, recheck=False, days=None):
                 claimed = con.execute("INSERT OR IGNORE INTO seen_messages VALUES (?)", (key,)).rowcount
                 if claimed:
                     con.execute("INSERT OR REPLACE INTO msg_pending(key, at, tries, inbox) VALUES (?,?,0,?)", (key, iso(now_utc()), sender["email"]))
-                else:                                # claimed earlier but never finished (crash, or an error): take it over, once
-                    claimed = con.execute("UPDATE msg_pending SET at=? WHERE key=? AND at<?",
+                else:                                # claimed earlier but never finished (crash, hang, error): take it over, once
+                    claimed = con.execute("UPDATE msg_pending SET at=?, tries=tries+1 WHERE key=? AND at<?",
                                           (iso(now_utc()), key, iso(now_utc() - timedelta(minutes=10)))).rowcount
+                    tries = (con.execute("SELECT tries FROM msg_pending WHERE key=?", (key,)).fetchone() or [0])[0]
+                    if claimed and tries >= safety.MAX_TRIES:     # it stopped BSO itself every time: settle it without handling it
+                        con.commit()
+                        try:
+                            _, full = M.uid("fetch", uid, "(BODY.PEEK[])")
+                            stuck = guard.parse(full[0][1][:300_000])
+                        except Exception:
+                            stuck = guard.parse(b"")
+                        safety.settle(cfg, con, sender, key, stuck, "BSO stopped or froze while handling it")
+                        con.commit()
+                        continue
                 con.commit()                         # always end the transaction, or other readers of this inbox would wait
                 if not claimed:
                     if con.execute("SELECT 1 FROM msg_pending WHERE key=?", (key,)).fetchone():
@@ -2494,11 +2550,13 @@ def cmd_check(cfg, con, args):
     """Read every inbox for replies. With many inboxes (the BSO Bot) several are read at the same time."""
     senders = [s for s in load_senders(cfg) if s["password"]]
     import safety
+    print(f"Reading replies in {len(senders)} inbox(es)…", flush=True)
     def one(s, c):
         try:
             recheck_once(cfg, c, s)
             process_inbox(cfg, c, s)
             safety.read_ok(c, s["email"])            # this inbox may send: its replies (and any stop requests) are read
+            print(f"  read {s['email']}", flush=True)  # progress in the run log: a long read is not mistaken for a stuck run
         except Exception as e:
             log.error("Inbox check failed for %s: %s", s["email"], e)
             safety.read_fail(c, s["email"], e)
@@ -2897,8 +2955,8 @@ def main(argv=None):
                         format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_config(args.config)
     con = db_connect(cfg.get("database", "outreach.db"))
+    lock = acquire_lock() if args.cmd in ("run", "check") else None     # first: a mode switch never lands in the middle of a run
     sync_mode(con, cfg)
-    lock = acquire_lock() if args.cmd in ("run", "check") else None
 
     {"import": cmd_import, "run": cmd_run, "check": cmd_check,
      "stats": cmd_stats, "suppress": cmd_suppress,

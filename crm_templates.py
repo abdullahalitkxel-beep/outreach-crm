@@ -477,7 +477,7 @@ LEAD = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block titl
  <form method="post" action="{{ url_for('sequence_action', lead_id=l.id) }}" style="display:inline">
  {% if l.status == 'active' %}<button class="btn" name="action" value="pause">Pause emails</button>{% endif %}
  {% if l.status in ('paused','done') and l.step < n_steps %}<button class="btn" name="action" value="resume">Resume emails</button>{% endif %}
- {% if l.status not in ('unsubscribed','bounced') %}<button class="btn" name="action" value="suppress" onclick="return confirm('Never email this person again?')">Do not contact</button>{% endif %}
+ {% if l.status not in ('unsubscribed','bounced') %}<button class="btn" name="action" value="suppress" onclick="return confirm('Never email this person again?')">Do not contact</button>{% elif is_owner or not team_user %}<button class="btn" name="action" value="unsuppress" onclick="return confirm('Take this person off do-not-contact for the whole team? Only do this if their stop was a mistake (for example they wrote &quot;remove Bob from cc&quot;). Their emails stay paused until you resume them.')">Remove from do-not-contact</button>{% endif %}
  </form>
 {% endcall %}
 {{ m.path(lead_open, l.stage, url_for('lead_stage', lead_id=l.id), closed_label, closed_cls, next_stage) }}

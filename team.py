@@ -647,11 +647,12 @@ def apply_dnc(con, hashes, last=False):
             if dnc_hash(r["e"]) in new:
                 _bot.suppress(con, r["e"], "on the team's do-not-contact list")
                 stopped += 1
+    s = state()
+    s["dnc_part_at"] = iso(now_utc())
     if last:
-        s = state()
         s["dnc_ready"] = iso(now_utc())
         s.pop("dnc_must_wait", None)
-        save_state(s)
+    save_state(s)
     con.commit()
     return stopped
 
@@ -1002,6 +1003,13 @@ def _apply_decisions(con, decisions):
                 s["updates"] = d["updates"]
             if isinstance(d.get("bot_inboxes"), list):
                 s["bot_inboxes"] = d["bot_inboxes"]
+            if d.get("dnc_list") and d["dnc_list"] != s.get("dnc_list"):
+                # a new or replaced console: it doesn't have the stops reported to the old one, so report them all again
+                if s.get("dnc_list") or s.get("dnc_ready"):
+                    con.execute("CREATE TABLE IF NOT EXISTS dnc_reported (email TEXT PRIMARY KEY)")
+                    con.execute("DELETE FROM dnc_reported")
+                    con.commit()
+                s["dnc_list"] = d["dnc_list"]
             save_state(s)
             continue
         if action == "bot_cmd":
@@ -1053,6 +1061,24 @@ def _apply_decisions(con, decisions):
                 ok = False
             if ok and d.get("handover_id"):
                 ho_done.append(d["handover_id"])
+            continue
+        if action == "dnc_del":         # the owner took a mistaken stop back: off the team list here too
+            hid = d.get("handover_id")
+            if hid not in state().get("ho_seen", []):
+                _dnc_table(con)
+                hs = {str(h)[:16] for h in d.get("h") or []}
+                for h in hs:
+                    con.execute("DELETE FROM team_dnc WHERE h=?", (h,))
+                for r in con.execute("SELECT email FROM suppression WHERE reason=?", ("on the team's do-not-contact list",)).fetchall():
+                    if dnc_hash(r["email"]) in hs:
+                        con.execute("DELETE FROM suppression WHERE email=?", (r["email"],))
+                        con.execute("UPDATE leads SET status='paused' WHERE email=? AND status='unsubscribed'", (r["email"],))
+                con.commit()
+                s2 = state()
+                s2["ho_seen"] = (s2.get("ho_seen", []) + [hid])[-1000:]
+                save_state(s2)
+            if hid:
+                ho_done.append(hid)
             continue
         if action == "dnc":
             hid = d.get("handover_id")
@@ -1269,10 +1295,15 @@ def _sync(con, version=""):
             tester = (con.execute("SELECT v FROM app_mode WHERE k='tester'").fetchone() or [""])[0]
             dnc_rows = [r["email"] for r in con.execute(
                 "SELECT email FROM suppression WHERE email NOT IN (SELECT email FROM dnc_reported) AND email!=? LIMIT 2000", (tester or "",)).fetchall()]
-        if dnc_rows:
-            packed.append({"id": "dnc", "type": "__dnc", "data": {"h": [dnc_hash(e) for e in dnc_rows]}})
-        if not s.get("dnc_ready") and (not s.get("dnc_req_at") or s["dnc_req_at"] < iso(now_utc() - timedelta(minutes=10))):
-            packed.append({"id": "dnq", "type": "__dnc_req", "data": {}})
+        if dnc_rows:              # first in the batch, so a console that only takes the first 600 events never drops them
+            packed.insert(0, {"id": "dnc", "type": "__dnc", "data": {"h": [dnc_hash(e) for e in dnc_rows]}})
+        dnc_del = list(s.get("dnc_del_pending") or [])
+        if dnc_del:
+            packed.insert(0, {"id": "dnd", "type": "__dnc_del", "data": {"h": dnc_del[:500]}})
+        stalled = iso(now_utc() - timedelta(minutes=30))
+        if not s.get("dnc_ready") and (not s.get("dnc_req_at") or
+                                       (s["dnc_req_at"] < stalled and (s.get("dnc_part_at") or "") < stalled)):
+            packed.append({"id": "dnq", "type": "__dnc_req", "data": {}})   # once; again only if no part has arrived for 30 minutes
         _access_table(con)
         acc = con.execute("SELECT * FROM access_log WHERE synced=0 ORDER BY id LIMIT 50").fetchall()
         dev = s.get("device_tag") or secrets.token_hex(4)
@@ -1319,6 +1350,8 @@ def _sync(con, version=""):
     if dnc_rows:
         con.executemany("INSERT OR IGNORE INTO dnc_reported(email) VALUES (?)", [(e,) for e in dnc_rows])
         con.commit()
+    if dnc_del:
+        s["dnc_del_pending"] = [h for h in (s.get("dnc_del_pending") or []) if h not in set(dnc_del[:500])]
     if any(p.get("type") == "__dnc_req" for p in packed):
         s["dnc_req_at"] = iso(now_utc())
     if events:

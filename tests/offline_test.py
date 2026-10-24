@@ -86,7 +86,7 @@ try:
     cfg["test_mode"] = {"enabled": False}
     sender = {"email": "cole.reed@getneosofttech.com", "name": "Cole Reed", "password": "x", "smtp_host": "h", "imap_host": "h"}
     sent = []
-    bot.send_email = lambda s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None, statuses=None, check_dnc=True: sent.append(dict(to=to, cc=cc, subject=subject, body=body)) or "<x>"
+    bot.send_email = lambda s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None, statuses=None, check_dnc=True, **_kw: sent.append(dict(to=to, cc=cc, subject=subject, body=body)) or "<x>"
     bot.notify = lambda *a, **k: None
     for i, (email, first, comp) in enumerate((("sarah@acme.com", "Sarah", "Acme"), ("tom@globex.com", "Tom", "Globex"), ("ann@initech.com", "Ann", "Initech")), 1):
         con.execute("INSERT INTO leads(email, first_name, company, extra, status, step, created_at, first_subject) VALUES (?,?,?,?,'active',1,'2026-10-01','Quick question')",
