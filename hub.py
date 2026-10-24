@@ -2041,7 +2041,11 @@ def ingest(con, uid, j):
     for lid in (j.get("acked") or [])[:600]:
         if isinstance(lid, str) and lid.startswith("ho:nt:"):
             try:
+                nt = con.execute("SELECT item FROM notices WHERE id=? AND user_id=? AND delivered=0", (int(lid[6:]), uid)).fetchone()
                 con.execute("UPDATE notices SET delivered=1 WHERE id=? AND user_id=?", (int(lid[6:]), uid))
+                if nt and '"action": "dnc"' in nt["item"]:
+                    import hub_bot
+                    hub_bot.dnc_acked(con, uid, json.loads(nt["item"]))
             except ValueError:
                 pass
             continue
@@ -2328,6 +2332,11 @@ def decisions_for(con, uid, handovers=True):
     if act and vk:                                       # the approved strategy, sealed (it contains real example emails)
         out.append({"action": "strategy", "local_id": None, "version": act.get("version"),
                     "sealed": seal_team({k: act.get(k) for k in ("version", "arms", "explore", "examples", "lessons", "scoring")})})
+    try:
+        import hub_bot
+        hub_bot.dnc_catch_up(con, uid)                   # the team's do-not-contact codes this person doesn't have yet
+    except Exception as e:
+        print("dnc:", e)
     for nt in con.execute("SELECT * FROM notices WHERE user_id=? AND delivered=0 ORDER BY id LIMIT 50", (uid,)).fetchall():
         it = json.loads(nt["item"])
         if vk and it.get("action") in ("leads_in", "comment", "removed", "transfer_out", "canary"):     # sealed for this person's BSO

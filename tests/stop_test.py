@@ -275,10 +275,11 @@ check(team.apply_dnc(con, [team.dnc_hash("SAM@mu.com"), "not-a-hash"], last=Fals
 check(not team.dnc_ready(), "the list isn't complete until its last part arrives")
 team.apply_dnc(con, [], last=True)
 check(team.dnc_ready(), "…then it is")
-check("sam@mu.com" not in json.dumps(team.dnc_hash("sam@mu.com")) and len(team.dnc_hash("sam@mu.com")) == 16, "only a one-way code travels, never the address")
+import hashlib  # noqa: E402
+check(team.dnc_hash("Sam@MU.com") == team.dnc_hash("sam@mu.com") == hashlib.sha256(b"bso-dnc:sam@mu.com").hexdigest()[:16]
+      and "@" not in team.dnc_hash("sam@mu.com"), "a one-way code (the same for any capitalisation) travels, not the address")
 real_joined = team.joined
 team.joined = lambda: True
-check(bot.add_lead(con, {"email": "sam@mu.com"}) is None or True, "")
 con.execute("DELETE FROM leads WHERE email='sam@mu.com'")
 con.execute("DELETE FROM suppression WHERE email='sam@mu.com'")
 con.commit()
@@ -296,18 +297,28 @@ for i, (nm, role) in enumerate((("Bot", "bot"), ("Ali", "supervisor"), ("Sara", 
     hc.execute("INSERT INTO users(id, name, email, username, role, status, pw_hash, created_at) VALUES (?,?,?,?,?,'active','x','2026-01-01')",
                (i, nm, f"{nm.lower()}@b.com", nm.lower(), role))
 hc.commit()
-hub_bot.ingest_extra(hc, 2, {"type": "__dnc", "data": {"h": [team.dnc_hash("x@y.com"), "zzz"]}})
-notes = [(r["user_id"], json.loads(r["item"])) for r in hc.execute("SELECT user_id, item FROM notices")]
-check(sorted(u for u, it in notes) == [1, 3] and all(it["h"] == [team.dnc_hash("x@y.com")] for u, it in notes),
-      "a stop on one laptop reaches every other laptop through the console (only valid codes)")
-hub_bot.ingest_extra(hc, 2, {"type": "__dnc", "data": {"h": [team.dnc_hash("x@y.com")]}})
-check(hc.execute("SELECT COUNT(*) FROM notices").fetchone()[0] == 2, "a code the console already has isn't sent again")
-hc.execute("DELETE FROM notices")
+hc.execute("UPDATE users SET last_seen='2026-10-24T00:00:00Z' WHERE id IN (1,2)")     # Sara (3) has never signed in
+hc.commit()
+codes = [team.dnc_hash(f"p{i}@y.com") for i in range(1500)]
+hub_bot.ingest_extra(hc, 2, {"type": "__dnc", "data": {"h": codes[:1200] + ["zzz", "not hex at all!"]}})
+check(hc.execute("SELECT COUNT(*) FROM dnc").fetchone()[0] == 1200, "the console keeps the valid codes a laptop reports")
+hub_bot.dnc_catch_up(hc, 1)
+hub_bot.dnc_catch_up(hc, 1)
+hub_bot.dnc_catch_up(hc, 3)
+nts = [json.loads(r["item"]) for r in hc.execute("SELECT item FROM notices WHERE user_id=1")]
+check(len(nts) == 1 and len(nts[0]["h"]) == 1000 and not nts[0]["last"], "the bot gets the codes in parts of 1,000, one waiting part at a time")
+check(not hc.execute("SELECT 1 FROM notices WHERE user_id=3").fetchone(), "nothing piles up for someone who has never signed in")
+nid = hc.execute("SELECT id FROM notices WHERE user_id=1").fetchone()[0]
+hub.ingest(hc, 1, {"acked": [f"ho:nt:{nid}"]})
+hub_bot.ingest_extra(hc, 2, {"type": "__dnc", "data": {"h": codes[1200:]}})
+hub_bot.dnc_catch_up(hc, 1)
+nts = [json.loads(r["item"]) for r in hc.execute("SELECT item FROM notices WHERE user_id=1 AND delivered=0")]
+check(len(nts) == 1 and nts[0]["h"] == codes[1000:1500] and nts[0]["last"], "after it confirms a part, the next one follows, with codes added meanwhile")
 hub_bot.ingest_extra(hc, 1, {"type": "__dnc_req", "data": {}})
-full = [json.loads(r["item"]) for r in hc.execute("SELECT item FROM notices WHERE user_id=1")]
-check(len(full) == 1 and full[0]["last"] and full[0]["h"] == [team.dnc_hash("x@y.com")], "a new or rebuilt bot gets the whole list")
-hub_bot.ingest_extra(hc, 1, {"type": "__dnc_req", "data": {}})
-check(hc.execute("SELECT COUNT(*) FROM notices WHERE user_id=1").fetchone()[0] == 1, "…once, not on every check-in")
+hub_bot.dnc_catch_up(hc, 1)
+nts = [json.loads(r["item"]) for r in hc.execute("SELECT item FROM notices WHERE user_id=1 AND delivered=0")]
+check(len(nts) == 1 and nts[0]["h"] == codes[:1000], "a restored or rebuilt bot that asks for the whole list starts again from the first code")
+check(len(json.dumps(nts[0])) < 25_000, f"a part stays small for the Google relay ({len(json.dumps(nts[0]))} bytes)")
 
 out = []
 real_print = print
@@ -320,6 +331,10 @@ team.policy = lambda: {"role": "bot"}
 st = team.state()
 st.pop("dnc_ready", None)
 team.save_state(st)
+check(not team.dnc_must_wait(con), "a bot that was already sending keeps going while the list arrives (an upgrade never halts it)")
+st = team.state()
+st["dnc_must_wait"] = True                       # as after a restore
+team.save_state(st)
 builtins.print = lambda *a, **k: out.append(" ".join(str(x) for x in a))
 smtp.clear()
 lead("uma@xi.com")
@@ -328,7 +343,21 @@ try:
     run()
 finally:
     builtins.print = real_print
-check(not smtp and any("do-not-contact list" in l for l in out), "the bot sends no cold email until it has the team's do-not-contact list")
+check("uma@xi.com" not in smtp and any("do-not-contact list" in l for l in out), "a restored or new bot sends no first email until it has the team's list")
+lead("vic@omi.com", step=1)
+con.commit()
+smtp.clear()
+out.clear()
+builtins.print = lambda *a, **k: out.append(" ".join(str(x) for x in a))
+try:
+    run()
+finally:
+    builtins.print = real_print
+check("vic@omi.com" in smtp and "uma@xi.com" not in smtp, f"…but follow-ups still go meanwhile, checked against this laptop's own list ({smtp})")
+smtp.clear()
+st = team.state()
+st["dnc_ready"] = "2026-10-24"
+team.save_state(st)
 team.joined = real_joined
 
 # ---------------------------------------------------------------- 7. a run left "running" never blocks the bot again
@@ -368,4 +397,108 @@ u2 = dict(u, bot_report=json.dumps(dict(json.loads(u["bot_report"]), last_sent_a
 check(hub_bot.not_sending(u2, loc=weekday_noon) is None, "not while it is sending")
 u3 = dict(u, bot_report=json.dumps(dict(json.loads(u["bot_report"]), test_mode=True)))
 check(hub_bot.not_sending(u3, loc=weekday_noon) is None, "not in test mode")
+
+# ---------------------------------------------------------------- 9. after the release audit
+# test mode: a real person's ordinary reply survives going live; your own address is never blocked; nothing leaves while testing
+crm.write_settings({"test_mode": {"enabled": True, "redirect_to": "omar@blacswanken.com"}})
+bot.sync_mode(con, cfg())
+lead("hot@real.com", step=1)
+lead("mine@test.com", step=1)
+con.execute("UPDATE leads SET first_msg_id='<m9@d1.com>', sender='a@d1.com' WHERE email IN ('hot@real.com','mine@test.com')")
+con.commit()
+reply("Hot Lead <hot@real.com>", "Re: Quick question", "Interested! Please call me tomorrow at 10am.", "<hot1@r>")
+reply("Omar <omar@blacswanken.com>", "Re: [TEST for mine@test.com] Quick question", "Stop emailing me.", "<t9@b>")
+con.commit()
+check(not con.execute("SELECT 1 FROM suppression WHERE email='omar@blacswanken.com'").fetchone(), "your own test reply never blocks your own address")
+import team as _team  # noqa: E402
+sent_body = {}
+real_post, real_joined2 = _team._post, _team.joined
+_team._post = lambda url, path, payload, token=None, timeout=20: (sent_body.update(payload) or (200, {"policy": {}}))
+_team.joined = lambda: True
+st = _team.state()
+st["hub"] = "http://127.0.0.1:1"
+_team.save_state(st)
+_team._sync(con)
+codes_sent = [h for e in sent_body.get("events", []) if e.get("type") == "__dnc" for h in e["data"]["h"]]
+check(_team.dnc_hash("mine@test.com") not in codes_sent and _team.dnc_hash("omar@blacswanken.com") not in codes_sent,
+      "while testing, no stop is reported to the team list (it may be undone)")
+tasks_before = con.execute("SELECT COUNT(*) FROM tasks WHERE lead_id=(SELECT id FROM leads WHERE email='hot@real.com')").fetchone()[0]
+crm.write_settings({"test_mode": {"enabled": False, "redirect_to": ""}})          # even with the test address cleared first
+bot.sync_mode(con, cfg())
+check(row("hot@real.com")["status"] == "replied" and tasks_before > 0 and
+      con.execute("SELECT COUNT(*) FROM tasks WHERE lead_id=(SELECT id FROM leads WHERE email='hot@real.com')").fetchone()[0] == tasks_before,
+      "going live keeps a real person's interested reply: their state and their follow-up task stay (no cold email to them)")
+check(row("mine@test.com")["status"] == "active" and not con.execute("SELECT 1 FROM suppression WHERE email='mine@test.com'").fetchone(),
+      "…and still undoes your own test stop (the test address was remembered)")
+sent_body.clear()
+_team._sync(con)
+codes_sent = [h for e in sent_body.get("events", []) if e.get("type") == "__dnc" for h in e["data"]["h"]]
+check(_team.dnc_hash("real@kappa.com") in codes_sent and _team.dnc_hash("mine@test.com") not in codes_sent,
+      "once live, real stops are reported to the team list; undone test stops never are")
+sent_body.clear()
+_team._sync(con)
+check(not [e for e in sent_body.get("events", []) if e.get("type") == "__dnc"], "each stop is reported once")
+_team._post, _team.joined = real_post, real_joined2
+
+# an email still being handled keeps the inbox from sending, even when it's looked at again soon
+lead("wyn@pi.com", step=1)
+con.commit()
+FakeIMAP.boxes["a@d1.com"] = [b"From: Wyn <wyn@pi.com>\r\nTo: a@d1.com\r\nSubject: Re: hi\r\nMessage-ID: <w1@pi>\r\n\r\nRemove me please.\r\n"]
+bot.handle_message = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("database is locked"))
+for i in range(2):
+    try:
+        bot.process_inbox(cfg(), con, s)
+        ok = True
+    except RuntimeError:
+        ok = False
+    check(not ok, f"check {i + 1} soon after a failure: the inbox still doesn't count as read")
+bot.handle_message = real_handle
+
+# no email to anyone on do-not-contact, whoever sends it
+smtp.clear()
+try:
+    bot.send_email({"email": "a@d1.com", "name": "A", "smtp_host": "h"}, "Hal <hal@eps.com>", "Re: info", "Here is more information.")
+    check(False, "blocked")
+except bot.Skipped as e:
+    check("do-not-contact" in str(e) and not smtp, "an automatic answer or a manual email to a do-not-contact address is refused")
+try:
+    bot.send_email({"email": "a@d1.com", "name": "A", "smtp_host": "h"}, "x@ok.com", "Hi", "b", cc="hal@eps.com")
+    check(False, "blocked cc")
+except bot.Skipped:
+    check(True, "…also in Cc")
+bot.send_email({"email": "a@d1.com", "name": "A", "smtp_host": "h"}, "hal@eps.com", "Handover", "brief", headers={"X-BSO-Kind": "brief"})
+check(smtp == ["hal@eps.com"], "BSO's own emails to the team are not prospects and still go")
+pid = lead("pax@rho.com", step=2, status="paused")
+con.commit()
+check(safety.why_not_send(pid, ("nurture", "active", "replied", "done", "paused")) is None, "a check-back email you approved for a paused lead may go")
+
+# unsubscribe codes any of the team's laptops can resolve
+key = os.urandom(32)
+safety._team_key = lambda: key
+t = safety.token_for(con, "zed@sig.com")
+lead("zed@sig.com", step=1)
+con.execute("DELETE FROM unsub_tokens")                 # a restored or replacement bot never issued it
+con.commit()
+check(safety.apply_unsubs(con, [{"t": t, "at": "2026-10-24"}]) == ["zed@sig.com"] and row("zed@sig.com")["status"] == "unsubscribed",
+      "an unsubscribe click is matched even on a laptop that didn't send that email")
+check(safety.token_for(con, "zed@sig.com") == t and "zed" not in t, "the code is the same on every laptop and reveals nothing")
+
+# one run at a time
+con.commit()
+crm_con.execute("UPDATE jobs SET status='ok' WHERE status='running'")
+crm_con.commit()
+crm.bot_argv = lambda *a, **k: [sys.executable, "-c", "import time; time.sleep(3)"]
+res = []
+ths = [threading.Thread(target=lambda: res.append(crm.start_job(bot.db_connect("outreach.db"), "run"))) for _ in range(2)]
+[t_.start() for t_ in ths]
+[t_.join() for t_ in ths]
+check(sorted(r[1] for r in res) == [False, True] and res[0][0] == res[1][0], f"two starts at the same moment: one run ({res})")
+lock = bot.acquire_lock()
+check(bot.run_in_progress(), "a run's lock is seen from outside it")
+crm.PROCS.clear()
+crm_con.execute("INSERT INTO jobs(cmd, args, status, output, started_at) VALUES ('run','','running','','x')")
+crm_con.commit()
+check(crm.clear_stale_jobs() == 0, "a run still going after a restart (it holds the lock) isn't mistaken for a leftover")
+lock.close()
+check(crm.clear_stale_jobs() >= 1, "once it has ended, its row is closed")
 print(f"\nAll {n} stop checks passed.")

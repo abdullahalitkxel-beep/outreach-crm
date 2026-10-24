@@ -59,23 +59,17 @@ def ingest_extra(con, uid, e):
         if isinstance(rp, dict):
             con.execute("UPDATE users SET bot_report=? WHERE id=?", (json.dumps(rp)[:2_000_000], uid))
         return True
-    if t == "__dnc":                                   # new do-not-contact codes from a laptop: kept here, passed to everyone else
-        con.execute("CREATE TABLE IF NOT EXISTS dnc (h TEXT PRIMARY KEY, at TEXT, user_id INTEGER)")
-        new = [h for h in ((e.get("data") or {}).get("h") or [])[:5000]
-               if isinstance(h, str) and len(h) == 16 and all(c in "0123456789abcdef" for c in h)
-               and con.execute("INSERT OR IGNORE INTO dnc(h, at, user_id) VALUES (?,?,?)", (h, H.iso(), uid)).rowcount]
-        if new:
-            for u in con.execute("SELECT id FROM users WHERE id!=? AND status NOT IN ('removed','disabled')", (uid,)).fetchall():
-                con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (u["id"], json.dumps({"action": "dnc", "h": new})))
+    if t == "__dnc":                                   # new do-not-contact codes from a laptop: kept here; everyone else catches up
+        _dnc_table(con)
+        for h in ((e.get("data") or {}).get("h") or [])[:5000]:
+            if isinstance(h, str) and len(h) == 16 and all(c in "0123456789abcdef" for c in h):
+                con.execute("INSERT OR IGNORE INTO dnc(h, at, user_id) VALUES (?,?,?)", (h, H.iso(), uid))
         return True
-    if t == "__dnc_req":                               # a laptop that doesn't have the whole list yet (new, rebuilt or restored)
-        con.execute("CREATE TABLE IF NOT EXISTS dnc (h TEXT PRIMARY KEY, at TEXT, user_id INTEGER)")
-        if not con.execute("SELECT 1 FROM notices WHERE user_id=? AND delivered=0 AND item LIKE ?", (uid, '{"action": "dnc"%"last": true%')).fetchone():
-            allh = [r["h"] for r in con.execute("SELECT h FROM dnc ORDER BY rowid")]
-            chunks = [allh[i:i + 3000] for i in range(0, len(allh), 3000)] or [[]]
-            for i, ch in enumerate(chunks):
-                con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)",
-                            (uid, json.dumps({"action": "dnc", "h": ch, "last": i == len(chunks) - 1})))
+    if t == "__dnc_req":                               # a laptop without the whole list (new, rebuilt or restored): start it from 0
+        _dnc_table(con)
+        con.execute("DELETE FROM notices WHERE user_id=? AND delivered=0 AND item LIKE ?", (uid, '{"action": "dnc"%'))
+        H._m_set(con, f"dnc_upto_{uid}", "0")
+        H._m_set(con, f"dnc_req_{uid}", "1")
         return True
     if t == "__device":
         info = e.get("data") or {}
@@ -83,6 +77,38 @@ def ingest_extra(con, uid, e):
         con.execute("UPDATE devices SET info=? WHERE user_id=? AND revoked=0 AND name=?", (json.dumps(info)[:4000], uid, str(info.get("device") or "")[:80]))
         return True
     return False
+
+
+def _dnc_table(con):
+    con.execute("CREATE TABLE IF NOT EXISTS dnc (h TEXT PRIMARY KEY, at TEXT, user_id INTEGER)")
+
+
+def dnc_catch_up(con, uid):
+    """Give this person the do-not-contact codes they don't have yet: at most one waiting notice at a time (1,000 codes),
+    never changed once written. When it is acknowledged their position moves on (dnc_acked) and the next one follows."""
+    _dnc_table(con)
+    u = con.execute("SELECT status, last_seen FROM users WHERE id=?", (uid,)).fetchone()
+    if not u or u["status"] != "active" or not u["last_seen"]:
+        return                                         # invited, disabled or removed: nothing waits for them
+    if con.execute("SELECT 1 FROM notices WHERE user_id=? AND delivered=0 AND item LIKE ?", (uid, '{"action": "dnc"%')).fetchone():
+        return
+    upto = int(H._m_get(con, f"dnc_upto_{uid}", "0") or 0)
+    rows = con.execute("SELECT rowid, h FROM dnc WHERE rowid>? ORDER BY rowid LIMIT 1000", (upto,)).fetchall()
+    top = con.execute("SELECT COALESCE(MAX(rowid), 0) FROM dnc").fetchone()[0]
+    asked = H._m_get(con, f"dnc_req_{uid}", "") == "1"
+    if rows:
+        last = rows[-1][0]
+        con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)",
+                    (uid, json.dumps({"action": "dnc", "h": [r[1] for r in rows], "to": last, "last": last >= top})))
+    elif asked:
+        con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (uid, json.dumps({"action": "dnc", "h": [], "to": upto, "last": True})))
+    if asked:
+        H._m_set(con, f"dnc_req_{uid}", "")
+
+
+def dnc_acked(con, uid, item):
+    if isinstance(item, dict) and item.get("action") == "dnc" and isinstance(item.get("to"), int):
+        H._m_set(con, f"dnc_upto_{uid}", str(item["to"]))
 
 
 def bots(con):
@@ -182,6 +208,9 @@ def not_sending(u, hours=3, loc=None):
     parts = [f"{rp.get('due_now')} lead(s) are due."]
     if rp.get("killed"):
         parts.append(f"Sending is stopped: {rp.get('killed_why') or 'kill switch on'}.")
+    if rp.get("dnc_wait"):
+        parts.append("The bot is waiting for the team's do-not-contact list from this console before sending first emails. "
+                     "Keep the console open and on the same version as the bot.")
     if lr.get("status") == "running" and lr.get("started_at") and H.parse(lr["started_at"]) and H.now() - H.parse(lr["started_at"]) > timedelta(hours=2):
         parts.append(f"A run has been 'running' since {lr['started_at'][:16]} UTC: it is probably stuck. Restart BSO on the bot laptop.")
     if rp.get("breakers"):

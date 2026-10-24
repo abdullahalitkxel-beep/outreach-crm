@@ -181,7 +181,7 @@ check(autopilot.may_send_alone(cfg(), {"autonomy": "autonomous"}, 65) and not au
 
 # ---------------------------------------------------------------- a real run
 sent = []
-def fake_send(s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None, statuses=None):
+def fake_send(s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None, statuses=None, check_dnc=True):
     sent.append(dict(frm=s["email"], to=to, subject=subject, body=body))
     return f"<{len(sent)}@x>"
 bot.send_email = fake_send

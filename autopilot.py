@@ -824,12 +824,23 @@ def report(cfg, con):
             "alerts": [dict(r) for r in con.execute("SELECT at, kind, text FROM alerts ORDER BY id DESC LIMIT 20")],
             "breakers": _safety().open_breakers(con), "backup": _safety().status(con),
             "last_sent_at": (con.execute("SELECT MAX(at) FROM events WHERE type='sent' AND detail NOT LIKE '%(test)%'").fetchone()[0] or ""),
-            "due_now": con.execute("SELECT COUNT(*) FROM leads WHERE status='active' AND next_send_at<=?", (iso(now_utc()),)).fetchone()[0],
+            "due_now": con.execute("SELECT COUNT(*) FROM leads l LEFT JOIN campaigns c ON c.id=COALESCE(l.campaign_id,1) WHERE l.status='active' "
+                                   "AND l.next_send_at<=? AND COALESCE(c.status,'active')='active' "
+                                   "AND NOT EXISTS (SELECT 1 FROM suppression s WHERE s.email=l.email)", (iso(now_utc()),)).fetchone()[0],
+            "dnc_wait": _dnc_wait(con),
             "last_run": dict(con.execute("SELECT status, started_at, finished_at FROM jobs WHERE cmd='run' ORDER BY id DESC LIMIT 1").fetchone() or {})
                         if con.execute("SELECT 1 FROM sqlite_master WHERE name='jobs'").fetchone() else {},
             "test_mode": bool((cfg.get("test_mode") or {}).get("enabled")),
             "queue": [dict(r) for r in con.execute("SELECT l.email, l.next_send_at, c.name campaign FROM leads l LEFT JOIN campaigns c ON c.id=COALESCE(l.campaign_id,1) "
                                                    "WHERE l.status='active' AND l.step=0 AND l.next_send_at>? ORDER BY l.next_send_at LIMIT 30", (iso(now_utc()),))]}
+
+
+def _dnc_wait(con):
+    try:
+        import team
+        return bool(team.joined() and team.works_as_bot() and not team.dnc_ready() and team.dnc_must_wait(con))
+    except Exception:
+        return False
 
 
 def _safety():

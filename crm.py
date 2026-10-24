@@ -1572,7 +1572,9 @@ def bot_argv(cmd, max_leads=None, force=False):
     return argv
 
 
-JOB_MAX_MINUTES = 90        # a run that takes longer than this is stuck (a frozen mail server): it is stopped and marked failed
+JOB_MAX_MINUTES = 45        # a run that writes nothing to its log for this long is stuck (a frozen server): it is stopped
+JOB_HARD_HOURS = 8          # and none runs longer than this, whatever it prints
+_START_LOCK = threading.Lock()
 PROCS = {}                  # job id -> process, for runs started by this app
 
 
@@ -1583,6 +1585,8 @@ def clear_stale_jobs(con=None):
     con = con or db_connect(load_config(CONFIG_PATH).get("database", "outreach.db"))
     try:
         mine = list(PROCS)
+        if bot.run_in_progress():
+            return 0                          # some run is still going (perhaps from before a restart): nothing is a leftover yet
         q = "UPDATE jobs SET status='failed', finished_at=?, output=COALESCE(output,'') || ? WHERE status='running'"
         args = [iso(now_utc()), "\n(interrupted: BSO was closed or restarted during this run)"]
         if mine:
@@ -1611,11 +1615,18 @@ def _run_job(job_id, argv):
                              stderr=subprocess.DEVNULL, creationflags=flags,
                              env={**os.environ, "PYTHONUNBUFFERED": "1", "OUTREACH_JOB_LOG": str(log)})
         PROCS[job_id] = p
-        started = _t.time()
+        started = last_change = _t.time()
+        last_size = 0
         while True:
             done = p.poll() is not None
-            if not done and (_t.time() - started > JOB_MAX_MINUTES * 60 or STOP_JOBS.pop(job_id, False)):
-                why = "stopped by you" if _t.time() - started <= JOB_MAX_MINUTES * 60 else f"stopped after {JOB_MAX_MINUTES} minutes (stuck)"
+            size = log.stat().st_size if log.exists() else 0
+            if size != last_size:
+                last_size, last_change = size, _t.time()
+            idle = _t.time() - last_change > JOB_MAX_MINUTES * 60
+            too_long = _t.time() - started > JOB_HARD_HOURS * 3600
+            if not done and (idle or too_long or STOP_JOBS.pop(job_id, False)):
+                why = (f"stopped: no progress for {JOB_MAX_MINUTES} minutes (stuck)" if idle else
+                       f"stopped after {JOB_HARD_HOURS} hours (stuck)" if too_long else "stopped by you")
                 p.kill()
                 p.wait(timeout=30)
                 with open(log, "a", encoding="utf-8") as f:
@@ -1645,6 +1656,11 @@ STOP_JOBS = {}
 
 def start_job(con, cmd, max_leads=None):
     """Start a bot run in the background. Returns (job_id, already_running)."""
+    with _START_LOCK:                         # two clicks, or a click and the timer, at the same moment: one run
+        return _start_job(con, cmd, max_leads)
+
+
+def _start_job(con, cmd, max_leads=None):
     clear_stale_jobs(con)                     # a "running" row no process of this app is running is a leftover
     running = con.execute("SELECT id FROM jobs WHERE status='running'").fetchone()
     if running:
@@ -1655,6 +1671,7 @@ def start_job(con, cmd, max_leads=None):
     argv = bot_argv(cmd, max_leads, force=bool(tm.get("enabled") and tm.get("redirect_to")) and not autopilot.active(c))
     job_id = con.execute("INSERT INTO jobs(cmd, args, status, output, started_at) VALUES (?,?,?,?,?)",
                          (cmd, " ".join(argv[-4:]), "running", "", iso(now_utc()))).lastrowid
+    PROCS[job_id] = None                      # ours from this moment, before its process exists
     con.commit()
     threading.Thread(target=_run_job, args=(job_id, argv), daemon=True).start()
     return job_id, False

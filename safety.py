@@ -176,8 +176,19 @@ def ensure(con):
     CREATE TABLE IF NOT EXISTS inbox_read (email TEXT PRIMARY KEY, ok_at TEXT, fail_at TEXT, error TEXT);
     CREATE TABLE IF NOT EXISTS unsub_tokens (token TEXT PRIMARY KEY, email TEXT UNIQUE, at TEXT);
     CREATE TABLE IF NOT EXISTS msg_pending (key TEXT PRIMARY KEY, at TEXT, tries INTEGER DEFAULT 0, inbox TEXT, error TEXT);
+    CREATE TABLE IF NOT EXISTS app_mode (k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE IF NOT EXISTS dnc_reported (email TEXT PRIMARY KEY);
     """)
     ensure_breaker(con)
+    if not con.execute("SELECT 1 FROM app_mode WHERE k='recovered_errors_v1'").fetchone():
+        # Earlier versions marked an email done even when handling it failed (a stop request could be lost that way).
+        # Those emails are read again: they are taken out of the "already seen" list once.
+        try:
+            con.execute("DELETE FROM seen_messages WHERE key IN (SELECT msg_id FROM inbox_log WHERE decision LIKE 'error:%' AND msg_id IS NOT NULL) "
+                        "AND key NOT IN (SELECT msg_id FROM received WHERE msg_id IS NOT NULL)")
+        except sqlite3.Error:
+            pass
+        con.execute("INSERT OR REPLACE INTO app_mode(k, v) VALUES ('recovered_errors_v1', ?)", (_iso(_now()),))
 
 
 def read_ok(con, email):
@@ -207,12 +218,22 @@ def unread(con, senders, minutes=READ_FRESH_MIN):
 
 # ---------------------------------------------------------------- one-click unsubscribe
 
+def _token(key, email):
+    import base64
+    import hashlib
+    import hmac
+    return base64.urlsafe_b64encode(hmac.new(key, b"unsub:" + email.encode(), hashlib.sha256).digest()).decode()[:22]
+
+
 def token_for(con, email):
+    """The unsubscribe code for an address. With the team key it is derived from the address, so any of the team's
+    laptops (a restored or replacement bot included) can tell who unsubscribed; it still reveals nothing by itself."""
     email = email.lower().strip()
     r = con.execute("SELECT token FROM unsub_tokens WHERE email=?", (email,)).fetchone()
     if r:
         return r[0]
-    t = secrets.token_urlsafe(16)
+    key = _team_key()
+    t = _token(key, email) if key else secrets.token_urlsafe(16)
     con.execute("INSERT OR IGNORE INTO unsub_tokens(token, email, at) VALUES (?,?,?)", (t, email, _iso(_now())))
     return con.execute("SELECT token FROM unsub_tokens WHERE email=?", (email,)).fetchone()[0]
 
@@ -246,14 +267,21 @@ def apply_unsubs(con, items):
     """Unsubscribes collected by the relay. Tokens this laptop didn't issue are ignored. Returns addresses stopped."""
     import bot
     done = []
+    derived = None
     for it in items or []:
         t = str((it or {}).get("t") or "")
         if not TOKEN_RE.match(t):
             continue
         r = con.execute("SELECT email FROM unsub_tokens WHERE token=?", (t,)).fetchone()
-        if not r:
+        email = r[0] if r else None
+        if not email:                      # issued by another of the team's laptops, or before a restore: derive it
+            key = _team_key()
+            if key and derived is None:
+                derived = {_token(key, (e or "").lower()): (e or "").lower()
+                           for (e,) in con.execute("SELECT email FROM leads UNION SELECT email FROM suppression").fetchall() if e}
+            email = (derived or {}).get(t)
+        if not email:
             continue
-        email = r[0]
         if con.execute("SELECT 1 FROM suppression WHERE email=?", (email,)).fetchone():
             continue
         bot.suppress(con, email, "unsubscribe link")
@@ -462,6 +490,16 @@ def settle_gap():
 
 
 def _swap_in(tmp):
+    try:                               # a restored database may lack stops made since the backup: fetch the team's whole list again
+        import team
+        s = team.state()
+        if s:
+            s.pop("dnc_ready", None)
+            s.pop("dnc_req_at", None)
+            s["dnc_must_wait"] = True
+            team.save_state(s)
+    except Exception:
+        pass
     data = _data()
     live = data / "outreach.db"
     if live.exists():
@@ -647,7 +685,7 @@ def message_failed(cfg, con, sender, key, msg, err):
 def why_not_send(lead_id, statuses=("active",)):
     """Why this lead must not get an email right now (None = it may). Read fresh from the database, right before the
     mail server is contacted: a reply, an unsubscribe or a do-not-contact entry that arrived a moment ago counts."""
-    c = sqlite3.connect(str(_data() / "outreach.db"), timeout=30)
+    c = sqlite3.connect(str(_db_path()), timeout=30)
     c.row_factory = sqlite3.Row
     try:
         r = c.execute("SELECT email, status FROM leads WHERE id=?", (lead_id,)).fetchone()
@@ -659,11 +697,46 @@ def why_not_send(lead_id, statuses=("active",)):
             return "the address is on do-not-contact"
         try:
             import team
-            if team.joined() and c.execute("SELECT 1 FROM sqlite_master WHERE name='team_dnc'").fetchone() and \
-                    c.execute("SELECT 1 FROM team_dnc WHERE h=?", (team.dnc_hash(r["email"]),)).fetchone():
-                return "the address is on the team's do-not-contact list"
+            joined = team.joined()
         except Exception:
-            pass
+            joined = False
+        if joined and c.execute("SELECT 1 FROM sqlite_master WHERE name='team_dnc'").fetchone() and \
+                c.execute("SELECT 1 FROM team_dnc WHERE h=?", (team.dnc_hash(r["email"]),)).fetchone():
+            return "the address is on the team's do-not-contact list"
         return None
     finally:
         c.close()
+
+
+def blocked_recipients(addrs):
+    """Addresses among To/Cc/Bcc that are on do-not-contact (this laptop's list or the team's)."""
+    import re as _re
+    found = []
+    for a in addrs:
+        found += [e.lower() for e in _re.findall(r"[\w.+'-]+@[\w-]+(?:\.[\w-]+)+", str(a or ""))]
+    if not found:
+        return []
+    c = sqlite3.connect(str(_db_path()), timeout=30)
+    try:
+        out = [e for e in found if c.execute("SELECT 1 FROM suppression WHERE email=?", (e,)).fetchone()]
+        try:
+            import team
+            if team.joined() and c.execute("SELECT 1 FROM sqlite_master WHERE name='team_dnc'").fetchone():
+                out += [e for e in found if e not in out and c.execute("SELECT 1 FROM team_dnc WHERE h=?", (team.dnc_hash(e),)).fetchone()]
+        except sqlite3.Error:
+            raise
+        except Exception:
+            pass
+        return out
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            return []
+        raise
+    finally:
+        c.close()
+
+
+def _db_path():
+    """The database this BSO uses (the 'database' setting, outreach.db by default)."""
+    import bot
+    return getattr(bot, "DB_FILE", None) or (_data() / "outreach.db")

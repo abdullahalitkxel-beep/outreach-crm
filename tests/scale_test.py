@@ -65,7 +65,7 @@ for k in range(3000):
 con.commit()
 
 sent, lock, active, peak = [], threading.Lock(), [0], [0]
-def fake_send(s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None, statuses=None):
+def fake_send(s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None, statuses=None, check_dnc=True):
     with lock:
         active[0] += 1
         peak[0] = max(peak[0], active[0])

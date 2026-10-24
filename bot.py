@@ -253,7 +253,9 @@ _migrated = set()
 def db_connect(path):
     """Open the database. WAL mode lets the CRM and bot runs read and write at the same time;
     the schema check/upgrade runs only once per process."""
+    global DB_FILE
     full = DATA / path
+    DB_FILE = full
     con = sqlite3.connect(full, check_same_thread=False, timeout=30)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA busy_timeout = 30000")
@@ -338,6 +340,10 @@ def sync_mode(con, cfg):
     """Tell the database which mode we're in. Switching from test to live clears the test results."""
     want = "1" if test_on(cfg) else "0"
     row = con.execute("SELECT v FROM app_mode WHERE k='test'").fetchone()
+    tester = str((cfg.get("test_mode") or {}).get("redirect_to") or "").lower().strip()
+    if want == "1" and tester and (con.execute("SELECT v FROM app_mode WHERE k='tester'").fetchone() or [""])[0] != tester:
+        con.execute("INSERT INTO app_mode(k, v) VALUES ('tester', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (tester,))
+        con.commit()                   # remembered: going live tells your own test replies apart by this address
     if row and row[0] == want:
         return
     if row and row[0] == "1" and want == "0":
@@ -364,43 +370,69 @@ def test_counts(con):
             "events": con.execute("SELECT COUNT(*) FROM test_rows WHERE tbl='events'").fetchone()[0]}
 
 
+REAL_STOP_REASONS = ("bounced", "unsubscribe link", "on the team's do-not-contact list")
+
+
 def clear_test_results(con, tester=None):
-    """Put every lead back as it was before test mode touched it and remove what the test added. Returns leads restored."""
+    """Put every lead back as it was before test mode touched it and remove what the test added. Returns leads restored.
+
+    Real people keep writing while you test (to emails sent before test mode). Everything a real person caused stays:
+    their lead's state, the reply, its tasks, notes and events, and any stop. Only what came from your own test replies
+    (from the test address, or tagged [TEST for ...]) and the test emails themselves is undone."""
     was = con.execute("SELECT v FROM app_mode WHERE k='test'").fetchone()
     con.execute("UPDATE app_mode SET v='0' WHERE k='test'")      # so the restore itself isn't recorded
+    tester = (tester or (con.execute("SELECT v FROM app_mode WHERE k='tester'").fetchone() or [""])[0] or "").lower().strip()
+    rows = con.execute("SELECT r.rowid AS rid, r.frm, r.subject, r.lead_id, l.email FROM received r LEFT JOIN leads l ON l.id=r.lead_id "
+                       "WHERE r.rowid IN (SELECT CAST(rid AS INTEGER) FROM test_rows WHERE tbl='received')").fetchall()
+
+    def is_test(r):
+        frm = (r["frm"] or "").lower()
+        if "[TEST for" in (r["subject"] or ""):
+            return True
+        if tester:
+            return frm == tester
+        return False                   # unknown test address: assume a real person (a missed undo beats an erased reply)
+    real_leads = {r["lead_id"] for r in rows if not is_test(r) and r["lead_id"]}
+    test_leads = {r["lead_id"] for r in rows if is_test(r) and r["lead_id"]}
+    for r in con.execute("SELECT l.id FROM leads l JOIN suppression s ON s.email=l.email WHERE s.email IN "
+                         "(SELECT rid FROM test_rows WHERE tbl='suppression') AND s.reason IN (%s)" % ",".join("?" * len(REAL_STOP_REASONS)),
+                         REAL_STOP_REASONS).fetchall():
+        real_leads.add(r[0])
+    real_emails = {e for (e,) in con.execute("SELECT lower(email) FROM leads WHERE id IN (%s)" % ",".join("?" * len(real_leads)),
+                                              tuple(real_leads)).fetchall()} if real_leads else set()
+    test_emails = {e for (e,) in con.execute("SELECT lower(email) FROM leads WHERE id IN (%s)" % ",".join("?" * len(test_leads)),
+                                              tuple(test_leads)).fetchall()} if test_leads else set()
     cols = {r[1] for r in con.execute("PRAGMA table_info(leads)")}
     n = 0
     for r in con.execute("SELECT lead_id, data FROM test_snapshot").fetchall():
+        if r["lead_id"] in real_leads:
+            continue                   # a real person moved this lead on: keep where it is now
         data = {k: v for k, v in json.loads(r["data"] or "{}").items() if k in cols and k in TEST_PROGRESS}
         if data:
             con.execute(f"UPDATE leads SET {', '.join(k + '=?' for k in data)} WHERE id=?", (*data.values(), r["lead_id"]))
             n += 1
-    # Real people can reply, bounce or unsubscribe while test mode is on (to emails sent before it). Those are kept:
-    # only stops caused by a test reply ("[TEST for ...]" in the subject) are undone.
-    rows = con.execute("SELECT r.frm, r.subject, l.email FROM received r LEFT JOIN leads l ON l.id=r.lead_id "
-                       "WHERE r.rowid IN (SELECT CAST(rid AS INTEGER) FROM test_rows WHERE tbl='received')").fetchall()
-    tester = (tester or "").lower()
-    def is_test(r):                    # your own reply in a test thread, or anything tagged [TEST for ...]
-        frm = (r["frm"] or "").lower()
-        return "[TEST for" in (r["subject"] or "") or (tester and frm == tester) or (not tester and frm != (r["email"] or "").lower())
-    test_emails = {(r["email"] or "").lower() for r in rows if is_test(r)}
-    real_emails = {x.lower() for r in rows if not is_test(r) for x in (r["frm"] or "", r["email"] or "") if x}
+    keep = ",".join(str(int(x)) for x in real_leads) or "-1"
     for t in TEST_TRACKED:
         if t == "suppression":
-            for r in con.execute("SELECT rid FROM test_rows WHERE tbl='suppression'").fetchall():
-                e = (r[0] or "").lower()
-                if e in test_emails and e not in real_emails:
+            for (e,) in con.execute("SELECT rid FROM test_rows WHERE tbl='suppression'").fetchall():
+                e = (e or "").lower()
+                reason = (con.execute("SELECT reason FROM suppression WHERE email=?", (e,)).fetchone() or [""])[0]
+                if reason in REAL_STOP_REASONS or e in real_emails:
+                    continue
+                if e == tester or e in test_emails:
                     con.execute("DELETE FROM suppression WHERE email=?", (e,))
         elif t == "received":
-            for r in con.execute("SELECT r.rowid, r.frm, r.subject, l.email FROM received r LEFT JOIN leads l ON l.id=r.lead_id "
-                                 "WHERE r.rowid IN (SELECT CAST(rid AS INTEGER) FROM test_rows WHERE tbl='received')").fetchall():
+            for r in rows:
                 if is_test(r):
-                    con.execute("DELETE FROM received WHERE rowid=?", (r[0],))
+                    con.execute("DELETE FROM received WHERE rowid=?", (r["rid"],))
         else:
-            con.execute(f"DELETE FROM {t} WHERE rowid IN (SELECT CAST(rid AS INTEGER) FROM test_rows WHERE tbl=?)", (t,))
-    for r in con.execute("SELECT email, reason FROM suppression").fetchall():      # every stop that stands stays applied to its leads
-        con.execute("UPDATE leads SET status=? WHERE lower(email)=? AND status NOT IN ('unsubscribed','bounced')",
-                    ("bounced" if r["reason"] == "bounced" else "unsubscribed", r["email"]))
+            has_lead = "lead_id" in {c[1] for c in con.execute(f"PRAGMA table_info({t})")}
+            con.execute(f"DELETE FROM {t} WHERE rowid IN (SELECT CAST(rid AS INTEGER) FROM test_rows WHERE tbl=?)"
+                        + (f" AND COALESCE(lead_id, -1) NOT IN ({keep})" if has_lead else ""), (t,))
+    # every stop that stands stays applied to its leads (one statement: fast even with 100k leads)
+    con.execute("UPDATE leads SET status=CASE WHEN (SELECT reason FROM suppression s WHERE s.email=leads.email)='bounced' "
+                "THEN 'bounced' ELSE 'unsubscribed' END WHERE status NOT IN ('unsubscribed','bounced') "
+                "AND email IN (SELECT email FROM suppression)")
     con.execute("DELETE FROM test_snapshot")
     con.execute("DELETE FROM test_rows")
     if was:
@@ -455,15 +487,21 @@ def suppress(con, addr, reason):
         (addr, reason, iso(now_utc())),
     )
     new = "bounced" if reason == "bounced" else "unsubscribed"
-    for r in con.execute("SELECT id FROM leads WHERE lower(email)=? AND status NOT IN ('unsubscribed','bounced')", (addr,)).fetchall():
+    for r in con.execute("SELECT id FROM leads WHERE email=? AND status NOT IN ('unsubscribed','bounced')", (addr,)).fetchall():
         con.execute("UPDATE leads SET status=? WHERE id=?", (new, r[0]))
         cancel_drafts(con, r[0])
+
+
+_DNC_CACHE = {"at": 0.0, "on": False}
 
 
 def _on_team_dnc(con, addr):
     try:
         import team
-        return team.joined() and team.on_team_dnc(con, addr)
+        if time.time() - _DNC_CACHE["at"] > 30:        # imports of thousands of rows: don't re-read the team file per row
+            _DNC_CACHE.update(at=time.time(), on=bool(team.joined()) and
+                              con.execute("SELECT 1 FROM sqlite_master WHERE name='team_dnc'").fetchone() is not None)
+        return _DNC_CACHE["on"] and con.execute("SELECT 1 FROM team_dnc WHERE h=?", (team.dnc_hash(addr),)).fetchone() is not None
     except Exception:
         return False
 
@@ -858,8 +896,11 @@ def render(template, lead, sender, cfg):
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+INTERNAL_KINDS = {"brief", "forward", "intake", "readiness", "seed"}     # BSO's own emails to the team, never to prospects
+
+
 def send_email(sender, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None,
-               statuses=("active",)):
+               statuses=("active",), check_dnc=True):
     """key: a name for this one email (e.g. "lead12-step2"). With a key the email is written in the send journal before
     the mail server is contacted, and a key that was already sent is never sent again (its first Message-ID is returned)."""
     try:
@@ -898,6 +939,11 @@ def send_email(sender, to, subject, body, in_reply_to=None, dry_run=False, cc=No
         why = safety.why_not_send(lead_id, statuses)
         if why:
             raise Skipped(why)
+    if check_dnc and str((headers or {}).get("X-BSO-Kind", "")) not in INTERNAL_KINDS:
+        import safety                         # every email to anyone outside: nobody on do-not-contact, whoever sends it and why
+        bad = safety.blocked_recipients([to, cc, (headers or {}).get("Bcc")])
+        if bad:
+            raise Skipped(f"{bad[0]} is on do-not-contact")
     if key:
         import safety
         earlier = safety.before_send(key, msg_id, sender["email"], to, subject)
@@ -1143,7 +1189,7 @@ def _autopilot_round(cfg, con, args, due, for_campaign, usable, capacity, limits
         idx = lead["step"]
         if convo.protected(con, lead["email"]):
             print(f"SKIP: {lead['email']}: part of an open conversation with their company; emails paused")
-            con.execute("UPDATE leads SET status='paused' WHERE id=?", (lead["id"],))
+            con.execute("UPDATE leads SET status='paused' WHERE id=? AND status='active'", (lead["id"],))
             con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",
                         (lead["id"], "Emails paused: this person is part of an open conversation with their company.", iso(now_utc())))
             continue
@@ -1154,7 +1200,7 @@ def _autopilot_round(cfg, con, args, due, for_campaign, usable, capacity, limits
             problems.append(f"Campaign {c['name'] if c else cid}: none of its inboxes can send right now.")
             continue
         if idx >= len(steps):
-            con.execute("UPDATE leads SET status='done' WHERE id=?", (lead["id"],))
+            con.execute("UPDATE leads SET status='done' WHERE id=? AND status='active'", (lead["id"],))
             continue
         if timed and idx == 0:
             why, until = autopilot.first_email_hold(cfg, con, lead, c)
@@ -1332,11 +1378,12 @@ def cmd_run(cfg, con, args):
         if not ok:
             print("PROBLEM:", why)
             sys.exit(1)
-        if team_mod.joined() and team_mod.works_as_bot() and not team_mod.dnc_ready() and \
-                (cfg.get("team_dnc") or {}).get("required", True):
-            print("Waiting for the team's do-not-contact list from the Master Console before sending cold email "
-                  "(it arrives with the next check-ins; the Master Console must be on this version or later).")
-            return
+    dnc_wait = False
+    if not args.dry_run and team_mod.joined() and team_mod.works_as_bot() and not team_mod.dnc_ready() and \
+            (cfg.get("team_dnc") or {}).get("required", True) and team_mod.dnc_must_wait(con):
+        dnc_wait = True                # a new, rebuilt or restored bot: no FIRST emails until it has the team's whole list
+        print("Waiting for the team's do-not-contact list from the Master Console: follow-ups and replies carry on, "
+              "first emails start once the list has arrived (the Master Console must be on this version or later).")
     ap_on = autopilot.active(cfg) and not args.dry_run
     if ap_on:
         try:
@@ -1442,7 +1489,7 @@ def cmd_run(cfg, con, args):
     due = con.execute(
         "SELECT l.* FROM leads l LEFT JOIN campaigns c ON c.id=COALESCE(l.campaign_id,1) "
         "WHERE l.status='active' AND l.next_send_at<=? AND COALESCE(c.status,'active')='active' "
-        "AND NOT EXISTS (SELECT 1 FROM suppression s WHERE s.email=lower(l.email)) "
+        "AND NOT EXISTS (SELECT 1 FROM suppression s WHERE s.email=lower(l.email)) " + ("AND l.step>0 " if dnc_wait else "") +
         "ORDER BY l.step DESC, COALESCE(l.fit_score, 50) DESC, l.id LIMIT ?",  # running sequences first, then the likeliest new leads; paused campaigns wait
         (iso(now_utc()), args.limit if not ap_on else max(args.limit, 400, 3 * len(senders))),
     ).fetchall()
@@ -1486,7 +1533,7 @@ def cmd_run(cfg, con, args):
             idx = lead["step"]
             if convo.protected(con, lead["email"]):                # part of a live deal elsewhere: no cold emails
                 print(f"SKIP: {lead['email']}: part of an open conversation with their company; emails paused")
-                con.execute("UPDATE leads SET status='paused' WHERE id=?", (lead["id"],))
+                con.execute("UPDATE leads SET status='paused' WHERE id=? AND status='active'", (lead["id"],))
                 con.execute("INSERT INTO notes(lead_id, body, at, kind) VALUES (?,?,?,'note')",
                             (lead["id"], "Emails paused: this person is part of an open conversation with their company.", iso(now_utc())))
                 continue
@@ -1497,7 +1544,7 @@ def cmd_run(cfg, con, args):
                 problems.append(f"Campaign {c['name'] if c else cid}: none of its inboxes can send right now.")
                 continue
             if idx >= len(steps):
-                con.execute("UPDATE leads SET status='done' WHERE id=?", (lead["id"],))
+                con.execute("UPDATE leads SET status='done' WHERE id=? AND status='active'", (lead["id"],))
                 continue
 
             timed = ap_on and not args.force
@@ -1760,7 +1807,7 @@ def nurture_tick(cfg, con, senders, redirect):
         con.commit()
         try:
             mid = send_email(sender, to, subj, body, lead.get("first_msg_id"), headers=unsub_headers(con, sender, lead, bool(redirect)), key=f"outbox{d['id']}",
-                             lead_id=lead["id"], statuses=("nurture", "active", "replied", "done"))
+                             lead_id=lead["id"], statuses=("nurture", "active", "replied", "done", "paused"))
         except Skipped as e:
             print(f"Check-back email to {lead['email']} not sent: {e}")
             con.execute("UPDATE outbox SET status='cancelled' WHERE id=?", (d["id"],))
@@ -1811,7 +1858,7 @@ def notify(text, cfg=None):
         try:  # an email alert, sent from the first working inbox
             sender = next((x for x in load_senders(cfg) if x["password"]), None)
             if sender:
-                send_email(sender, to, "BSO: " + text.split(":", 1)[0][:80], text)
+                send_email(sender, to, "BSO: " + text.split(":", 1)[0][:80], text, check_dnc=False)
         except Exception as e:
             log.warning("Email notification failed: %s", e)
     hook = env("SLACK_WEBHOOK_URL")
@@ -1854,7 +1901,7 @@ def intake_message(cfg, con, sender, msg):
     def answer(text):
         try:
             send_email(sender, frm, subject if subject.lower().startswith("re:") else "Re: " + subject, text, msg.get("Message-ID"),
-                       headers={"X-BSO-Kind": "intake"})
+                       headers={"X-BSO-Kind": "intake"}, key="intake-" + str(msg.get("Message-ID") or subject)[:180] + "-" + text[:20])
         except Exception as e:
             log.error("Couldn't answer the lead file email: %s", e)
     if not files and not re.search(r"\b(leads?|campaign)\b", subject, re.I):
@@ -2023,7 +2070,8 @@ def handle_message(cfg, con, sender, msg, folder="INBOX"):
         suppress(con, lead["email"], "unsubscribe" if stop == "unsubscribe" else "legal or complaint wording")
         log_event(con, lead["id"], "complaint" if stop == "legal" or guard.complaint(msg.get("Subject", ""), body) else "unsubscribed",
                   "reply asked to stop", sender["email"])
-        if frm != lead["email"]:
+        tester = str(((cfg.get("test_mode") or {}).get("redirect_to")) or "").lower()
+        if frm != lead["email"] and frm != tester:          # your own test reply never blocks your own address
             suppress(con, frm, "asked not to be contacted")
         cancel_drafts(con, lead["id"])
         if stop == "legal":
@@ -2099,7 +2147,7 @@ def handle_message(cfg, con, sender, msg, folder="INBOX"):
         con.execute("UPDATE leads SET status='unsubscribed' WHERE id=?", (lead["id"],))
         set_stage(con, lead["id"], "unqualified")
         suppress(con, lead["email"], label if label in ("unsubscribe", "not_interested") else "asked not to be contacted")
-        if frm != lead["email"]:
+        if frm != lead["email"] and frm != str(((cfg.get("test_mode") or {}).get("redirect_to")) or "").lower():
             suppress(con, frm, "asked not to be contacted")
         return done(f"{label.replace('_', ' ')} from {lead['email']}{who_sent}: closed, on do-not-contact{extra_note}{where}", lead["id"])
     if temp == "cold":
@@ -2229,9 +2277,11 @@ def handover(cfg, con, lead, sender, msg, body, label, temp="warm", reason=""):
         subject = subject if subject.lower().startswith("re:") else "Re: " + subject
         try:
             if redirect:
-                mid = send_email(sender, redirect, f"[TEST for {lead['email']}, CC {sup['email']}] {subject}", intro_text, msg.get("Message-ID"))
+                mid = send_email(sender, redirect, f"[TEST for {lead['email']}, CC {sup['email']}] {subject}", intro_text, msg.get("Message-ID"),
+                                 key="intro-" + str(msg.get("Message-ID") or lead["id"])[:200], check_dnc=False)
             else:
-                mid = send_email(sender, lead["email"], subject, intro_text, msg.get("Message-ID"), cc=sup["email"])
+                mid = send_email(sender, lead["email"], subject, intro_text, msg.get("Message-ID"), cc=sup["email"],
+                                 key="intro-" + str(msg.get("Message-ID") or lead["id"])[:200])
             convo.record_sent(con, mid, lead, "intro", sender["email"], redirect or lead["email"], subject, intro_text,
                               cc=None if redirect else sup["email"], test=bool(redirect))
             log_event(con, lead["id"], "sent", "handover intro" + (" (test)" if redirect else ""), sender["email"])
@@ -2266,7 +2316,7 @@ def handover(cfg, con, lead, sender, msg, body, label, temp="warm", reason=""):
     brief_to = redirect or sup["email"]
     try:
         send_email(sender, brief_to, f"{'[TEST] ' if redirect else ''}Handover: {name}, {company} ({label.replace('_', ' ')})", "\n".join(lines),
-                   headers={"X-BSO-Kind": "brief", "X-BSO-Prospect": lead["email"]})
+                   headers={"X-BSO-Kind": "brief", "X-BSO-Prospect": lead["email"]}, key="brief-" + str(msg.get("Message-ID") or lead["id"])[:200])
     except Exception as e:
         log.error("Handover brief to %s failed: %s", sup["email"], e)
 
@@ -2310,7 +2360,8 @@ def forward_to_supervisor(cfg, con, lead, sender, msg, body):
             f"Reply to them directly (Reply goes to {lead['email']}).\n\n--- Their message ---\n{body.strip()[:8000]}")
     try:
         send_email(sender, redirect or lead["handed_to"], f"{'[TEST] ' if redirect else ''}Fwd: {msg.get('Subject', '')} ({name} replied to {sender['email']})",
-                   text, headers={"X-BSO-Kind": "forward", "X-BSO-Prospect": lead["email"], "Reply-To": lead["email"]})
+                   text, headers={"X-BSO-Kind": "forward", "X-BSO-Prospect": lead["email"], "Reply-To": lead["email"]},
+                   key="fwd-" + str(msg.get("Message-ID") or "")[:200] if msg.get("Message-ID") else None)
         log_event(con, lead["id"], "reply", "after handover: forwarded to supervisor", sender["email"])
     except Exception as e:
         log.error("Forward to supervisor %s failed: %s", lead["handed_to"], e)
@@ -2389,15 +2440,14 @@ def process_inbox(cfg, con, sender, recheck=False, days=None):
                 claimed = con.execute("INSERT OR IGNORE INTO seen_messages VALUES (?)", (key,)).rowcount
                 if claimed:
                     con.execute("INSERT OR REPLACE INTO msg_pending(key, at, tries, inbox) VALUES (?,?,0,?)", (key, iso(now_utc()), sender["email"]))
-                else:
-                    stale = con.execute("SELECT tries FROM msg_pending WHERE key=? AND at<?", (key, iso(now_utc() - timedelta(minutes=10)))).fetchone()
-                    if stale is not None:              # claimed earlier but never finished (crash, or an error): take it over
-                        claimed = 1
-                        con.execute("UPDATE msg_pending SET at=? WHERE key=?", (iso(now_utc()), key))
+                else:                                # claimed earlier but never finished (crash, or an error): take it over, once
+                    claimed = con.execute("UPDATE msg_pending SET at=? WHERE key=? AND at<?",
+                                          (iso(now_utc()), key, iso(now_utc() - timedelta(minutes=10)))).rowcount
                 con.commit()                         # always end the transaction, or other readers of this inbox would wait
                 if not claimed:
                     if con.execute("SELECT 1 FROM msg_pending WHERE key=?", (key,)).fetchone():
-                        continue                     # another reader is on it right now
+                        failed.append("an email is still being handled")   # not done yet: this inbox doesn't count as read
+                        continue
                     if not recheck or not mid:
                         continue
                     done_before = con.execute("SELECT 1 FROM received WHERE msg_id=?", (mid,)).fetchone() or con.execute(
@@ -2405,16 +2455,17 @@ def process_inbox(cfg, con, sender, recheck=False, days=None):
                         "OR decision LIKE 'out of office%' OR decision LIKE 'handed-over%')", (mid,)).fetchone()
                     if done_before:
                         continue
-                _, full = M.uid("fetch", uid, "(BODY.PEEK[])")
-                msg = guard.parse(full[0][1])
+                msg = None
                 try:
+                    _, full = M.uid("fetch", uid, "(BODY.PEEK[])")
+                    msg = guard.parse(full[0][1])
                     handle_message(cfg, con, sender, msg, label)
                     con.execute("DELETE FROM msg_pending WHERE key=?", (key,))
                     con.commit()
                 except Exception as e:
                     con.rollback()
                     log.error("Couldn't handle a message in %s: %s", sender["email"], e)
-                    if safety.message_failed(cfg, con, sender, key, msg, e):
+                    if safety.message_failed(cfg, con, sender, key, msg if msg is not None else guard.parse(b""), e):
                         failed.append(str(e)[:120])  # tried again later; until then this inbox doesn't count as read
                     con.commit()
                 n_new += 1
@@ -2765,19 +2816,55 @@ def cmd_stats(cfg, con, args):
 
 # ---------------------------------------------------------------- main
 
-def acquire_lock():
-    """Stop two overlapping cron runs from double-sending."""
+def _try_lock(fh):
+    """Non-blocking exclusive lock on an open file (Windows and others). True if this process now holds it."""
     try:
+        import msvcrt
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        return True
+    except ImportError:
         import fcntl
-    except ImportError:  # Windows: no lock
-        return None
-    fh = open(DATA / ".bot.lock", "w")
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
     except OSError:
+        return False
+
+
+def acquire_lock():
+    """Only one run or reply check at a time, on every system (two at once could send the same email twice)."""
+    fh = open(DATA / ".bot.lock", "a+")
+    if not _try_lock(fh):
+        fh.close()
         print("Another run is in progress; exiting.")
         sys.exit(0)
     return fh
+
+
+def run_in_progress():
+    """True while another process holds the run lock (a run started before an update restart, for example)."""
+    try:
+        fh = open(DATA / ".bot.lock", "a+")
+    except OSError:
+        return False
+    try:
+        if _try_lock(fh):
+            try:
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except ImportError:
+                import fcntl
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            return False
+        return True
+    finally:
+        fh.close()
 
 
 def main(argv=None):

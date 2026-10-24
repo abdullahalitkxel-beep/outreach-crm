@@ -650,6 +650,7 @@ def apply_dnc(con, hashes, last=False):
     if last:
         s = state()
         s["dnc_ready"] = iso(now_utc())
+        s.pop("dnc_must_wait", None)
         save_state(s)
     con.commit()
     return stopped
@@ -658,6 +659,15 @@ def apply_dnc(con, hashes, last=False):
 def on_team_dnc(con, email):
     _dnc_table(con)
     return con.execute("SELECT 1 FROM team_dnc WHERE h=?", (dnc_hash(email),)).fetchone() is not None
+
+
+def dnc_must_wait(con):
+    """A bot waits for the whole list only when it could otherwise email someone stopped elsewhere: it has never sent
+    (new or rebuilt), or it was restored from a backup. A bot that was already running keeps going while the list arrives."""
+    s = state()
+    if s.get("dnc_must_wait"):
+        return True
+    return not con.execute("SELECT 1 FROM events WHERE type='sent' AND detail NOT LIKE '%(test)%' LIMIT 1").fetchone()
 
 
 def dnc_ready():
@@ -1218,7 +1228,8 @@ def _sync(con, version=""):
                 rp = autopilot.report(_bot.load_config(str(Path(DATA) / "config.yaml")), con)
                 rp["cmd_results"] = s.get("cmd_results", [])[-20:]
                 rp["version"] = version or _app_version()
-                rkey = hashlib.sha256(json.dumps({k: v for k, v in rp.items() if k != "at"}, sort_keys=True, default=str).encode()).hexdigest()
+                rkey = hashlib.sha256(json.dumps({k: v for k, v in rp.items() if k not in ("at", "last_sent_at", "due_now")}, sort_keys=True,
+                                                 default=str).encode()).hexdigest()
                 due_rep = s.get("report_due") or rkey != s.get("report_key") or not s.get("report_at") or \
                     now_utc() - datetime.fromisoformat(s["report_at"]).astimezone(timezone.utc) > timedelta(minutes=5)
                 if due_rep:
@@ -1251,10 +1262,15 @@ def _sync(con, version=""):
         packed += [{"id": f"t{t['part']}", "type": "__transfer", "data": _tr(t)} for t in tq]
         if s.get("away_pending"):
             packed.append({"id": "away", "type": "__away", "data": {"until": s.get("away_until", "")}})
-        dnc_rows = con.execute("SELECT rowid, email FROM suppression WHERE rowid>? ORDER BY rowid LIMIT 2000",
-                               (int(s.get("dnc_sent") or 0),)).fetchall()
+        dnc_rows = []
+        testing = (con.execute("SELECT v FROM app_mode WHERE k='test'").fetchone() or ["0"])[0] == "1"
+        if not testing:                    # stops caused while testing never leave this laptop (they may be undone)
+            con.execute("CREATE TABLE IF NOT EXISTS dnc_reported (email TEXT PRIMARY KEY)")
+            tester = (con.execute("SELECT v FROM app_mode WHERE k='tester'").fetchone() or [""])[0]
+            dnc_rows = [r["email"] for r in con.execute(
+                "SELECT email FROM suppression WHERE email NOT IN (SELECT email FROM dnc_reported) AND email!=? LIMIT 2000", (tester or "",)).fetchall()]
         if dnc_rows:
-            packed.append({"id": "dnc", "type": "__dnc", "data": {"h": [dnc_hash(r["email"]) for r in dnc_rows]}})
+            packed.append({"id": "dnc", "type": "__dnc", "data": {"h": [dnc_hash(e) for e in dnc_rows]}})
         if not s.get("dnc_ready") and (not s.get("dnc_req_at") or s["dnc_req_at"] < iso(now_utc() - timedelta(minutes=10))):
             packed.append({"id": "dnq", "type": "__dnc_req", "data": {}})
         _access_table(con)
@@ -1301,7 +1317,8 @@ def _sync(con, version=""):
     if any(p.get("type") == "__device" for p in packed):
         s["device_sent"] = iso(now_utc())
     if dnc_rows:
-        s["dnc_sent"] = dnc_rows[-1]["rowid"]
+        con.executemany("INSERT OR IGNORE INTO dnc_reported(email) VALUES (?)", [(e,) for e in dnc_rows])
+        con.commit()
     if any(p.get("type") == "__dnc_req" for p in packed):
         s["dnc_req_at"] = iso(now_utc())
     if events:
