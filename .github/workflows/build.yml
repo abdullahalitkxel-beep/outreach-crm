@@ -222,20 +222,22 @@ jobs:
             $pfx = "$env:RUNNER_TEMP\cs.pfx"
             [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CODESIGN_PFX_BASE64))
             $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
-            & $st.FullName sign /f $pfx /p $env:CODESIGN_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 dist\BSO-Setup.exe
+            $out = & $st.FullName sign /f $pfx /p $env:CODESIGN_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 dist\BSO-Setup.exe 2>&1
             $rc = $LASTEXITCODE
             Remove-Item $pfx
-            if ($rc) { throw "signing BSO-Setup.exe failed" }
+            if ($rc) { Write-Host "::error title=Installer signing::$(($out | Out-String) -replace "`r?`n", ' ')"; throw "signing BSO-Setup.exe failed" }
           } else { Write-Host "::warning title=Code signing::CODESIGN_PFX_BASE64 secret not set: the installer is unsigned" }
           if ($env:UPDATE_SIGNING_KEY) {
             $key = "$env:RUNNER_TEMP\upd.pem"
             Set-Content -Path $key -Value $env:UPDATE_SIGNING_KEY -NoNewline
-            openssl dgst -sha256 -sign $key -out dist\BSO-Setup.exe.sig dist\BSO-Setup.exe
+            $first = ($env:UPDATE_SIGNING_KEY -split "`n")[0].Trim()
+            $lines = ($env:UPDATE_SIGNING_KEY -split "`n").Count
+            $out = openssl dgst -sha256 -sign $key -out dist\BSO-Setup.exe.sig dist\BSO-Setup.exe 2>&1
             $rc = $LASTEXITCODE
             Remove-Item $key
-            if ($rc) { throw "release signature failed" }
+            if ($rc) { Write-Host "::error title=Release signature::openssl couldn't use UPDATE_SIGNING_KEY (first line '$first', $lines line(s)): $(($out | Out-String) -replace "`r?`n", ' ')"; throw "release signature failed" }
             python -c "import updater,sys; ok=updater.verify(open('dist/BSO-Setup.exe','rb').read(), open('dist/BSO-Setup.exe.sig','rb').read()); print('release signature ok' if ok else 'BAD'); sys.exit(0 if ok else 1)"
-            if ($LASTEXITCODE) { throw "the release signature doesn't match update_key.json" }
+            if ($LASTEXITCODE) { Write-Host "::error title=Release signature::UPDATE_SIGNING_KEY is a valid key but not the one in update_key.json: paste the private key from the secrets file again"; throw "the release signature doesn't match update_key.json" }
           } else { Write-Host "::warning title=Automatic updates::UPDATE_SIGNING_KEY secret not set: this release isn't signed, so BSOs won't install it automatically" }
 
       - name: Test the installer (install, run, check Windows "Installed apps" entry, uninstall)
