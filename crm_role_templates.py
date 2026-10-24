@@ -18,10 +18,10 @@ ROLE_TEMPLATES["botroom.html"] = r"""{% extends 'base.html' %}{% import 'macros.
  <div class="kpi"><small>Sent today</small><b>{{ sent }}</b><span class="muted">{{ ('today\'s limit: ' ~ cap) if cap else 'no inbox may send yet' }}</span></div>
  <div class="kpi"><small>Inboxes sending</small><b>{{ rp.inboxes|selectattr('limit')|list|length }}</b><span class="muted">of {{ rp.inboxes|length }}</span></div>
  <div class="kpi"><small>Waiting in Review</small><b>{{ review_count or 0 }}</b></div>
- <div class="kpi"><small>Last run</small><b style="font-size:16px">{{ (last.finished_at or last.started_at or '')[:16].replace('T', ' ') if last else 'never' }}</b><span class="muted">{{ last.status if last }}</span></div>
+ <div class="kpi"><small>Last run</small><b style="font-size:16px">{{ local_time(last.finished_at or last.started_at) if last else 'never' }}</b><span class="muted">{{ last.status if last }}</span></div>
 </div>
 {% if rp.breakers %}<div class="card" style="border-color:#c23934"><div class="card-h"><h2>Paused by the safety breaker</h2><span class="muted" style="margin-left:8px">too many bounces, complaints or stop requests; resuming is a person's decision</span></div><table class="tbl">
-{% for k in rp.breakers %}<tr><td>{{ {'campaign': 'Campaign', 'list': 'Imported list', 'restore': 'After a restore'}.get(k.kind, k.kind) }} <b>{{ k.key }}</b></td><td class="muted">{{ k.at[:16].replace('T', ' ') }}</td><td>{{ k.reason }}</td>
+{% for k in rp.breakers %}<tr><td>{{ {'campaign': 'Campaign', 'list': 'Imported list', 'restore': 'After a restore'}.get(k.kind, k.kind) }} <b>{{ k.key }}</b></td><td class="muted">{{ local_time(k.at) }}</td><td>{{ k.reason }}</td>
 <td><form method="post" action="{{ url_for('bot_breaker_resume', bid=k.id) }}" style="margin:0" onsubmit="return confirm('Resume? Fix the cause first: clean the list, check the email copy.')"><button class="btn sm">Resume</button></form></td></tr>{% endfor %}</table></div>{% endif %}
 <div class="card"><div class="card-h"><h2>Why not more emails today?</h2></div><div class="card-b">{% for k, w in rp.why_not %}<div>• {{ w }}</div>{% else %}<div class="muted">Nothing is holding sending back.</div>{% endfor %}</div></div>
 <div class="card"><div class="card-h"><h2>Campaigns</h2></div><table class="tbl"><tr><th>Campaign</th><th>Client</th><th>Who approves</th><th class="r">Sent today</th><th class="r">Leads waiting</th><th class="r">New per day</th><th class="r">Days of leads left</th></tr>
