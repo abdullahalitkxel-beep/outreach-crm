@@ -48,7 +48,7 @@ try:
         c.post("/users/new", data={"_csrf": tok("/users"), "name": name, "email": email, "username": user, "role": role, "password": user + "-pass-1234"})
     c.post("/settings", data={"_csrf": tok("/settings"), "action": "relay_url", "relay_url": URL})
     hcon = hub.sqlite3.connect(str(hub.DB_PATH)); hcon.row_factory = hub.sqlite3.Row
-    check(hub._m_get(hcon, "relay_version") == "5", "console uses Google script version 5")
+    check(hub._m_get(hcon, "relay_version") == str(hub.RELAY_LATEST), "console uses the latest Google script version")
 
     # ---- 2-step sign-in for the console
     c.post("/security/2fa", data={"_csrf": tok("/security/2fa"), "action": "start"})
