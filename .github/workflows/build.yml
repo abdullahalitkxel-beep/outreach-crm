@@ -20,6 +20,7 @@ jobs:
       CODESIGN_PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
       CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
       UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+      UPDATE_SIGNING_KEY_PASSWORD: ${{ secrets.UPDATE_SIGNING_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -234,6 +235,17 @@ jobs:
             $lines = ($env:UPDATE_SIGNING_KEY -split "`n").Count
             $out = openssl dgst -sha256 -sign $key -out dist\BSO-Setup.exe.sig dist\BSO-Setup.exe 2>&1
             $rc = $LASTEXITCODE
+            if ($rc -and ($env:UPDATE_SIGNING_KEY -match "ENCRYPTED")) {
+              # the key is protected by a password: try the update key's own password secret, then the certificate's
+              foreach ($pw in @($env:UPDATE_SIGNING_KEY_PASSWORD, $env:CODESIGN_PFX_PASSWORD)) {
+                if (-not $pw) { continue }
+                $env:BSO_KEYPASS = $pw
+                $out = openssl dgst -sha256 -sign $key -passin env:BSO_KEYPASS -out dist\BSO-Setup.exe.sig dist\BSO-Setup.exe 2>&1
+                $rc = $LASTEXITCODE
+                Remove-Item Env:\BSO_KEYPASS
+                if (-not $rc) { Write-Host "release key unlocked with its password"; break }
+              }
+            }
             Remove-Item $key
             if ($rc) { Write-Host "::error title=Release signature::openssl couldn't use UPDATE_SIGNING_KEY (first line '$first', $lines line(s)): $(($out | Out-String) -replace "`r?`n", ' ')"; throw "release signature failed" }
             python -c "import updater,sys; ok=updater.verify(open('dist/BSO-Setup.exe','rb').read(), open('dist/BSO-Setup.exe.sig','rb').read()); print('release signature ok' if ok else 'BAD'); sys.exit(0 if ok else 1)"
