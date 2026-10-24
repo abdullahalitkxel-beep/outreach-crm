@@ -52,7 +52,7 @@ function fileObj(id) {
   const it = items[id];
   return {
     getId: () => id, getName: () => it.name, getDateCreated: () => new Date(it.created),
-    getBlob: () => ({ getDataAsString: () => it.content }),
+    getBlob: () => ({ getDataAsString: () => it.content }), getSize: () => Buffer.byteLength(it.content),
     setContent: (c) => { it.content = String(c); }, setTrashed: (t) => { it.trashed = !!t; },
   };
 }
@@ -86,7 +86,8 @@ const params = (url, body, type) => {
   return p;
 };
 
-const code = fs.readFileSync(path.join(__dirname, 'Code.gs'), 'utf8').replace('__ADMIN_KEY_HASH__', adminHash);
+const code = fs.readFileSync(path.join(__dirname, 'Code.gs'), 'utf8').replace('__ADMIN_KEY_HASH__', adminHash)
+  .replace('var UNSUB_LINKS = false;', `var UNSUB_LINKS = ${process.env.UNSUB_LINKS === '1'};`);
 const ctx = vm.createContext({ Utilities, PropertiesService, CacheService, LockService, DriveApp, ContentService, HtmlService, ScriptApp, JSON, Date, Math, Number, String, Error, parseInt, Object });
 vm.runInContext(code, ctx, { filename: 'Code.gs' });
 

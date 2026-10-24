@@ -707,9 +707,10 @@ def housekeeping(cfg, con):
         if safety.due_backup(con):
             r = safety.backup(con, folder=(cfg.get("backup") or {}).get("folder") or None)
             lines.append(f"Backup {r['file']}: {r['detail']}" +
-                         (f"; off-laptop copy: {r['offsite_detail']}" if r.get("offsite_detail") else "; no off-laptop folder set (Settings → Safety)"))
-            if not r["ok"] or r.get("offsite_ok") is False:
-                bot.notify(f"⚠ BSO Bot backup problem: {r['detail']}" + (f" / {r.get('offsite_detail')}" if r.get("offsite_detail") else ""), cfg)
+                         (f"; Google Drive: {r['drive_detail']}" if r.get("drive_detail") else "; no Google Drive copy (update the Google script to version 6)") +
+                         (f"; folder: {r['offsite_detail']}" if r.get("offsite_detail") else ""))
+            if not r["ok"] or r.get("offsite_ok") is False or r.get("drive_ok") is False:
+                bot.notify(f"⚠ BSO Bot backup problem: {r['detail']}" + "".join(f" / {r[k]}" for k in ("drive_detail", "offsite_detail") if r.get(k)), cfg)
     except Exception as e:
         lines.append(f"PROBLEM: daily backup failed ({e}).")
     return lines

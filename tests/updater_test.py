@@ -53,6 +53,20 @@ release = {"tag_name": "v1.0.52", "published_at": "2026-11-02T10:00:00Z", "body"
 updater.requests.get = lambda *a, **k: Resp(release)
 b = updater.check(force=True)
 check(b["available"] and b["latest"] == "1.0.52" and "Autopilot" in b["notes"], "a newer release is found with its notes")
+asked = []
+def two_repos(url, *a, **k):
+    asked.append(url)
+    if "bso-releases" in url:
+        raise RuntimeError("404 Not Found")            # the releases repository doesn't exist yet
+    return Resp(release)
+updater.requests.get = two_repos
+b = updater.check(force=True)
+check(b["latest"] == "1.0.52" and any("bso-releases" in u for u in asked) and any("outreach-crm" in u for u in asked),
+      "updates come from the public releases repository, and from the code repository until that exists")
+older = dict(release, tag_name="v1.0.50")
+updater.requests.get = lambda url, *a, **k: Resp(release if "bso-releases" in url else older)
+check(updater.check(force=True)["latest"] == "1.0.52", "the newest release in either repository wins")
+updater.requests.get = lambda url, *a, **k: Resp(release)
 role = {"r": "owner"}
 updater._role = lambda: role["r"]
 ctl = {}

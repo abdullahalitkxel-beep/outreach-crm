@@ -2376,7 +2376,7 @@ def api_sync():
 # this console publishes users, limits and decisions to it and collects the reports, about once a minute.
 
 RELAY_EVERY = 60
-RELAY_LATEST = 5          # version of relay/Code.gs shipped with this BSO
+RELAY_LATEST = 6          # version of relay/Code.gs shipped with this BSO
 _relay_lock = threading.Lock()
 
 
@@ -2934,7 +2934,7 @@ T["security.html"] = """{% extends 'base.html' %}{% block title %}Security{% end
 T["audit.html"] = """{% extends 'base.html' %}{% block title %}Audit log{% endblock %}{% block body %}<div class="card"><div class="card-h"><h2>Who changed what in this console</h2></div><table><tr><th>When</th><th>Who</th><th>Action</th><th>Detail</th></tr>{% for r in rows %}<tr><td class="muted">{{ r.at|dt }}</td><td>{{ r.actor }}</td><td>{{ r.action }}</td><td>{{ r.detail }}</td></tr>{% endfor %}</table></div>{% endblock %}"""
 T["settings.html"] = """{% extends 'base.html' %}{% block title %}Settings{% endblock %}{% block body %}{% if msg %}<div class="note">{{ msg }}</div>{% endif %}
 <div class="card"><div class="card-h"><h2>Team connection through your Google Drive</h2>{% if relay_url and relay_ok and not relay_err %}<span class="badge b-ok">Connected</span>{% elif relay_url %}<span class="badge b-bad">Problem</span>{% else %}<span class="badge b-warn">Not set up</span>{% endif %}</div><div class="card-b">
-{% if relay_url and relay_version < relay_latest %}<div class="err"><b>Update your Google script (one time, the address stays the same).</b> With the new version, cold emails get a one-click unsubscribe link (Gmail and Yahoo expect one), and handovers, comments, away dates and moving prospects between supervisors are handled by Google itself, so nobody needs this console to be open for them.
+{% if relay_url and relay_version < relay_latest %}<div class="err"><b>Update your Google script (one time, the address stays the same).</b> With the new version, the BSO Bot copies every backup to your Google Drive (sealed, checked, newest 14 kept), and handovers, comments, away dates and moving prospects between supervisors are handled by Google itself, so nobody needs this console to be open for them.
 <ol style="margin:6px 0 0"><li>Click <b>Copy script</b> below.</li><li>In script.google.com, open your BSO project, select all the code, paste over it and <b>Save</b>.</li><li><b>Deploy → Manage deployments →</b> pencil (Edit) <b>→ Version: New version → Deploy</b>.</li><li>Back here, click <b>Sync now</b>. This message disappears when the update is detected.</li></ol></div>{% endif %}
 {% if relay_url %}<p style="margin-top:0">Team laptops sign in and report through <b>{{ relay_url }}</b>. Last sync: {{ relay_ok|dt if relay_ok else 'never' }}.{% if relay_err %}<br><span style="color:#ba0517">{{ relay_err }}</span>{% endif %}</p>
 <form method="post" style="display:inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="btn" name="action" value="relay_sync">Sync now</button></form>

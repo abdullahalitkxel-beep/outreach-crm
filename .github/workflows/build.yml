@@ -21,12 +21,19 @@ jobs:
       CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
       UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
       UPDATE_SIGNING_KEY_PASSWORD: ${{ secrets.UPDATE_SIGNING_KEY_PASSWORD }}
+      RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      # A wrong secret otherwise shows up only at the signing steps, 15 minutes in. This takes seconds.
+      - name: Check the release secrets
+        run: |
+          python -m pip install --quiet cryptography
+          python packaging/check_secrets.py
 
       - name: Install dependencies
         run: |
@@ -128,6 +135,9 @@ jobs:
 
       - name: Test stop requests are always honoured (mid-run stops, test mode, lost replies, team list, stuck runs)
         run: python tests/stop_test.py
+
+      - name: Test the release-secrets check
+        run: python tests/secrets_check_test.py
 
       - name: Test from source
         run: python tests/smoke_test.py app.py
@@ -354,6 +364,33 @@ jobs:
           tag_name: v1.0.${{ github.run_number }}
           name: BSO – BlacSwanken Outreach 1.0.${{ github.run_number }} (Windows)
           target_commitish: ${{ github.sha }}
+          make_latest: true
+          body: |
+            ${{ github.event.head_commit.message }}
+
+            ---
+            **BSO-Setup.exe**: install on your PC (per-user, no admin rights needed). Shows the licence agreement and registers BlacSwanken as publisher.
+            **BSO-Store.msix**: upload this to Microsoft Partner Center for the Store listing. (It isn't meant to be double-clicked; the Store signs it.)
+            **privacy.html, terms.html, acceptable-use.html**: put these on blacswanken.com; the Store listing needs the privacy page's address.
+
+            Until the Store version is live, Windows may show "Windows protected your PC" for the installer: click **More info → Run anyway**.
+            Your data stays in %APPDATA%\OutreachCRM, so updating keeps everything.
+          files: |
+            dist/BSO-Setup.exe
+            dist/BSO-Setup.exe.sig
+            dist/BSO-Store.msix
+            build/legal-site/privacy.html
+            build/legal-site/terms.html
+            build/legal-site/acceptable-use.html
+
+      - name: Publish the release to the public releases repository (laptops update from there)
+        if: github.ref == 'refs/heads/main' && env.RELEASES_TOKEN != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: abdullahalitkxel-beep/bso-releases
+          token: ${{ env.RELEASES_TOKEN }}
+          tag_name: v1.0.${{ github.run_number }}
+          name: BSO – BlacSwanken Outreach 1.0.${{ github.run_number }} (Windows)
           make_latest: true
           body: |
             ${{ github.event.head_commit.message }}

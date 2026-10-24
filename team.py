@@ -1361,6 +1361,7 @@ def _sync(con, version=""):
     s["drafts_sent"] = sorted(set(s.get("drafts_sent", [])) | {d["id"] for d in drafts})[-2000:]
     s["policy"] = j.get("policy") or s.get("policy", {})
     s["relay_version"] = int(j.get("relay_version") or (1 if relay.is_relay(s["hub"]) else 0))
+    s["relay_unsub"] = bool(j.get("unsub_links"))       # the master switched unsubscribe links on in the script
     unsubs = j.get("unsubs") or []
     if unsubs:                                            # one-click unsubscribes collected by the relay
         try:

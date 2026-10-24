@@ -88,7 +88,7 @@ The Software checks GitHub (github.com, operated by GitHub, Inc.) for new releas
 
 ## 7b. Unsubscribe links and backups
 
-When your organisation's Google relay is version 5 or later, cold emails sent by the Software include an unsubscribe link to that relay. The link carries a random code, not the recipient's address. When a recipient uses it, the relay stores the code and the time in your organisation's Google Drive; only the computer that sent the email can match the code to an address, and it then stops emailing that person. The Software also keeps backup copies of its database on your computer and, if your organisation chooses a backup folder, a copy sealed with your team's key in that folder.
+When your organisation switches unsubscribe links on in its Google relay (version 5 or later), cold emails sent by the Software include an unsubscribe link to that relay. The link carries a random code, not the recipient's address. When a recipient uses it, the relay stores the code and the time in your organisation's Google Drive; only the computer that sent the email can match the code to an address, and it then stops emailing that person. The Software also keeps backup copies of its database on your computer and, with a relay of version 6 or later, stores copies sealed with your team's key in your organisation's Google Drive (the newest 14), plus a sealed copy in a backup folder if your organisation chooses one. Sealed copies can only be opened by the Software signed in to your team.
 
 ## 8. Children
 

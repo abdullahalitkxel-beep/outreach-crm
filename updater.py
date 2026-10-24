@@ -29,7 +29,10 @@ import requests
 import bot
 from bot import DATA, ROOT, iso, now_utc
 
-REPO = os.getenv("BSO_UPDATE_REPO", "abdullahalitkxel-beep/outreach-crm")
+# Releases are published to a public repository that holds only the installers, so the source code can stay private.
+# The code repository is still asked as a fallback (laptops that updated before the releases repository existed).
+REPOS = [r for r in (os.getenv("BSO_UPDATE_REPO"), "abdullahalitkxel-beep/bso-releases", "abdullahalitkxel-beep/outreach-crm") if r]
+REPO = REPOS[0]
 API = f"https://api.github.com/repos/{REPO}/releases/latest"
 STATE = Path(DATA) / "update.json"
 DIR = Path(DATA) / "updates"
@@ -104,9 +107,19 @@ def check(force=False):
     if not force and s.get("checked_at") and time.time() - s["checked_at"] < CHECK_EVERY:
         return banner()
     try:
-        r = requests.get(API, headers={"Accept": "application/vnd.github+json", "User-Agent": "BSO-updater"}, timeout=20)
-        r.raise_for_status()
-        j = r.json()
+        j, errs = None, []
+        for repo in REPOS:                          # the newest release found in any of them
+            try:
+                r = requests.get(f"https://api.github.com/repos/{repo}/releases/latest",
+                                 headers={"Accept": "application/vnd.github+json", "User-Agent": "BSO-updater"}, timeout=20)
+                r.raise_for_status()
+                got = r.json()
+                if got.get("tag_name") and (j is None or ver(got["tag_name"].lstrip("v")) > ver(j["tag_name"].lstrip("v"))):
+                    j = got
+            except Exception as e:
+                errs.append(str(e)[:80])
+        if j is None:
+            raise RuntimeError("; ".join(errs) or "no release found")
         assets = {a["name"]: a["browser_download_url"] for a in j.get("assets") or []}
         s.update(latest=j.get("tag_name", "").lstrip("v"), published_at=j.get("published_at"), notes=(j.get("body") or "")[:4000],
                  setup_url=assets.get("BSO-Setup.exe"), sig_url=assets.get("BSO-Setup.exe.sig"), checked_at=time.time(), error="")
@@ -224,8 +237,15 @@ def _previous_installer():
     if old.exists():
         return old
     try:
-        r = requests.get(f"https://api.github.com/repos/{REPO}/releases/tags/v{current()}", timeout=20, headers={"User-Agent": "BSO-updater"})
-        assets = {a["name"]: a["browser_download_url"] for a in r.json().get("assets") or []}
+        assets = {}
+        for repo in REPOS:
+            try:
+                r = requests.get(f"https://api.github.com/repos/{repo}/releases/tags/v{current()}", timeout=20, headers={"User-Agent": "BSO-updater"})
+                assets = {a["name"]: a["browser_download_url"] for a in r.json().get("assets") or []}
+            except Exception:
+                assets = {}
+            if assets.get("BSO-Setup.exe"):
+                break
         if assets.get("BSO-Setup.exe") and assets.get("BSO-Setup.exe.sig"):
             _download(assets["BSO-Setup.exe"], old)
             sig = old.with_suffix(".exe.sig")

@@ -18,9 +18,10 @@ One-click unsubscribe
     token, never the address; only this laptop knows which address a token belongs to.
 
 Backups
-    Once a day the database is copied (SQLite online backup), checked (integrity, the copy opens, row counts match)
-    and, when a backup folder is set (for example a Google Drive for desktop folder), a compressed copy sealed with
-    the team key is written there so it survives the laptop. restore() puts a backup back.
+    Every 6 hours the database is copied (SQLite online backup) and checked (integrity, the copy opens, row counts
+    match). A compressed copy sealed with the team key then leaves the laptop: to the owner's Google Drive through the
+    team relay (version 6 or later, nothing to set up), read back and checked there, and also to a backup folder when
+    one is set. restore() puts a backup back; drive_fetch() downloads one from Google Drive first.
 """
 import json
 import os
@@ -252,12 +253,13 @@ def token_for(con, email):
 
 
 def relay_url():
-    """The team relay's address when it can take unsubscribes (relay version 5+), else None."""
+    """The team relay's address when it takes unsubscribes and the master switched the links on there (UNSUB_LINKS in
+    the script: off by default, because the link prints the relay's address in every cold email), else None."""
     try:
         import relay
         import team
         s = team.state()
-        if team.joined() and relay.is_relay(s.get("hub")) and int(s.get("relay_version") or 0) >= 5:
+        if team.joined() and relay.is_relay(s.get("hub")) and int(s.get("relay_version") or 0) >= 5 and s.get("relay_unsub"):
             return s["hub"].split("?")[0]
     except Exception:
         pass
@@ -356,13 +358,33 @@ def backup(con, folder=None, key=None):
     for old in sorted(out_dir.glob("daily-*.db"))[:-KEEP_BACKUPS]:
         old.unlink(missing_ok=True)
     key = key if key is not None else _team_key()
+    sealed = None
+    if (folder or drive_ready()) and key and ok:
+        sealed = _fast_seal(key, zlib.compress(dest.read_bytes(), 6))
+    if drive_ready():
+        if not ok:
+            res.update(drive_ok=False, drive_detail="not uploaded: this copy failed its restore test")
+        elif not key:
+            res.update(drive_ok=False, drive_detail="sign this BSO in to the team first: the Drive copy is sealed with the team key")
+        else:
+            name = f"BSO-backup-{stamp}.bsobak"
+            try:
+                drive_put(name, sealed)
+                back = drive_download(name)
+                if back != sealed:
+                    raise RuntimeError("the copy read back from Google Drive doesn't match")
+                d_ok, d_detail = _check_sealed_text(back, key, live)
+                res.update(drive=name, drive_ok=d_ok, drive_detail=("read back from Google Drive: " + d_detail) if d_ok else d_detail)
+            except Exception as e:
+                res.update(drive_ok=False, drive_detail=f"Google Drive copy failed: {e}")
     if folder:
         try:
             if not key:
                 raise RuntimeError("sign this BSO in to the team first: the off-laptop copy is sealed with the team key")
+            if sealed is None:
+                raise RuntimeError("not copied: this backup failed its restore test")
             f = Path(folder)
             f.mkdir(parents=True, exist_ok=True)
-            sealed = _fast_seal(key, zlib.compress(dest.read_bytes(), 6))
             tmp = f / f"BSO-backup-{stamp}.bsobak.part"
             tmp.write_text(sealed, encoding="ascii")
             final = tmp.with_suffix("")
@@ -406,6 +428,88 @@ def check_copy(path, live=None):
 def open_sealed(path, key):
     import sealbox
     return zlib.decompress(sealbox.open_(key, Path(path).read_text(encoding="ascii")))
+
+
+def _check_sealed_text(text, key, live=None):
+    import sealbox
+    try:
+        raw = zlib.decompress(sealbox.open_(key, text))
+    except Exception as e:
+        return False, f"the sealed copy can't be opened ({e})"
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        Path(tmp).write_bytes(raw)
+        return check_copy(tmp, live)
+    finally:
+        os.unlink(tmp)
+
+
+# ---------------------------------------------------------------- Google Drive copies through the team relay (version 6)
+
+DRIVE_PART = 4_000_000
+
+
+def _drive_call(action, body, timeout=180):
+    import team
+    s = team.state()
+    code, j = team._post(s["hub"], "/" + action, body, token=team.env(team.TOKEN_KEY), timeout=timeout)
+    if code != 200:
+        raise RuntimeError(j.get("error") or f"the relay answered {code}")
+    return j
+
+
+def drive_ready():
+    """True when this laptop is signed in to a team relay that keeps backups (version 6 or later)."""
+    try:
+        import relay
+        import team
+        s = team.state()
+        return bool(team.joined() and relay.is_relay(s.get("hub")) and int(s.get("relay_version") or 0) >= 6 and team.env(team.TOKEN_KEY))
+    except Exception:
+        return False
+
+
+def drive_put(name, sealed):
+    parts = [sealed[i:i + DRIVE_PART] for i in range(0, len(sealed), DRIVE_PART)] or [""]
+    if len(parts) > 12:
+        raise RuntimeError(f"the backup is too big for the relay ({len(sealed) // 1_000_000} MB sealed)")
+    for i, p in enumerate(parts):
+        last = None
+        for attempt in range(3):
+            try:
+                _drive_call("backup_put", {"name": name, "part": i, "parts": len(parts), "data": p})
+                last = None
+                break
+            except Exception as e:
+                last = e
+                time.sleep(2 * (attempt + 1))
+        if last:
+            raise last
+
+
+def drive_list():
+    """The backups stored on Google Drive for this sign-in, newest first."""
+    return _drive_call("backup_list", {}, timeout=60).get("backups") or []
+
+
+def drive_download(name):
+    first = _drive_call("backup_get", {"name": name, "part": 0})
+    data = [first.get("data") or ""]
+    for i in range(1, int(first.get("parts") or 1)):
+        data.append(_drive_call("backup_get", {"name": name, "part": i}).get("data") or "")
+    return "".join(data)
+
+
+def drive_fetch(name):
+    """Download a backup from Google Drive into this laptop's backups folder; returns its path for restore()."""
+    if not re.match(r"^BSO-backup-\d{8}-\d{4,6}\.bsobak$", name or ""):
+        raise RuntimeError("That isn't a BSO backup name.")
+    out = _data() / "backups"
+    out.mkdir(exist_ok=True)
+    p = out / name
+    p.write_text(drive_download(name), encoding="ascii")
+    return p
 
 
 def check_sealed(path, key, live=None):

@@ -26,7 +26,8 @@ PORT = 8793
 URL = f"http://127.0.0.1:{PORT}/exec"
 hub.prepare(str(tmp / "hub"))
 key = hub.relay_key(create=True)
-node = subprocess.Popen(["node", str(root / "relay" / "test_double.js"), str(PORT), hashlib.sha256(key.encode()).hexdigest()])
+node = subprocess.Popen(["node", str(root / "relay" / "test_double.js"), str(PORT), hashlib.sha256(key.encode()).hexdigest()],
+                        env=dict(os.environ, UNSUB_LINKS="1"))   # the master switched unsubscribe links on in this test
 try:
     for _ in range(50):
         try:
@@ -134,9 +135,16 @@ try:
     team.sign_in(con, "ayesha", "new-ayesha-pass")
     check(team.sync(con)[0], "new password works")
 
-    # --- one-click unsubscribe through the relay (version 5)
+    # --- one-click unsubscribe through the relay (version 5+, switched on by the master)
     import urllib.request, urllib.parse, safety  # noqa: E401
-    check(team.state().get("relay_version") == 5, "the laptop sees relay version 5")
+    check(team.state().get("relay_version") == 6, "the laptop sees relay version 6")
+    check("var UNSUB_LINKS = false;" in (root / "relay" / "Code.gs").read_text(),
+          "the script as shipped keeps unsubscribe links off (they would print the relay address in every cold email)")
+    st = team.state(); st["relay_unsub"] = False; team.save_state(st)
+    h = safety.unsub_headers(con, "cole@neosoft-mail.com", "l1@acme.com")
+    check(h == {"List-Unsubscribe": "<mailto:cole@neosoft-mail.com?subject=unsubscribe>"}, "links off: cold emails carry only the mailto: unsubscribe")
+    team.sync(con)
+    check(team.state().get("relay_unsub") is True, "the laptop learns the master switched links on")
     h = safety.unsub_headers(con, "cole@neosoft-mail.com", "l1@acme.com")
     con.commit()
     m = re.match(r"<(http[^>]+)>, <mailto:cole@neosoft-mail.com\?subject=unsubscribe>", h["List-Unsubscribe"])
@@ -158,6 +166,40 @@ try:
           "the next sync stops all email to that person")
     team.sync(con)
     check(not con.execute("SELECT 1 FROM suppression WHERE email='l2@acme.com'").fetchone(), "nobody else is affected")
+
+    # --- off-laptop backups to the master's Google Drive (version 6)
+    safety.DRIVE_PART = 2000                      # small parts so the test covers a backup in several pieces
+    check(safety.drive_ready(), "a signed-in laptop on relay 6 has Google Drive backups with nothing to set up")
+    r = safety.backup(con)
+    check(r["ok"] and r.get("drive_ok") and "read back from Google Drive" in r.get("drive_detail", ""),
+          "a backup goes to Google Drive, is read back and passes the restore test: " + str(r.get("drive_detail")))
+    lst = safety.drive_list()
+    check(len(lst) == 1 and lst[0]["complete"] and lst[0]["parts"] > 1 and lst[0]["name"] == r["drive"], "it is listed, complete, in several parts")
+    files = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/_files").read())
+    raw = [f for f in files if f["name"].startswith("BSO-backup-")]
+    check(raw and not any("acme" in json.dumps(f) for f in raw), "Drive holds only the sealed copy")
+    p = safety.drive_fetch(r["drive"])
+    check(safety.check_sealed(p, team._team_key())[0], "a replacement laptop with the same sign-in downloads it and it opens")
+    try:
+        safety.drive_fetch("../../evil")
+        check(False, "odd names refused")
+    except RuntimeError:
+        check(True, "a made-up backup name is refused before anything is written")
+    sealed = p.read_text()
+    for i in range(16):
+        safety.drive_put(f"BSO-backup-202601{i + 10:02d}-0600.bsobak", sealed[:500])
+    lst = safety.drive_list()
+    check(len(lst) == 14 and lst[0]["name"] == r["drive"] and all(x["complete"] for x in lst), "only the newest 14 are kept on Drive")
+    try:
+        safety._drive_call("backup_put", {"name": "BSO-backup-20260101-0000.bsobak", "part": 0, "parts": 1, "data": "<script>"})
+        check(False, "bad data refused")
+    except RuntimeError:
+        check(True, "the relay refuses anything that isn't a sealed backup")
+    team.leave()
+    team.sign_in(con, "cole.reed", "cole-pass-1234", consent=True)
+    check(safety.drive_list() == [], "another person's sign-in can't see this laptop's backups")
+    team.leave()
+    team.sign_in(con, "ayesha", "new-ayesha-pass", consent=True)
 
     # --- relay unreachable: laptop keeps working within the grace period
     team.built_in_hub = lambda: "http://127.0.0.1:1/exec"

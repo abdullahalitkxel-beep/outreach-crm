@@ -164,8 +164,16 @@ def botroom():
     cap = sum(i["limit"] for i in rp["inboxes"])
     sent = sum(i["sent_today"] for i in rp["inboxes"])
     last = (crm.rows("SELECT * FROM jobs WHERE cmd='run' ORDER BY id DESC LIMIT 1") or [None])[0]
+    import safety
+    drive, drive_err = None, ""
+    if request.args.get("drive") and can_restore():       # listing asks Google, so only when someone opens it
+        try:
+            drive = safety.drive_list()
+        except Exception as e:
+            drive_err = str(e)
     return crm.render("botroom.html", rp=rp, cap=cap, sent=sent, last=last, active_on=autopilot.active(c), lands=lambda e: "",
-                      backup_folder=(c.get("backup") or {}).get("folder", ""))
+                      backup_folder=(c.get("backup") or {}).get("folder", ""), drive_ready=safety.drive_ready(), drive=drive, drive_err=drive_err,
+                      can_restore=can_restore())
 
 
 @app.post("/bot/kill")
@@ -191,19 +199,29 @@ def save_backup():
     msg = "Backup folder saved."
     if request.form.get("now"):
         r = safety.backup(crm.db(), folder=folder or (crm.cfg().get("backup") or {}).get("folder") or None)
-        msg = f"Backup made: {r['detail']}" + (f". Off-laptop copy: {r['offsite_detail']}" if r.get("offsite_detail") else "")
+        msg = (f"Backup made: {r['detail']}" + (f". Google Drive: {r['drive_detail']}" if r.get("drive_detail") else "")
+               + (f". Backup folder: {r['offsite_detail']}" if r.get("offsite_detail") else ""))
     return redirect(url_for("botroom", msg=msg))
+
+
+def can_restore():
+    """The owner, or the BSO Bot account on a replacement laptop (it restores its own backups from Google Drive)."""
+    return is_owner() or not team.signed_in() or team.is_bot()
 
 
 @app.post("/bot/restore")
 def save_restore():
     import safety
-    if not is_owner() and team.signed_in():
-        return redirect(url_for("botroom", msg="Only the owner can restore a backup."))
+    if not can_restore():
+        return redirect(url_for("botroom", msg="Only the owner or the BSO Bot account can restore a backup."))
     if request.form.get("confirm", "").strip().upper() != "RESTORE":
         return redirect(url_for("botroom", msg="Type RESTORE to confirm. Nothing was changed."))
     path = request.form.get("path", "").strip().strip('"')
     try:
+        if request.form.get("drive_name"):
+            path = str(safety.drive_fetch(request.form["drive_name"]))
+        elif not path:
+            raise RuntimeError("choose a backup on Google Drive or give the path of a backup file")
         detail = safety.restore(path, now=False)
     except Exception as e:
         return redirect(url_for("botroom", msg=f"Not restored: {e}"))
