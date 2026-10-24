@@ -7,7 +7,8 @@
  * decisions here, and collects the reported activity.
  *
  * Version 6: off-laptop backups. The BSO Bot stores a copy of its database here after each backup, sealed with the
- *   team key (this script and Google can't read it), in "BSO Team Data/backups/<ID>". The newest 14 are kept.
+ *   team key (this script and Google can't read it), in "BSO Team Data/backups/<ID>": the last day, one a day for two
+ *   weeks and one a week for two months, in slots that are overwritten (nothing piles up in the trash).
  *   A replacement laptop signed in with the same ID lists and downloads them to restore. Unsubscribe links in cold
  *   emails stay off (UNSUB_LINKS below): they would print this script's address in every cold email.
  * Version 5: one-click unsubscribe. Cold emails carry a link to this script with a random token (never the address).
@@ -27,7 +28,6 @@ var ADMIN_KEY_HASH = '__ADMIN_KEY_HASH__';
 var FOLDER_NAME = 'BSO Team Data';
 var RELAY_VERSION = 6;
 var UNSUB_LINKS = false;           // true: cold emails carry this script's unsubscribe link (makes its address public)
-var BACKUP_KEEP = 14;
 var BACKUP_PART_MAX = 6000000;     // characters per stored part
 var BACKUP_MAX_PARTS = 12;
 var BACKUP_NAME = /^BSO-backup-\d{8}-\d{4,6}\.bsobak$/;
@@ -523,78 +523,131 @@ function restore_(req) {
 }
 
 // ------------------------------------------------------------------ off-laptop backups (version 6)
+//
+// Each person's backups live in "BSO Team Data/backups/<ID>" in a fixed set of slots that are overwritten, never
+// deleted, so nothing piles up in Drive's trash (trashed files still count against the storage quota for 30 days):
+//   r0..r3   the 4 newest scheduled backups (every 6 hours: the last day)
+//   d0..d13  one per day for 14 days (the first backup of each day is copied here)
+//   w0..w7   one per week for 8 weeks
+//   m0       the latest "Back up now", so pressing it never pushes out the scheduled copies
+// manifest.json says which backup each slot holds; a slot being written is marked incomplete until its last part.
+
+var SLOT_RE = /^(r[0-3]|d([0-9]|1[0-3])|w[0-7]|m0)$/;
 
 function backupUser_(req) {
   var f = userFromToken_(readDoc_(), req.token);
   if (!f) fail_(401, 'unauthorized');
+  if (f.u.status === 'disabled') fail_(403, 'This account is paused.');
   return f;
 }
 
-function backupParts_(folder) {          // name -> {n: parts expected, files: {i: file}}
-  var groups = {}, it = folder.getFiles();
-  while (it.hasNext()) {
-    var file = it.next(), m = /^(.+\.bsobak)\.part(\d+)-(\d+)$/.exec(file.getName());
-    if (!m) continue;
-    var g = groups[m[1]] || (groups[m[1]] = { n: Number(m[3]), files: {} });
-    if (Number(m[3]) === g.n) g.files[Number(m[2])] = file;
-  }
-  return groups;
+function manifest_(folder) {
+  var it = folder.getFilesByName('manifest.json');
+  if (!it.hasNext()) return { file: null, m: { slots: {}, next: 0 } };
+  var file = it.next();
+  try { return { file: file, m: JSON.parse(file.getBlob().getDataAsString()) || { slots: {}, next: 0 } }; }
+  catch (x) { return { file: file, m: { slots: {}, next: 0 } }; }
 }
 
-function complete_(g) {
-  for (var i = 0; i < g.n; i++) if (!g.files[i]) return false;
-  return true;
+function saveManifest_(folder, mf) {
+  var text = JSON.stringify(mf.m);
+  if (mf.file) mf.file.setContent(text); else mf.file = folder.createFile('manifest.json', text, 'application/json');
+}
+
+function writePart_(folder, slot, i, data) {
+  var it = folder.getFilesByName(slot + '.part' + i);
+  if (it.hasNext()) it.next().setContent(data); else folder.createFile(slot + '.part' + i, data, 'text/plain');
+}
+
+function readPart_(folder, slot, i) {
+  var it = folder.getFilesByName(slot + '.part' + i);
+  return it.hasNext() ? it.next().getBlob().getDataAsString() : null;
+}
+
+function copySlot_(folder, from, to, entry) {
+  for (var i = 0; i < entry.parts; i++) writePart_(folder, to, i, readPart_(folder, from, i) || '');
+  for (var j = entry.parts; j < BACKUP_MAX_PARTS; j++) {               // shorter than what was there: empty the rest
+    var it = folder.getFilesByName(to + '.part' + j);
+    if (it.hasNext()) it.next().setContent('');
+  }
+}
+
+function withLock_(fn) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { return fn(); } finally { lock.releaseLock(); }
 }
 
 function backupPut_(req) {
   var f = backupUser_(req);
   var name = String(req.name || ''), part = Number(req.part), parts = Number(req.parts), data = String(req.data || '');
+  var manual = req.kind === 'manual';
   if (!BACKUP_NAME.test(name)) fail_(400, 'Bad backup name.');
   if (!(parts >= 1 && parts <= BACKUP_MAX_PARTS && part >= 0 && part < parts && part === Math.floor(part))) fail_(400, 'Bad backup part.');
   if (data.length > BACKUP_PART_MAX || !BACKUP_DATA.test(data)) fail_(400, 'Bad backup data.');
-  var lock = LockService.getScriptLock();
-  lock.waitLock(20000);
-  try {
-    var folder = userFolder_('backups', f.key), file = name + '.part' + part + '-' + parts;
-    var it = folder.getFilesByName(file);
-    if (it.hasNext()) it.next().setContent(data); else folder.createFile(file, data, 'text/plain');
-    if (part === parts - 1) prune_(folder, name);     // last part in: keep the newest copies, drop the rest
-    return { ok: true, stored: file };
-  } finally {
-    lock.releaseLock();
-  }
+  var folder = userFolder_('backups', f.key);
+  var slot = withLock_(function () {                        // which slot this upload goes to (decided at part 0)
+    var mf = manifest_(folder);
+    if (part === 0) {
+      var sl = manual ? 'm0' : 'r' + (Number(mf.m.next || 0) % 4);
+      if (!manual) mf.m.next = (Number(mf.m.next || 0) + 1) % 4;
+      mf.m.slots[sl] = { name: name, parts: parts, complete: false, size: 0, at: new Date().toISOString() };
+      saveManifest_(folder, mf);
+      return sl;
+    }
+    for (var k in mf.m.slots) if (mf.m.slots[k].name === name && !mf.m.slots[k].complete) return k;
+    fail_(409, 'Start the backup again from its first part.');
+  });
+  writePart_(folder, slot, part, data);
+  if (part === parts - 1) withLock_(function () {
+    var mf = manifest_(folder), e = mf.m.slots[slot];
+    if (!e || e.name !== name) return;
+    var size = 0;
+    for (var i = 0; i < parts; i++) { var t = readPart_(folder, slot, i); if (t === null) return; size += t.length; }
+    e.complete = true; e.size = size;
+    if (!manual) {                                          // the first backup of a day and of a week is kept longer
+      var day = name.substr(11, 8), now = new Date(Date.UTC(+day.substr(0, 4), +day.substr(4, 2) - 1, +day.substr(6, 2)));
+      var dn = Math.floor(now.getTime() / 86400000), d = 'd' + (dn % 14), w = 'w' + (Math.floor(dn / 7) % 8);
+      var ds = mf.m.slots[d], ws = mf.m.slots[w];
+      if (!ds || !ds.complete || ds.name.substr(11, 8) !== day) { copySlot_(folder, slot, d, e); mf.m.slots[d] = JSON.parse(JSON.stringify(e)); }
+      if (!ws || !ws.complete || Math.floor(dayNum_(ws.name) / 7) !== Math.floor(dn / 7)) { copySlot_(folder, slot, w, e); mf.m.slots[w] = JSON.parse(JSON.stringify(e)); }
+    }
+    saveManifest_(folder, mf);
+  });
+  return { ok: true, slot: slot };
 }
 
-function prune_(folder, current) {
-  var groups = backupParts_(folder), names = Object.keys(groups).sort().reverse(), kept = 0;
-  for (var i = 0; i < names.length; i++) {
-    var n = names[i], g = groups[n];
-    if (n === current) continue;                                    // the copy just stored is never dropped
-    if (complete_(g) && kept < BACKUP_KEEP - 1) { kept++; continue; }
-    if (!complete_(g) && n > current) continue;                     // a newer upload still arriving
-    for (var k in g.files) g.files[k].setTrashed(true);
-  }
+function dayNum_(name) {
+  var day = String(name).substr(11, 8);
+  return Math.floor(Date.UTC(+day.substr(0, 4), +day.substr(4, 2) - 1, +day.substr(6, 2)) / 86400000);
 }
 
 function backupList_(req) {
   var f = backupUser_(req);
-  var groups = backupParts_(userFolder_('backups', f.key)), out = [];
-  for (var name in groups) {
-    var g = groups[name], size = 0, have = 0;
-    for (var k in g.files) { have++; try { size += g.files[k].getSize(); } catch (x) { /* unknown */ } }
-    out.push({ name: name, parts: g.n, have: have, complete: complete_(g), size: size });
+  var m = manifest_(userFolder_('backups', f.key)).m, seen = {}, out = [];
+  for (var k in m.slots) {
+    var e = m.slots[k];
+    if (!e.complete || seen[e.name]) continue;               // the same backup can sit in several slots
+    seen[e.name] = true;
+    out.push({ name: e.name, slot: k, parts: e.parts, complete: true, size: e.size, manual: k === 'm0' });
   }
   out.sort(function (a, b) { return a.name < b.name ? 1 : -1; });
-  return { backups: out, keep: BACKUP_KEEP };
+  return { backups: out };
 }
 
 function backupGet_(req) {
   var f = backupUser_(req);
   var name = String(req.name || ''), part = Number(req.part);
   if (!BACKUP_NAME.test(name)) fail_(400, 'Bad backup name.');
-  var g = backupParts_(userFolder_('backups', f.key))[name];
-  if (!g || !g.files[part]) fail_(404, 'That backup is not on Google Drive.');
-  return { name: name, part: part, parts: g.n, data: g.files[part].getBlob().getDataAsString() };
+  var folder = userFolder_('backups', f.key), m = manifest_(folder).m;
+  for (var k in m.slots) {
+    var e = m.slots[k];
+    if (e.name === name && e.complete && SLOT_RE.test(k) && part >= 0 && part < e.parts) {
+      var data = readPart_(folder, k, part);
+      if (data !== null) return { name: name, part: part, parts: e.parts, data: data };
+    }
+  }
+  fail_(404, 'That backup is not on Google Drive.');
 }
 
 // ------------------------------------------------------------------ master console

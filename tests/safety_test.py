@@ -240,7 +240,7 @@ try:
     safety.restore(bad)
     check(False, "damaged refused")
 except Exception as e:
-    check("restore test" in str(e) or "database" in str(e), "a damaged backup is refused before it replaces anything")
+    check("restore test" in str(e) or "database" in str(e) or "isn't a BSO backup" in str(e), "a damaged backup is refused before it replaces anything")
 
 # ---------------------------------------------------------------- after a restore: the gap since the backup is settled cautiously
 con.execute("UPDATE events SET at='2026-10-01T00:00:00Z'")
@@ -272,6 +272,35 @@ bot._migrated.clear()
 check(waiting and safety.apply_pending_restore() and not (bot.DATA / "outreach.restore.db").exists(),
       "a restore chosen in the app waits and goes in when BSO starts again")
 con = bot.db_connect("outreach.db")
+safety.restore(p2, now=False)
+check(safety.pending_restore() and (safety.cancel_restore() or True) and not safety.pending_restore() and not safety.apply_pending_restore(),
+      "a waiting restore can be cancelled")
+safety.restore(p2, now=False)
+meta = json.loads((bot.DATA / "outreach.restore.json").read_text())
+meta["at"] = "2020-01-01T00:00:00Z"
+(bot.DATA / "outreach.restore.json").write_text(json.dumps(meta))
+check(safety.pending_restore() is None and not (bot.DATA / "outreach.restore.db").exists(),
+      "a restore forgotten for hours expires instead of replacing days of work at the next start")
+import sealbox, zlib, team  # noqa: E401,E402
+old = Path(tempfile.mkdtemp()) / "BSO-backup-20260101-0600.bsobak"
+old.write_text(sealbox.seal(key, zlib.compress((bot.DATA / "backups" / local["file"]).read_bytes())), encoding="ascii")
+check(safety.restore(old, key=key, now=False) and safety.pending_restore(), "a backup made before origins were recorded still restores")
+safety.cancel_restore()
+theirs = Path(tempfile.mkdtemp()) / "BSO-backup-20260101-0700.bsobak"
+theirs.write_text(sealbox.seal(key, safety._pack((bot.DATA / "backups" / local["file"]).read_bytes(), {"user": "cole.reed"})), encoding="ascii")
+real_signed = team.signed_in
+team.signed_in = lambda: "bsobot"
+try:
+    safety.restore(theirs, key=key, now=False)
+    check(False, "another sign-in's backup refused")
+except RuntimeError as e:
+    check("belongs to cole.reed" in str(e) and not safety.pending_restore(), "a backup made under another sign-in is refused (another person's work)")
+team.signed_in = real_signed
+try:
+    safety.restore(Path(tempfile.mkdtemp()) / "nope.bsobak")
+    check(False, "missing")
+except RuntimeError as e:
+    check("doesn't exist" in str(e), "a wrong path gets a plain message, not a Python error")
 
 # ---------------------------------------------------------------- bounces, auto-replies and the circuit breaker
 check(safety.bounce_kind("Undelivered Mail", "550 5.1.1 <x@y.com>: Recipient address rejected: User unknown") == "hard" and

@@ -4,7 +4,7 @@ Build preparation (run by the GitHub build before PyInstaller):
   python packaging/prepare.py <build_number>
 
 Writes:
-  version.txt                     app version shown in the app (1.0.<build>)
+  version.txt                     app version shown in the app (<series>.<build>, series from RELEASE_SERIES, e.g. 1.1)
   build/version_info.txt          Windows file properties: publisher BlacSwanken, product, copyright
   build/EULA.txt                  licence text shown by the installer
   build/AppxManifest.xml          Microsoft Store package manifest
@@ -23,7 +23,9 @@ BUILD = ROOT / "build"
 BUILD.mkdir(exist_ok=True)
 
 build_no = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-version = f"1.0.{build_no}"
+series = (ROOT / "RELEASE_SERIES").read_text(encoding="utf-8").strip() if (ROOT / "RELEASE_SERIES").exists() else "1.0"
+major, minor = (int(x) for x in series.split(".")[:2])
+version = f"{major}.{minor}.{build_no}"
 cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
 publisher = cfg.get("publisher") or "BlacSwanken"
 company = (cfg.get("legal") or {}).get("company_name") or publisher
@@ -32,7 +34,7 @@ copyright_ = f"© 2026 {company}. All rights reserved."
 (ROOT / "version.txt").write_text(version, encoding="utf-8")
 
 # ---- Windows version resource (File → Properties → Details)
-v4 = (1, 0, build_no, 0)
+v4 = (major, minor, build_no, 0)
 (BUILD / "version_info.txt").write_text(f"""VSVersionInfo(
   ffi=FixedFileInfo(filevers={v4}, prodvers={v4}, mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
   kids=[

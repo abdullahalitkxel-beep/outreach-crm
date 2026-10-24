@@ -705,7 +705,8 @@ def housekeeping(cfg, con):
     try:
         import safety
         if safety.due_backup(con):
-            r = safety.backup(con, folder=(cfg.get("backup") or {}).get("folder") or None)
+            r = safety.backup(con, folder=(cfg.get("backup") or {}).get("folder") or None,
+                              on_drive_fail=lambda m: bot.notify(m, cfg))   # the Drive copy uploads in the background
             lines.append(f"Backup {r['file']}: {r['detail']}" +
                          (f"; Google Drive: {r['drive_detail']}" if r.get("drive_detail") else "; no Google Drive copy (update the Google script to version 6)") +
                          (f"; folder: {r['offsite_detail']}" if r.get("offsite_detail") else ""))

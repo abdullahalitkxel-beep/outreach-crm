@@ -36,7 +36,9 @@ h1,h2,h3{margin:0;font-weight:700}
 .menu a,.menu button{display:block;width:100%;padding:9px 14px;color:var(--ink);background:none;border:0;font:inherit;text-align:left;cursor:pointer}
 .menu a:hover,.menu button:hover{background:var(--bg);text-decoration:none}
 .open .menu{display:block}
-.userchip{position:relative;display:flex;align-items:center;gap:6px;height:32px;padding:0 10px 0 4px;border:1px solid var(--line);border-radius:16px;background:#fff;cursor:pointer;font-size:13px;white-space:nowrap}
+.dd{position:relative}.dd>.iconbtn{font:inherit;font-weight:700}
+.userchip:focus-visible,.iconbtn:focus-visible,.menu button:focus-visible,.menu a:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+.userchip{position:relative;display:flex;font:inherit;color:var(--ink);align-items:center;gap:6px;height:32px;padding:0 10px 0 4px;border:1px solid var(--line);border-radius:16px;background:#fff;cursor:pointer;font-size:13px;white-space:nowrap}
 .userchip .av{width:24px;height:24px;border-radius:50%;background:var(--brand);color:#fff;display:grid;place-items:center;font-weight:700;font-size:12px}
 .userchip .un{font-weight:600;max-width:160px;overflow:hidden;text-overflow:ellipsis}
 .userchip .rl{color:var(--muted)}
@@ -94,6 +96,8 @@ textarea{min-height:80px}.inline{display:flex;gap:8px;align-items:end;flex-wrap:
 .tbl td{padding:7px 10px;border-bottom:1px solid var(--line2);vertical-align:top}
 .tbl tr:hover td{background:#f9fbfe}
 .scroll{overflow-x:auto}
+@media (max-width:1100px){.nav{flex-wrap:wrap;white-space:normal;overflow-x:visible}.nav .app{border-right:0}}
+@media (max-width:900px){.tbl{display:block;overflow-x:auto}}
 /* badges */
 .badge{display:inline-block;padding:0 8px;border-radius:12px;font-size:11px;line-height:20px;background:#ecebea;color:var(--ink);white-space:nowrap}
 .b-ok{background:var(--ok-l);color:#194e31}.b-err{background:var(--err-l);color:#8e030f}.b-warn{background:#fff0d1;color:#8c4b02}.b-info{background:var(--brand-l);color:var(--brand-d)}
@@ -132,7 +136,7 @@ clip-path:polygon(0 0,calc(100% - 10px) 0,100% 50%,calc(100% - 10px) 100%,0 100%
 .tabs button.on{border-bottom-color:var(--brand);font-weight:700}
 .tabpane{display:none}.tabpane.on{display:block}
 /* help + toast */
-.help{display:flex;gap:10px;background:var(--brand-l);border:1px solid #b0c7e6;border-radius:var(--r);padding:10px 14px;margin-bottom:12px}
+.help.tip{display:flex}.help{display:block;gap:10px;background:var(--brand-l);border:1px solid #b0c7e6;border-radius:var(--r);padding:10px 14px;margin-bottom:12px}
 .help b{color:var(--brand-d)}.help .x{margin-left:auto;background:none;border:0;cursor:pointer;color:var(--muted);font-size:16px;line-height:1}
 .help ol,.help ul{margin:4px 0 0;padding-left:18px}
 .toast{background:#2e844a;color:#fff;border-radius:var(--r);padding:10px 14px;margin-bottom:12px;box-shadow:var(--sh)}
@@ -188,24 +192,27 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
   <input name="q" placeholder="Search leads, prospects, emails, comments, campaigns…" value="{{ request.args.get('q','') if request.endpoint=='search' else '' }}">
  </form>{% else %}<div style="flex:1"></div>{% endif %}
  <div class="tools">
-  {% if team_user %}<div class="userchip" id="userchip" title="Who is signed in" onclick="this.classList.toggle('open')">
-   <span class="av">{{ (team_name or team_user)[:1]|upper }}</span><span class="un">{{ team_name or team_user }}</span>{% if role_label %}<span class="rl">{{ role_label }}{% if is_owner and view_as != 'full' %} · acting as {{ 'BSO Bot' if view_as == 'bot' else 'Supervisor' }}{% endif %}</span>{% endif %} ▾
-   <div class="menu" onclick="event.stopPropagation()">
-    <div class="muted" style="padding:8px 14px">Signed in as <b>{{ team_name or team_user }}</b>{{ ' (' ~ team_user ~ ')' if team_name and team_name != team_user }}</div>
-    {% if is_owner %}<form method="post" action="{{ url_for('view_as_set') }}"><div class="muted" style="padding:4px 14px">Act as (that role's layout and work, with full access)</div>{% for v, l in [('full','Owner: everything'),('bot','BSO Bot'),('workspace','Supervisor')] %}<button name="view" value="{{ v }}" style="{{ 'font-weight:700' if view_as == v }}">{{ '✓ ' if view_as == v else '' }}{{ l }}</button>{% endfor %}</form>{% endif %}
-    <form method="post" action="{{ url_for('signout') }}"><button>Sign out</button></form>
+  {% if team_user %}<div class="dd" id="userchip">
+   <button type="button" class="userchip" data-dd aria-haspopup="true" aria-expanded="false" aria-controls="userchip-menu" title="Who is signed in">
+    <span class="av" aria-hidden="true">{{ (team_name or team_user)[:1]|upper }}</span><span class="un">{{ team_name or team_user }}</span>{% if role_label %}<span class="rl">{{ role_label }}{% if is_owner and view_as != 'full' %} · acting as {{ 'BSO Bot' if view_as == 'bot' else 'Supervisor' }}{% endif %}</span>{% endif %} <span aria-hidden="true">▾</span></button>
+   <div class="menu" id="userchip-menu" role="menu">
+    <div class="muted" style="padding:8px 14px">Signed in as <b>{{ team_name or team_user }}</b>{{ ' (' ~ team_user ~ ')' if team_name and team_name != team_user }}{{ ' · stays signed in' if team_bot }}</div>
+    {% if is_owner %}<form method="post" action="{{ url_for('view_as_set') }}" style="border-top:1px solid var(--line2)"><div class="muted" style="padding:6px 14px 2px">Act as (for testing; you keep full access)</div>
+     <button role="menuitem" name="view" value="full" style="{{ 'font-weight:700' if view_as == 'full' }}">{{ '✓ ' if view_as == 'full' }}Owner: everything</button>
+     <button role="menuitem" name="view" value="bot" style="{{ 'font-weight:700' if view_as == 'bot' }}" {% if view_as != 'bot' %}onclick="return confirm('Act as the BSO Bot on THIS laptop?\n\nThe bot\'s scheduler and intake start running here and can send real emails from the inboxes on this laptop' + ({{ 'true' if test_mode_on else 'false' }} ? ' (test mode is ON: they go to your test address).' : ' (test mode is OFF: real people receive them).') + '\n\nUse Back to Owner to stop.')"{% endif %}>{{ '✓ ' if view_as == 'bot' }}BSO Bot (runs the bot on this laptop)</button>
+     <button role="menuitem" name="view" value="workspace" style="{{ 'font-weight:700' if view_as == 'workspace' }}">{{ '✓ ' if view_as == 'workspace' }}Supervisor (prospects come to you)</button></form>{% endif %}
+    <form method="post" action="{{ url_for('signout') }}" style="border-top:1px solid var(--line2)"><button role="menuitem">Sign out</button></form>
    </div>
   </div>{% endif %}
-  <div class="iconbtn" id="helpbtn" title="Help" onclick="this.classList.toggle('open')">?
-   <div class="menu">
-    <button onclick="startTour(true)">Take the guided tour</button>
-    <a href="{{ url_for('setup') }}">Getting started checklist</a>
-    <button onclick="resetHelp()">Show all help tips again</button>
-    <a href="{{ url_for('settings') }}">Settings</a>
-    <a href="{{ url_for('about') }}">About &amp; legal</a>
-    {% if is_owner %}<form method="post" action="{{ url_for('view_as_set') }}" style="padding:4px 12px"><div class="muted">Act as (works as that role, with full access)</div>{% for v, l in [('full','Owner: everything'),('bot','BSO Bot'),('workspace','Supervisor')] %}<button name="view" value="{{ v }}" style="{{ 'font-weight:700' if view_as == v }}">{{ '✓ ' if view_as == v }}{{ l }}</button>{% endfor %}</form>{% endif %}
-    {% if team_user %}<div class="muted" style="padding:6px 12px">Signed in as {{ team_name or team_user }}{{ ' (bot, stays signed in)' if team_bot }}{{ ' · Owner: full access' if is_owner }}</div><form method="post" action="{{ url_for('signout') }}"><button>Sign out</button></form>{% endif %}
-    <form method="post" action="{{ url_for('quit_app') }}" onsubmit="return confirm('Stop BSO? Automatic runs stop until you open it again.')"><button>Quit the app</button></form>
+  <div class="dd" id="helpbtn">
+   <button type="button" class="iconbtn" data-dd aria-haspopup="true" aria-expanded="false" aria-controls="help-menu" title="Help" aria-label="Help">?</button>
+   <div class="menu" id="help-menu" role="menu">
+    <button role="menuitem" onclick="startTour(true)">Take the guided tour</button>
+    <a role="menuitem" href="{{ url_for('setup') }}">Getting started checklist</a>
+    <button role="menuitem" onclick="resetHelp()">Show all help tips again</button>
+    <a role="menuitem" href="{{ url_for('settings') }}">Settings</a>
+    <a role="menuitem" href="{{ url_for('about') }}">About &amp; legal</a>
+    <form method="post" action="{{ url_for('quit_app') }}" style="border-top:1px solid var(--line2)" onsubmit="return confirm('Quit BSO? Automatic runs stop until you open it again.')"><button role="menuitem">Quit BSO</button></form>
    </div>
   </div>
  </div>
@@ -274,7 +281,13 @@ document.querySelectorAll('.help[data-id]').forEach(function(h){
   var x=h.querySelector('.x'); if(x) x.onclick=function(){h.style.display='none';ls('help-'+h.dataset.id,'hidden')};
 });
 function resetHelp(){try{Object.keys(localStorage).forEach(function(k){if(k.indexOf('help-')===0)localStorage.removeItem(k)})}catch(e){} location.reload()}
-document.addEventListener('click',function(e){var hb=document.getElementById('helpbtn'); if(hb && !hb.contains(e.target)) hb.classList.remove('open')});
+// ---- header menus: a button opens one menu at a time; a click outside or Escape closes it
+function closeMenus(except){document.querySelectorAll('.dd.open').forEach(function(d){if(d!==except){d.classList.remove('open');var b=d.querySelector('[data-dd]');if(b)b.setAttribute('aria-expanded','false');}});}
+document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('[data-dd]');
+  if(b){var d=b.parentNode,on=!d.classList.contains('open');closeMenus(d);d.classList.toggle('open',on);b.setAttribute('aria-expanded',on?'true':'false');
+    if(on){var f=d.querySelector('.menu button,.menu a');if(f&&e.detail===0)f.focus();}return;}
+  var inside=e.target.closest&&e.target.closest('.dd'); closeMenus(inside);});
+document.addEventListener('keydown',function(e){if(e.key==='Escape'){var o=document.querySelector('.dd.open');if(o){closeMenus();var b=o.querySelector('[data-dd]');if(b)b.focus();}}});
 // ---- tabs inside cards
 document.querySelectorAll('[data-tabs]').forEach(function(box){
   var btns=box.querySelectorAll('.tabs button');
@@ -284,19 +297,34 @@ document.querySelectorAll('[data-tabs]').forEach(function(box){
 // ---- bulk select
 var all=document.getElementById('selall'); if(all) all.onchange=function(){document.querySelectorAll('input[name=ids]').forEach(function(c){c.checked=all.checked})};
 // ---- guided tour
-var TOUR=[
+var TOUR={% if role_mode == 'bot' %}[
+ {sel:null,t:'The BSO Bot',p:'This laptop runs the cold email: it writes, sends within each lead\'s morning, reads replies and hands interested people to a supervisor. You can replay this tour from the ? menu.'},
+ {sel:'#nav-botroom',t:'Status',p:'What was sent today, why not more, what is queued, backups, and the button to stop all sending.'},
+ {sel:'#nav-campaigns',t:'Campaigns',p:'Each client\'s campaigns, who approves the emails, and how many leads are left.'},
+ {sel:'#nav-review',t:'Review',p:'Emails waiting for a person to approve, when a campaign asks for that.'},
+ {sel:'#userchip',t:'Who is signed in',p:'The bot account stays signed in. The owner can switch back here.'},
+ {sel:null,t:"That's it",p:'The bot runs by itself. Check Status once a day.'}
+]{% elif role_mode == 'workspace' %}[
+ {sel:null,t:'Your workspace',p:'Interested prospects from the BSO Bot come to you here. You can replay this tour from the ? menu.'},
+ {sel:'#nav-myday',t:'My day',p:'Who to answer first: new prospects and replies waiting for you.'},
+ {sel:'#nav-ws_conversations',t:'Conversations',p:'Every email with your prospects, in one place.'},
+ {sel:'#nav-pipeline',t:'Pipeline',p:'Move prospects through the stages as the conversation goes.'},
+ {sel:'#userchip',t:'Who is signed in',p:'Your name, and Sign out.'},
+ {sel:null,t:"You're set",p:'Answer new prospects within the hour: speed wins meetings.'}
+]{% else %}[
  {sel:null,t:'Welcome to BSO',p:'This 60-second tour shows where everything lives. You can replay it any time from the ? menu at the top right.'},
  {sel:'#nav-setup',t:'Start here: Getting Started',p:'A checklist that walks you through setup, with a button for every step. It ticks itself off as you go.'},
  {sel:'#nav-settings',t:'Settings',p:'Connect your inbox, paste your keys, edit your emails and targeting. Simple forms with a Test button. No files to edit.'},
  {sel:'#nav-home',t:'Home',p:'Your daily dashboard: tasks due, hot replies, emails waiting for review, and recent activity.'},
  {sel:'#nav-leads',t:'Leads',p:'Everyone you are prospecting. Filter, sort and bulk-update them. Each lead has an A/B/C fit grade based on their job title.'},
- {sel:'#nav-review',t:'Review',p:'Nothing is emailed until you approve it here. Read each draft, edit it, ask for a new AI opener, or reject the lead.'},
+ {sel:'#nav-review',t:'Review',p:'Emails waiting for your approval. Campaigns where you approve every email wait here; campaigns set to send on their own don\'t.'},
+ {sel:'#nav-botroom',t:'BSO Bot',p:'Backups and sending on this computer. The real BSO Bot laptop is watched from the Master Console.'},
  {sel:'#nav-opportunities',t:'Opportunities',p:'When a lead is interested, click Convert on their page. That creates an Account and an Opportunity you can move through the deal stages.'},
- {sel:'#nav-tasks',t:'Tasks',p:'Your to-do list. The bot adds a task automatically whenever someone replies with interest.'},
  {sel:'#nav-reports',t:'Reports',p:'Funnel, reply rates per email step, lead source performance and your pipeline forecast.'},
+ {sel:'#userchip',t:'Who is signed in',p:'Your name and role. As owner you can Act as the bot or a supervisor here to test their screens, and sign out.'},
  {sel:'#t-search',t:'Search everything',p:'Find any lead, account or opportunity by name, email or company.'},
  {sel:null,t:"You're all set",p:'Open Getting Started next. It takes you from zero to your first test email in about 10 minutes.',go:'{{ url_for("setup") }}'}
-];
+]{% endif %};
 var ti=0;
 function placeTour(){
   var s=TOUR[ti],dim=document.getElementById('tour-dim'),spot=document.getElementById('tour-spot'),pop=document.getElementById('tour-pop');
@@ -316,8 +344,8 @@ function placeTour(){
     pop.style.left=Math.max(12,(innerWidth-pop.offsetWidth)/2)+'px'; pop.style.top=(innerHeight*0.3)+'px';
   }
 }
-function startTour(force){ if(!force&&ls('tour-done'))return; ti=0; document.getElementById('tour-dim').style.display='block'; placeTour(); }
-function endTour(){ document.getElementById('tour-dim').style.display='none'; ls('tour-done','1'); }
+function startTour(force){ closeMenus(); if(!force&&ls('tour-done{{ '-' ~ role_mode if role_mode != 'full' }}'))return; ti=0; document.getElementById('tour-dim').style.display='block'; placeTour(); }
+function endTour(){ document.getElementById('tour-dim').style.display='none'; ls('tour-done{{ '-' ~ role_mode if role_mode != 'full' }}','1'); }
 document.getElementById('tour-next').onclick=function(){ if(ti===TOUR.length-1){endTour(); if(TOUR[ti].go) location.href=TOUR[ti].go; return;} ti++; placeTour(); };
 document.getElementById('tour-back').onclick=function(){ if(ti>0){ti--;placeTour();} };
 document.getElementById('tour-skip').onclick=endTour;
@@ -337,7 +365,7 @@ MACROS = r"""
 {% endmacro %}
 
 {% macro help(id, title) %}
-<div class="help" data-id="{{ id }}"><div style="font-size:16px">💡</div><div><b>{{ title }}</b>{{ caller() }}</div><button class="x" title="Hide this tip">×</button></div>
+<div class="help tip" data-id="{{ id }}"><div style="font-size:16px">💡</div><div><b>{{ title }}</b>{{ caller() }}</div><button class="x" title="Hide this tip">×</button></div>
 {% endmacro %}
 
 {% macro path(open_stages, current, url, closed_label, closed_cls, next_stage) %}
@@ -368,10 +396,10 @@ MACROS = r"""
 """
 
 HOME = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}Home{% endblock %}{% block body %}
-{% call m.header('t-home', '⌂', ('Home · ' ~ (team_name or team_user) ~ (' · ' ~ role_label if role_label else '')) if team_user else 'Home',
+{% call m.header('t-home', '⌂', 'Home',
                   ('Good to see you, ' ~ (team_name or team_user).split(' ')[0].split('@')[0].split('.')[0]|capitalize) if team_user else 'Good to see you') %}
  <a class="btn" href="{{ url_for('setup') }}">Getting started ({{ setup_done }}/{{ setup_total }})</a>
- <form method="post" action="{{ url_for('job_start') }}" style="display:inline"><input type="hidden" name="cmd" value="run"><button class="btn brand">▶ Run bot now</button></form>
+ <form method="post" action="{{ url_for('job_start') }}" style="display:inline" {% if not test_mode_on %}onsubmit="return confirm('Run the bot now from this computer? Test mode is OFF: emails that are due and approved go to real people.')"{% endif %}><input type="hidden" name="cmd" value="run"><button class="btn brand">▶ Run bot now</button></form>
 {% endcall %}
 {% if setup_done < setup_total %}
 {% call m.help('home-setup', 'New here?') %} You've finished {{ setup_done }} of {{ setup_total }} setup steps. <a href="{{ url_for('setup') }}">Continue Getting Started →</a>{% endcall %}
@@ -741,7 +769,7 @@ SETUP = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block tit
   <button class="btn {{ 'brand' if not s.ok and loop.index0 == next_idx }}" {{ 'disabled' if s.blocked and not s.ok }}>{{ s.button }}</button></form>{% endif %}
  {% if s.link %}<a class="btn {{ 'brand' if not s.ok and loop.index0 == next_idx }}" href="{{ s.link }}">{{ s.link_text }}</a>{% endif %}
  {% if s.sample %}<form method="post" action="{{ url_for('sample_remove' if s.has_sample else 'sample_load') }}" style="display:inline"><button class="btn">{{ 'Remove sample leads' if s.has_sample else 'Add sample leads' }}</button></form>{% endif %}
- {% if s.blocked and not s.ok %}<span class="muted"> Finish step {{ s.blocked }} first.</span>{% endif %}
+ {% if s.blocked and not s.ok %}<span class="muted"> {{ s.blocked if s.blocked is string else 'Finish step ' ~ s.blocked ~ ' first.' }}</span>{% endif %}
 </div></div>{% endfor %}</div>
 {% endblock %}"""
 

@@ -101,28 +101,68 @@ def verify(data, sig, key=None):
 
 # ---------------------------------------------------------------- what's out there
 
+MANIFEST = "BSO-release.json"          # {"version": ..., "sha256": <of BSO-Setup.exe>}, signed as BSO-release.json.sig
+
+
+def _small(url):
+    r = requests.get(url, timeout=20, headers={"User-Agent": "BSO-updater"})
+    r.raise_for_status()
+    return r.content
+
+
+def _signed_manifest(rel):
+    """The release's signed manifest if it checks out: the signature is BlacSwanken's and it names this release's
+    version, so an old installer can't be republished under a newer number. None otherwise."""
+    assets = {a["name"]: a["browser_download_url"] for a in rel.get("assets") or []}
+    if not (assets.get("BSO-Setup.exe") and assets.get(MANIFEST) and assets.get(MANIFEST + ".sig")):
+        return None
+    try:
+        body, sig = _small(assets[MANIFEST]), _small(assets[MANIFEST + ".sig"])
+        if not verify(body, sig):
+            return None
+        m = json.loads(body)
+        if str(m.get("version")) != str(rel.get("tag_name", "")).lstrip("v") or len(str(m.get("sha256", ""))) != 64:
+            return None
+        return {"manifest": body.decode(), "manifest_sig": sig.hex(), "sha256": m["sha256"], "setup_url": assets["BSO-Setup.exe"]}
+    except Exception:
+        return None
+
+
 def check(force=False):
-    """Ask GitHub for the latest release (at most every 6 hours unless forced). Returns banner()."""
+    """Ask GitHub for the latest release (at most every 6 hours unless forced). Returns banner().
+    Every repository in REPOS is asked; the newest release whose signed manifest checks out wins. A release without
+    one (or with a bad one) is skipped, so a broken or planted release can't block updates or downgrade anyone."""
     s = _state()
     if not force and s.get("checked_at") and time.time() - s["checked_at"] < CHECK_EVERY:
         return banner()
     try:
-        j, errs = None, []
-        for repo in REPOS:                          # the newest release found in any of them
+        found, errs = [], []
+        for repo in REPOS:
             try:
                 r = requests.get(f"https://api.github.com/repos/{repo}/releases/latest",
                                  headers={"Accept": "application/vnd.github+json", "User-Agent": "BSO-updater"}, timeout=20)
                 r.raise_for_status()
                 got = r.json()
-                if got.get("tag_name") and (j is None or ver(got["tag_name"].lstrip("v")) > ver(j["tag_name"].lstrip("v"))):
-                    j = got
+                if got.get("tag_name"):
+                    found.append(got)
             except Exception as e:
                 errs.append(str(e)[:80])
-        if j is None:
+        if not found:
             raise RuntimeError("; ".join(errs) or "no release found")
-        assets = {a["name"]: a["browser_download_url"] for a in j.get("assets") or []}
-        s.update(latest=j.get("tag_name", "").lstrip("v"), published_at=j.get("published_at"), notes=(j.get("body") or "")[:4000],
-                 setup_url=assets.get("BSO-Setup.exe"), sig_url=assets.get("BSO-Setup.exe.sig"), checked_at=time.time(), error="")
+        found.sort(key=lambda x: ver(x["tag_name"].lstrip("v")), reverse=True)
+        pick, sm = None, None
+        for rel in found:
+            sm = _signed_manifest(rel)
+            if sm:
+                pick = rel
+                break
+        if not pick:
+            s.update(checked_at=time.time(), latest=None, error="")
+            _save(s)
+            return banner()
+        s.update(latest=pick.get("tag_name", "").lstrip("v"), published_at=pick.get("published_at"), notes=(pick.get("body") or "")[:4000],
+                 setup_url=sm["setup_url"], manifest=sm["manifest"], manifest_sig=sm["manifest_sig"], sha256=sm["sha256"],
+                 sig_url=None, checked_at=time.time(), error="")
         if ver(s["latest"]) > ver(current()) and not s.get("first_seen", {}).get(s["latest"]):
             s.setdefault("first_seen", {})[s["latest"]] = iso(now_utc())
     except Exception as e:
@@ -156,7 +196,7 @@ def decision(s=None, now=None):
     latest = s.get("latest")
     if not latest or ver(latest) <= ver(current()):
         return False, False, "You have the latest version."
-    if not s.get("sig_url"):
+    if not _manifest_ok(s):
         return False, False, f"Version {latest} isn't signed by BlacSwanken's build system, so it won't be installed."
     ctl = _control()
     forced = bool(ctl.get("min_version")) and ver(current()) < ver(ctl["min_version"])
@@ -200,16 +240,25 @@ def _download(url, dest):
     return dest
 
 
+def _manifest_ok(s):
+    try:
+        m = json.loads(s.get("manifest") or "{}")
+        return (verify((s.get("manifest") or "").encode(), bytes.fromhex(s.get("manifest_sig") or "")) and
+                str(m.get("version")) == str(s.get("latest")) and m.get("sha256") == s.get("sha256"))
+    except Exception:
+        return False
+
+
 def fetch(s=None):
-    """Download and verify the latest installer. Returns its path. Raises RuntimeError."""
+    """Download the latest installer and check it is exactly the one BlacSwanken signed. Returns its path. Raises RuntimeError."""
     s = s or _state()
+    if not _manifest_ok(s):
+        raise RuntimeError("This release isn't signed by BlacSwanken's build system; it won't be installed.")
     DIR.mkdir(parents=True, exist_ok=True)
     exe = DIR / f"BSO-Setup-{s['latest']}.exe"
-    sig = DIR / f"BSO-Setup-{s['latest']}.exe.sig"
     if not exe.exists():
         _download(s["setup_url"], exe)
-    _download(s["sig_url"], sig)
-    if not verify(exe.read_bytes(), sig.read_bytes()):
+    if hashlib.sha256(exe.read_bytes()).hexdigest() != s["sha256"]:
         exe.unlink(missing_ok=True)
         raise RuntimeError("The download's signature doesn't match BlacSwanken's build key; it was deleted and not installed.")
     return exe
@@ -232,29 +281,23 @@ def backup_db():
 
 
 def _previous_installer():
-    """The installer of the version running now, for going back if the new one fails (signed release asset)."""
+    """The installer of the version running now, for going back if the new one fails (checked against its signed manifest)."""
     old = DIR / f"BSO-Setup-{current()}.exe"
     if old.exists():
         return old
-    try:
-        assets = {}
-        for repo in REPOS:
-            try:
-                r = requests.get(f"https://api.github.com/repos/{repo}/releases/tags/v{current()}", timeout=20, headers={"User-Agent": "BSO-updater"})
-                assets = {a["name"]: a["browser_download_url"] for a in r.json().get("assets") or []}
-            except Exception:
-                assets = {}
-            if assets.get("BSO-Setup.exe"):
-                break
-        if assets.get("BSO-Setup.exe") and assets.get("BSO-Setup.exe.sig"):
-            _download(assets["BSO-Setup.exe"], old)
-            sig = old.with_suffix(".exe.sig")
-            _download(assets["BSO-Setup.exe.sig"], sig)
-            if verify(old.read_bytes(), sig.read_bytes()):
+    for repo in REPOS:
+        try:
+            r = requests.get(f"https://api.github.com/repos/{repo}/releases/tags/v{current()}", timeout=20, headers={"User-Agent": "BSO-updater"})
+            sm = _signed_manifest(r.json())
+            if not sm:
+                continue
+            DIR.mkdir(parents=True, exist_ok=True)
+            _download(sm["setup_url"], old)
+            if hashlib.sha256(old.read_bytes()).hexdigest() == sm["sha256"]:
                 return old
             old.unlink(missing_ok=True)
-    except Exception:
-        pass
+        except Exception:
+            pass
     return None
 
 

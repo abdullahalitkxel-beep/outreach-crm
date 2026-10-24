@@ -157,6 +157,11 @@ def main():
 
     import bot  # sets up the data folder (%APPDATA%\OutreachCRM) on first run
     _ensure_stdio(bot.DATA / "app.log")
+    if "--after-restart" in sys.argv:              # "Restart BSO now": wait for the old BSO to let go of its port
+        for _ in range(60):
+            if not _port_in_use():
+                break
+            time.sleep(0.5)
     if not _port_in_use():
         try:
             import safety

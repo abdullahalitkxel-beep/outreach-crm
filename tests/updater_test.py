@@ -47,9 +47,22 @@ class Resp:
     def __init__(self, j): self.j = j
     def raise_for_status(self): pass
     def json(self): return self.j
-release = {"tag_name": "v1.0.52", "published_at": "2026-11-02T10:00:00Z", "body": "Autopilot for the BSO Bot",
-           "assets": [{"name": "BSO-Setup.exe", "browser_download_url": "https://x/BSO-Setup.exe"},
-                      {"name": "BSO-Setup.exe.sig", "browser_download_url": "https://x/BSO-Setup.exe.sig"}]}
+def rel(tag, base="https://x/"):
+    return {"tag_name": tag, "published_at": "2026-11-02T10:00:00Z", "body": "Autopilot for the BSO Bot",
+            "assets": [{"name": n, "browser_download_url": base + tag + "/" + n} for n in ("BSO-Setup.exe", "BSO-release.json", "BSO-release.json.sig")]}
+release = rel("v1.0.52")
+manifests = {}
+def publish(tag, data=installer, signed_as=None):
+    """What the build does: a manifest naming the version and the installer's hash, signed with the build key."""
+    body = json.dumps({"version": (signed_as or tag).lstrip("v"), "sha256": hashlib.sha256(data).hexdigest()}).encode()
+    manifests[tag] = (body, sign(body))
+publish("v1.0.52")
+def small(url):
+    tag, name = url.split("/")[-2:]
+    if tag not in manifests:
+        raise RuntimeError("404")
+    return manifests[tag][1] if name.endswith(".sig") else manifests[tag][0]
+updater._small = small
 updater.requests.get = lambda *a, **k: Resp(release)
 b = updater.check(force=True)
 check(b["available"] and b["latest"] == "1.0.52" and "Autopilot" in b["notes"], "a newer release is found with its notes")
@@ -63,9 +76,17 @@ updater.requests.get = two_repos
 b = updater.check(force=True)
 check(b["latest"] == "1.0.52" and any("bso-releases" in u for u in asked) and any("outreach-crm" in u for u in asked),
       "updates come from the public releases repository, and from the code repository until that exists")
-older = dict(release, tag_name="v1.0.50")
+publish("v1.0.50")
+older = rel("v1.0.50")
 updater.requests.get = lambda url, *a, **k: Resp(release if "bso-releases" in url else older)
 check(updater.check(force=True)["latest"] == "1.0.52", "the newest release in either repository wins")
+planted = {"tag_name": "v9.9.9", "assets": [{"name": "BSO-Setup.exe", "browser_download_url": "https://x/v9.9.9/BSO-Setup.exe"}]}
+updater.requests.get = lambda url, *a, **k: Resp(planted if "bso-releases" in url else release)
+b = updater.check(force=True)
+check(b["latest"] == "1.0.52" and b["available"], "a planted release without BlacSwanken's signed manifest is skipped: it can't block updates")
+publish("v9.9.8", signed_as="v1.0.40")              # an old, genuinely signed release republished under a higher number
+updater.requests.get = lambda url, *a, **k: Resp(rel("v9.9.8") if "bso-releases" in url else release)
+check(updater.check(force=True)["latest"] == "1.0.52", "an old signed release republished under a newer number is refused (no downgrade)")
 updater.requests.get = lambda url, *a, **k: Resp(release)
 role = {"r": "owner"}
 updater._role = lambda: role["r"]
@@ -89,20 +110,20 @@ ctl["release_now"] = "2026-11-02T10:30:00Z"
 check(updater.decision(now=now)[0], "Release to everyone now skips the staged roll-out")
 ctl.clear()
 s = updater._state()
-s["sig_url"] = None
+s["manifest_sig"] = "00" * 256
 updater._save(s)
-check(not updater.decision(now=now + timedelta(days=3))[0], "an unsigned release is never installed")
+check(not updater.decision(now=now + timedelta(days=3))[0], "a release whose signature doesn't check out is never installed")
 updater.check(force=True)
 
 # ---------------------------------------------------------------- downloading
 def fake_download(url, dest):
-    Path(dest).write_bytes(sig if url.endswith(".sig") else installer)
+    Path(dest).write_bytes(installer)
     return dest
 updater._download = fake_download
 exe = updater.fetch()
 check(exe.exists(), "the installer is downloaded and verified")
 exe.unlink()
-updater._download = lambda url, dest: Path(dest).write_bytes(sig if url.endswith(".sig") else installer + b"tampered") or dest
+updater._download = lambda url, dest: Path(dest).write_bytes(installer + b"tampered") or dest
 try:
     updater.fetch()
     ok = False

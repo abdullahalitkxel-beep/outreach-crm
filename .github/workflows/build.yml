@@ -21,7 +21,6 @@ jobs:
       CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
       UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
       UPDATE_SIGNING_KEY_PASSWORD: ${{ secrets.UPDATE_SIGNING_KEY_PASSWORD }}
-      RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -31,9 +30,15 @@ jobs:
 
       # A wrong secret otherwise shows up only at the signing steps, 15 minutes in. This takes seconds.
       - name: Check the release secrets
+        id: secrets
+        shell: pwsh
+        env:
+          RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN }}
         run: |
           python -m pip install --quiet cryptography
           python packaging/check_secrets.py
+          if ($LASTEXITCODE) { throw "a release secret is wrong (see the error above)" }
+          "releases_token=$([bool]$env:RELEASES_TOKEN)" >> $env:GITHUB_OUTPUT
 
       - name: Install dependencies
         run: |
@@ -56,7 +61,12 @@ jobs:
           echo "::warning title=Bootloader::Compiling the bootloader failed; used the standard pre-built one."
 
       - name: Prepare version info, licence text, Store manifest, third-party notices
-        run: python packaging/prepare.py ${{ github.run_number }}
+        id: prep
+        shell: pwsh
+        run: |
+          python packaging/prepare.py ${{ github.run_number }}
+          if ($LASTEXITCODE) { throw "prepare failed" }
+          "version=$(Get-Content version.txt)" >> $env:GITHUB_OUTPUT
 
       - name: Test team mode (hub and laptop)
         run: python tests/team_test.py
@@ -242,29 +252,8 @@ jobs:
             Remove-Item $pfx
             if ($rc) { Write-Host "::error title=Installer signing::$(($out | Out-String) -replace "`r?`n", ' ')"; throw "signing BSO-Setup.exe failed" }
           } else { Write-Host "::warning title=Code signing::CODESIGN_PFX_BASE64 secret not set: the installer is unsigned" }
-          if ($env:UPDATE_SIGNING_KEY) {
-            $key = "$env:RUNNER_TEMP\upd.pem"
-            Set-Content -Path $key -Value $env:UPDATE_SIGNING_KEY -NoNewline
-            $first = ($env:UPDATE_SIGNING_KEY -split "`n")[0].Trim()
-            $lines = ($env:UPDATE_SIGNING_KEY -split "`n").Count
-            $out = openssl dgst -sha256 -sign $key -out dist\BSO-Setup.exe.sig dist\BSO-Setup.exe 2>&1
-            $rc = $LASTEXITCODE
-            if ($rc -and ($env:UPDATE_SIGNING_KEY -match "ENCRYPTED")) {
-              # the key is protected by a password: try the update key's own password secret, then the certificate's
-              foreach ($pw in @($env:UPDATE_SIGNING_KEY_PASSWORD, $env:CODESIGN_PFX_PASSWORD)) {
-                if (-not $pw) { continue }
-                $env:BSO_KEYPASS = $pw
-                $out = openssl dgst -sha256 -sign $key -passin env:BSO_KEYPASS -out dist\BSO-Setup.exe.sig dist\BSO-Setup.exe 2>&1
-                $rc = $LASTEXITCODE
-                Remove-Item Env:\BSO_KEYPASS
-                if (-not $rc) { Write-Host "release key unlocked with its password"; break }
-              }
-            }
-            Remove-Item $key
-            if ($rc) { Write-Host "::error title=Release signature::openssl couldn't use UPDATE_SIGNING_KEY (first line '$first', $lines line(s)): $(($out | Out-String) -replace "`r?`n", ' ')"; throw "release signature failed" }
-            python -c "import updater,sys; ok=updater.verify(open('dist/BSO-Setup.exe','rb').read(), open('dist/BSO-Setup.exe.sig','rb').read()); print('release signature ok' if ok else 'BAD'); sys.exit(0 if ok else 1)"
-            if ($LASTEXITCODE) { Write-Host "::error title=Release signature::UPDATE_SIGNING_KEY is a valid key but not the one in update_key.json: paste the private key from the secrets file again"; throw "the release signature doesn't match update_key.json" }
-          } else { Write-Host "::warning title=Automatic updates::UPDATE_SIGNING_KEY secret not set: this release isn't signed, so BSOs won't install it automatically" }
+          python packaging/sign_release.py dist\BSO-Setup.exe (Get-Content version.txt)
+          if ($LASTEXITCODE) { throw "release signature failed" }
 
       - name: Test the installer (install, run, check Windows "Installed apps" entry, uninstall)
         shell: pwsh
@@ -355,56 +344,63 @@ jobs:
           path: |
             dist/BSO-Setup.exe
             dist/BSO-Setup.exe.sig
+            dist/BSO-release.json
+            dist/BSO-release.json.sig
             dist/BSO-Store.msix
+
+      - name: Release notes
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: |
+          $v = Get-Content version.txt
+          $notes = Get-Content RELEASE_NOTES.md -Raw
+          $tail = @"
+
+          ---
+          **BSO-Setup.exe**: install on your PC (per-user, no admin rights needed). BSO updates itself after that.
+          **BSO-release.json + .sig**: the signed fingerprint BSO checks before installing an update.
+          **BSO-Store.msix**: for Microsoft Partner Center (the Store signs it).
+          **privacy.html, terms.html, acceptable-use.html**: for blacswanken.com.
+
+          Until the Store version is live, Windows may show "Windows protected your PC" for the installer: click **More info → Run anyway**.
+          Your data stays in %APPDATA%\OutreachCRM, so updating keeps everything.
+          "@
+          Set-Content -Path build\release-notes.md -Value ("BSO $v`n`n" + $notes + $tail) -Encoding utf8
 
       - name: Publish release (only after every test passed)
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: BSO – BlacSwanken Outreach 1.0.${{ github.run_number }} (Windows)
+          tag_name: v${{ steps.prep.outputs.version }}
+          name: BSO – BlacSwanken Outreach ${{ steps.prep.outputs.version }} (Windows)
           target_commitish: ${{ github.sha }}
           make_latest: true
-          body: |
-            ${{ github.event.head_commit.message }}
-
-            ---
-            **BSO-Setup.exe**: install on your PC (per-user, no admin rights needed). Shows the licence agreement and registers BlacSwanken as publisher.
-            **BSO-Store.msix**: upload this to Microsoft Partner Center for the Store listing. (It isn't meant to be double-clicked; the Store signs it.)
-            **privacy.html, terms.html, acceptable-use.html**: put these on blacswanken.com; the Store listing needs the privacy page's address.
-
-            Until the Store version is live, Windows may show "Windows protected your PC" for the installer: click **More info → Run anyway**.
-            Your data stays in %APPDATA%\OutreachCRM, so updating keeps everything.
+          body_path: build/release-notes.md
           files: |
             dist/BSO-Setup.exe
             dist/BSO-Setup.exe.sig
+            dist/BSO-release.json
+            dist/BSO-release.json.sig
             dist/BSO-Store.msix
             build/legal-site/privacy.html
             build/legal-site/terms.html
             build/legal-site/acceptable-use.html
 
       - name: Publish the release to the public releases repository (laptops update from there)
-        if: github.ref == 'refs/heads/main' && env.RELEASES_TOKEN != ''
+        if: github.ref == 'refs/heads/main' && steps.secrets.outputs.releases_token == 'True'
         uses: softprops/action-gh-release@v2
         with:
           repository: abdullahalitkxel-beep/bso-releases
-          token: ${{ env.RELEASES_TOKEN }}
-          tag_name: v1.0.${{ github.run_number }}
-          name: BSO – BlacSwanken Outreach 1.0.${{ github.run_number }} (Windows)
+          token: ${{ secrets.RELEASES_TOKEN }}
+          tag_name: v${{ steps.prep.outputs.version }}
+          name: BSO – BlacSwanken Outreach ${{ steps.prep.outputs.version }} (Windows)
           make_latest: true
-          body: |
-            ${{ github.event.head_commit.message }}
-
-            ---
-            **BSO-Setup.exe**: install on your PC (per-user, no admin rights needed). Shows the licence agreement and registers BlacSwanken as publisher.
-            **BSO-Store.msix**: upload this to Microsoft Partner Center for the Store listing. (It isn't meant to be double-clicked; the Store signs it.)
-            **privacy.html, terms.html, acceptable-use.html**: put these on blacswanken.com; the Store listing needs the privacy page's address.
-
-            Until the Store version is live, Windows may show "Windows protected your PC" for the installer: click **More info → Run anyway**.
-            Your data stays in %APPDATA%\OutreachCRM, so updating keeps everything.
+          body_path: build/release-notes.md
           files: |
             dist/BSO-Setup.exe
             dist/BSO-Setup.exe.sig
+            dist/BSO-release.json
+            dist/BSO-release.json.sig
             dist/BSO-Store.msix
             build/legal-site/privacy.html
             build/legal-site/terms.html

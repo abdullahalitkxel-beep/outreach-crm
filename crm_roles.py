@@ -87,7 +87,7 @@ def nav(default_nav):
 def active_for(endpoint):
     return {"ws_conversations": "ws_conversations", "pipeline": "pipeline", "lead": "ws_conversations" if mode() == "workspace" else "leads",
             "bot_spot": "botroom", "bot_kill_local": "botroom", "bot_breaker_resume": "botroom", "save_backup": "botroom",
-            "save_restore": "botroom"}.get(endpoint, endpoint)
+            "save_restore": "botroom", "restore_cancel": "botroom"}.get(endpoint, endpoint)
 
 
 @app.before_request
@@ -157,6 +157,32 @@ def _cfg():
     return crm.cfg()
 
 
+def here_is_bot():
+    """Is this computer the BSO Bot (or a single-user BSO that sends by itself)? The owner's laptop isn't, unless the
+    owner chose Act as → BSO Bot."""
+    return (not team.joined()) or team.is_bot() or (is_owner() and view_as() == "bot")
+
+
+def local_time(iso_utc):
+    """'2026-10-24T09:48:00Z' -> 'Sat 24 Oct, 14:48' in this computer's time zone."""
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(str(iso_utc).replace("Z", "+00:00")).astimezone().strftime("%a %d %b, %H:%M")
+    except Exception:
+        return str(iso_utc or "")[:16].replace("T", " ")
+
+
+def backup_label(b):
+    n = b.get("name", "")
+    try:
+        when = local_time(f"{n[11:15]}-{n[15:17]}-{n[17:19]}T{n[20:22]}:{n[22:24]}:{(n[24:26] or '00')}Z")
+    except Exception:
+        when = n
+    size = b.get("size") or 0
+    sz = f"{size / 1e6:.1f} MB" if size >= 100_000 else f"{max(1, size // 1000)} KB"
+    return f"{when} · {sz}" + (" · made with Back up now" if b.get("manual") else "")
+
+
 @app.route("/bot")
 def botroom():
     c, con = _cfg(), crm.db()
@@ -173,14 +199,18 @@ def botroom():
             drive_err = str(e)
     return crm.render("botroom.html", rp=rp, cap=cap, sent=sent, last=last, active_on=autopilot.active(c), lands=lambda e: "",
                       backup_folder=(c.get("backup") or {}).get("folder", ""), drive_ready=safety.drive_ready(), drive=drive, drive_err=drive_err,
-                      can_restore=can_restore())
+                      can_restore=can_restore(), here_is_bot=here_is_bot(), pending=safety.pending_restore(), local_time=local_time,
+                      backup_label=backup_label)
 
 
 @app.post("/bot/kill")
 def bot_kill_local():
+    import safety
     on = request.form.get("on") == "1"
-    autopilot.set_kill(crm.db(), on, "stopped on the bot computer")
-    return redirect(url_for("botroom", msg="All sending stopped." if on else "Sending starts again at the next tick (within 3 minutes)."))
+    if not on and safety.pending_restore():
+        return redirect(url_for("botroom", msg="A restore is waiting. Restart BSO first (or cancel the restore), then start sending."))
+    autopilot.set_kill(crm.db(), on, "stopped on the bot computer" if here_is_bot() else "stopped on this computer")
+    return redirect(url_for("botroom", msg=("Sending stopped on this computer." if on else "Sending starts again at the next tick (within 3 minutes).")))
 
 
 @app.post("/bot/breaker/<int:bid>")
@@ -196,11 +226,15 @@ def save_backup():
     folder = request.form.get("folder", "").strip().strip('"')
     if "folder" in request.form:
         crm.write_settings({"backup": {"folder": folder}})
-    msg = "Backup folder saved."
+    msg = "Backup folder saved." if folder else "Backup folder removed."
     if request.form.get("now"):
-        r = safety.backup(crm.db(), folder=folder or (crm.cfg().get("backup") or {}).get("folder") or None)
-        msg = (f"Backup made: {r['detail']}" + (f". Google Drive: {r['drive_detail']}" if r.get("drive_detail") else "")
-               + (f". Backup folder: {r['offsite_detail']}" if r.get("offsite_detail") else ""))
+        st = safety.status(crm.db())
+        if st.get("manual") and st.get("at", "") > safety._iso(safety._now() - safety.timedelta(minutes=10)):
+            return redirect(url_for("botroom", msg="A backup was made less than 10 minutes ago. Wait a little before making another."))
+        r = safety.backup(crm.db(), folder=folder or (crm.cfg().get("backup") or {}).get("folder") or None, manual=True)
+        msg = ("Backup made and checked." if r["ok"] else f"Backup problem: {r['detail']}") + \
+              (" The Google Drive copy is uploading; this page shows when it's checked (refresh in a minute)." if r.get("drive_ok") is None and r.get("drive") else "") + \
+              (f" Backup folder: {r['offsite_detail']}" if r.get("offsite_detail") else "")
     return redirect(url_for("botroom", msg=msg))
 
 
@@ -214,20 +248,29 @@ def save_restore():
     import safety
     if not can_restore():
         return redirect(url_for("botroom", msg="Only the owner or the BSO Bot account can restore a backup."))
-    if request.form.get("confirm", "").strip().upper() != "RESTORE":
-        return redirect(url_for("botroom", msg="Type RESTORE to confirm. Nothing was changed."))
+    if request.form.get("confirm", "").strip() != "RESTORE":
+        return redirect(url_for("botroom", msg="Type RESTORE in capital letters to confirm. Nothing was changed."))
+    src = request.form.get("source", "drive" if request.form.get("drive_name") else "file")
     path = request.form.get("path", "").strip().strip('"')
     try:
-        if request.form.get("drive_name"):
+        if src == "drive":
+            if not request.form.get("drive_name"):
+                raise RuntimeError("Choose a backup from the list.")
             path = str(safety.drive_fetch(request.form["drive_name"]))
         elif not path:
-            raise RuntimeError("choose a backup on Google Drive or give the path of a backup file")
+            raise RuntimeError("Paste the full path of the backup file.")
         detail = safety.restore(path, now=False)
     except Exception as e:
         return redirect(url_for("botroom", msg=f"Not restored: {e}"))
-    autopilot.set_kill(crm.db(), True, "a backup is waiting to be restored: quit BSO and open it again")
-    return redirect(url_for("botroom", msg=f"Backup checked ({detail}). Sending is stopped. Quit BSO (tray icon → Quit) and open it again: "
-                                            "the backup is put in place as it starts. Then press Start sending."))
+    autopilot.set_kill(crm.db(), True, "a backup is waiting to be restored: restart BSO to put it in place")
+    return redirect(url_for("botroom", msg=f"Backup checked ({detail}). Sending is stopped. Now click Restart BSO now."))
+
+
+@app.post("/bot/restore/cancel")
+def restore_cancel():
+    import safety
+    safety.cancel_restore()
+    return redirect(url_for("botroom", msg="The waiting restore was cancelled. Nothing was changed. Sending stays stopped until you start it."))
 
 
 @app.post("/bot/spot/<int:sid>")

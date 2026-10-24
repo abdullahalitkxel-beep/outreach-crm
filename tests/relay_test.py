@@ -170,13 +170,13 @@ try:
     # --- off-laptop backups to the master's Google Drive (version 6)
     safety.DRIVE_PART = 2000                      # small parts so the test covers a backup in several pieces
     check(safety.drive_ready(), "a signed-in laptop on relay 6 has Google Drive backups with nothing to set up")
-    r = safety.backup(con)
+    r = safety.backup(con, drive="wait")
     check(r["ok"] and r.get("drive_ok") and "read back from Google Drive" in r.get("drive_detail", ""),
           "a backup goes to Google Drive, is read back and passes the restore test: " + str(r.get("drive_detail")))
     lst = safety.drive_list()
     check(len(lst) == 1 and lst[0]["complete"] and lst[0]["parts"] > 1 and lst[0]["name"] == r["drive"], "it is listed, complete, in several parts")
     files = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/_files").read())
-    raw = [f for f in files if f["name"].startswith("BSO-backup-")]
+    raw = [f for f in files if ".part" in f["name"]]
     check(raw and not any("acme" in json.dumps(f) for f in raw), "Drive holds only the sealed copy")
     p = safety.drive_fetch(r["drive"])
     check(safety.check_sealed(p, team._team_key())[0], "a replacement laptop with the same sign-in downloads it and it opens")
@@ -186,18 +186,43 @@ try:
     except RuntimeError:
         check(True, "a made-up backup name is refused before anything is written")
     sealed = p.read_text()
-    for i in range(16):
-        safety.drive_put(f"BSO-backup-202601{i + 10:02d}-0600.bsobak", sealed[:500])
-    lst = safety.drive_list()
-    check(len(lst) == 14 and lst[0]["name"] == r["drive"] and all(x["complete"] for x in lst), "only the newest 14 are kept on Drive")
+    from datetime import date as _d, timedelta as _td
+    day0 = _d(2026, 11, 2)
+    for n in range(70):                                   # 70 days of backups every 6 hours
+        dd = day0 + _td(days=n)
+        for h in ("00", "06", "12", "18"):
+            safety.drive_put(f"BSO-backup-{dd:%Y%m%d}-{h}0000.bsobak", sealed[:300])
+    last_day = day0 + _td(days=69)
+    names = [x["name"] for x in safety.drive_list()]
+    days = sorted({n[11:19] for n in names})
+    check(len([n for n in names if n[11:19] == f"{last_day:%Y%m%d}"]) == 4, "the last day's 4 backups are all kept")
+    check(sum(1 for d in days if d >= f"{last_day - _td(days=13):%Y%m%d}") == 14, "one a day is kept for two weeks")
+    check(min(days) <= f"{last_day - _td(days=49):%Y%m%d}" and len(days) <= 14 + 8, "and one a week for about two months")
+    files = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/_files").read())
+    check(len([f for f in files if ".part" in f["name"]]) <= 27 * 2, "slots are overwritten: the number of files stays fixed (nothing piles up in Drive's trash)")
+    for k in range(20):
+        safety.drive_put(f"BSO-backup-{last_day:%Y%m%d}-23{k:02d}00.bsobak", sealed[:300], manual=True)
+    names2 = [x["name"] for x in safety.drive_list()]
+    check(set(names) - set(names2) == set() and len(names2) == len(names) + 1,
+          "pressing Back up now again and again never pushes out the scheduled copies (one manual slot)")
     try:
         safety._drive_call("backup_put", {"name": "BSO-backup-20260101-0000.bsobak", "part": 0, "parts": 1, "data": "<script>"})
         check(False, "bad data refused")
     except RuntimeError:
         check(True, "the relay refuses anything that isn't a sealed backup")
+    tok_a = team.env(team.TOKEN_KEY)
     team.leave()
     team.sign_in(con, "cole.reed", "cole-pass-1234", consent=True)
     check(safety.drive_list() == [], "another person's sign-in can't see this laptop's backups")
+    c.post(f"/users/{uid}", data={"_csrf": tok(f"/users/{uid}"), "action": "disable"})      # pause Ayesha
+    hub.relay_cycle()
+    try:
+        relay.call(URL, {"action": "backup_list", "token": tok_a})
+        check(False, "a paused account can't use backups")
+    except relay.RelayError as e:
+        check(e.code == 403, "a paused account can't upload or download backups")
+    c.post(f"/users/{uid}", data={"_csrf": tok(f"/users/{uid}"), "action": "enable"})
+    hub.relay_cycle()
     team.leave()
     team.sign_in(con, "ayesha", "new-ayesha-pass", consent=True)
 

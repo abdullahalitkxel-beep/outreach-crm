@@ -200,7 +200,7 @@ check(not watcher._cold_not_here(), "the owner's BSO keeps its inboxes")
 for path in ("/campaigns", "/review", "/leads", "/bot", "/bot/domains", "/bot/intake", "/myday", "/pipeline", "/settings?tab=inbox", "/settings?tab=autopilot", "/setup"):
     check(w.get(path).status_code == 200, f"owner opens {path}")
 page = txt(w.get("/leads"))
-check('id="nav-campaigns"' in page and "Act as" in page and "Owner: full access" in page, "the owner gets the full menu and the Act as switch")
+check('id="nav-campaigns"' in page and "Act as" in page and "Owner: everything" in page, "the owner gets the full menu and the Act as switch")
 w.post("/view-as", data={"view": "bot"})
 check(team.acting_as() == "bot" and autopilot.active(bot.load_config(crm.CONFIG_PATH)), "owner acting as the bot: the bot's rules run on this computer")
 r = w.get("/")

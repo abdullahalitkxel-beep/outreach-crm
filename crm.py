@@ -88,6 +88,31 @@ def require_password():
             return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="CRM"'})
 
 
+@app.before_request
+def same_origin_only():
+    """BSO's pages run on this computer. A web page open in a browser on the same computer must not be able to press
+    BSO's buttons (stop or start sending, restore a backup, sign out): every form and button posts from BSO itself, so
+    a POST from any other origin is refused. Without a password, BSO also answers only to its own local address
+    (a website can't reach it by pointing a name of its own at 127.0.0.1)."""
+    from urllib.parse import urlsplit
+    host = (request.host or "").lower()
+    if not os.getenv("CRM_PASSWORD") and host.split(":")[0] not in ("127.0.0.1", "localhost", "[::1]"):
+        return Response("BSO only answers on this computer's own address.", 403)
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    if request.headers.get("Sec-Fetch-Site", "same-origin") not in ("same-origin", "none"):
+        return Response("Refused: this request came from another website.", 403)
+    for h in ("Origin", "Referer"):
+        v = request.headers.get(h)
+        if v and v != "null":
+            if urlsplit(v).netloc.lower() != host:
+                return Response("Refused: this request came from another website.", 403)
+            break
+        if v == "null":
+            return Response("Refused: this request came from another website.", 403)
+    return None
+
+
 LAST_SEEN = None  # last time an app window pinged /heartbeat
 LAST_BYE = None   # last time a window said it was closing (/bye)
 
@@ -274,6 +299,7 @@ def render(name, **ctx):
     for k, v in crm_roles.ctx().items():
         ctx.setdefault(k, v)
     ctx.setdefault("all_campaigns", rows("SELECT id, name, status FROM campaigns ORDER BY id"))
+    ctx.setdefault("test_mode_on", bool((cfg().get("test_mode") or {}).get("enabled")))
     return app.jinja_env.get_template(name).render(
         request=request, url_for=url_for, money=money, today=today(), status_labels=STATUS_LABELS,
         temp_badge=temp_badge, temp_icons=_convo.TEMP_ICON, now_local=datetime.now().isoformat(timespec="minutes"),
@@ -2412,6 +2438,21 @@ def save_schedule():
     return redirect(url_for("settings", tab="schedule", result="Schedule saved.", ok=1))
 
 
+@app.post("/restart")
+def restart_app():
+    """Start a fresh BSO and close this one (a restore waiting for a restart goes in as the new one starts)."""
+    import subprocess
+    cmd = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, str(Path(__file__).resolve().parent / "app.py")]
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        subprocess.Popen(cmd + ["--after-restart"], creationflags=flags, close_fds=True)
+    except Exception as e:
+        return redirect(url_for("botroom", msg=f"Couldn't start BSO again ({e}). Quit it from the tray icon and open it again."))
+    threading.Timer(0.8, lambda: os._exit(0)).start()
+    return ("<meta http-equiv='refresh' content='8;url=/bot'><p style='font:16px system-ui;padding:40px'>BSO is restarting… "
+            "this window reloads in a few seconds.</p>")
+
+
 @app.post("/quit")
 def quit_app():
     threading.Timer(0.5, lambda: os._exit(0)).start()
@@ -2451,7 +2492,9 @@ def setup_steps():
     s5 = one("SELECT COUNT(*) FROM outbox WHERE status IN ('approved','sent')") > 0
     s6 = one("SELECT COUNT(*) FROM events WHERE type='sent'") > 0
     s7 = one("SELECT COUNT(*) FROM events WHERE type='reply'") > 0
-    s8 = not tm.get("enabled")
+    s8 = not tm.get("enabled") and s6
+    test_on = bool(tm.get("enabled"))
+    review_on = bool((c.get("review") or {}).get("enabled"))
 
     steps = [
         dict(id="details", ok=s1, title="Connect your email inbox",
@@ -2470,8 +2513,10 @@ def setup_steps():
              link=url_for("import_page"), link_text="Import a spreadsheet",
              action="apollo-preview" if apollo_key else None, button="Preview Apollo searches (free)"),
         dict(id="draft", ok=s4, title="Let the bot draft your first emails",
-             text="The bot writes a personalised draft for each lead that's due. Nothing is sent at this step. "
-                  "Drafts wait for you in <b>Review</b>.",
+             text=("The bot writes a personalised draft for each lead that's due. "
+                   + ("Nothing is sent at this step: drafts wait for you in <b>Review</b>." if review_on else
+                      ("<b>Review before sending is off</b>, so the run sends straight away" +
+                       (" (test mode is on: to your test address)." if test_on else ": <b>test mode is off, so real people receive these emails.</b>")))),
              action="run", button="▶ Run bot now", blocked=(None if s1 and s2 else 1 if not s1 else 2)),
         dict(id="review", ok=s5, title="Review and approve",
              text="Read each draft, edit it if you like, and approve the ones you're happy with. Reject anyone who isn't a fit.",
@@ -2481,13 +2526,15 @@ def setup_steps():
                    if tm.get("enabled") else "") +
                   "Click the button, then check that inbox: did it land in <b>Inbox or Spam</b>? Does the formatting look right? "
                   "Follow-ups will arrive in the same thread on later runs.",
-             action="run", button="▶ Send approved emails", blocked=(None if s5 else 5)),
+             action="run", button="▶ Send approved emails",
+             blocked=(None if s5 and test_on else 5 if not s5 else
+                      "Test mode is off: this button would email real people. Turn test mode on (Settings → Safety) to send yourself a test.")),
         dict(id="replies", ok=s7, title="Check that reply detection works",
              text="Add a lead whose email is your own test address, approve and send its draft, then <b>reply</b> to it "
                   "from that inbox with something like \"Sounds interesting, let's talk\". Click the button: the lead should "
                   "move to <b>Replied</b>, its emails stop, and a follow-up task appears.",
              action="check", button="Check replies now", link=url_for("new_lead"), link_text="Add your own address as a lead"),
-        dict(id="golive", ok=s8, title="Go live",
+        dict(id="golive", ok=s8, title="Go live",   # ticked only once a test was sent and test mode is off
              text="Only when your inboxes have warmed up for 2–3 weeks and test emails land in the inbox, not spam: "
                   "in <b>Settings → Safety</b>, switch off <b>Test mode</b> and switch on <b>Run automatically</b>. "
                   "Keep <b>Review before sending</b> on for the first weeks. Start at 10 emails a day per inbox and raise it by about 5 each week.",

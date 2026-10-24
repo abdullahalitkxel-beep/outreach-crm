@@ -337,13 +337,57 @@ def _team_key():
         return None
 
 
-def backup(con, folder=None, key=None):
-    """Copy the database, prove the copy works, and (with a folder and the team key) store a sealed copy off the laptop.
-    Returns a dict for the run log and the console."""
-    import bot
+MAGIC = b"BSOBAK1\n"          # sealed backups start with this, a line of JSON saying whose backup it is, then the database
+
+
+def _origin():
+    o = {"at": _iso(_now())}
+    try:
+        import team
+        o["user"] = team.signed_in() or ""
+        o["laptop"] = (team.device_info() or {}).get("name", "")
+    except Exception:
+        pass
+    return o
+
+
+def _pack(db_bytes, origin):
+    return zlib.compress(MAGIC + json.dumps(origin).encode() + b"\n" + db_bytes, 6)
+
+
+def _unpack(raw):
+    """(origin, database bytes). Backups made before the origin was recorded have no header: origin is {}."""
+    if raw.startswith(MAGIC):
+        head, _, db = raw[len(MAGIC):].partition(b"\n")
+        try:
+            return json.loads(head.decode() or "{}"), db
+        except ValueError:
+            return {}, db
+    return {}, raw
+
+
+def _save_status(res, con=None):
+    c = con or sqlite3.connect(str(_data() / "outreach.db"), timeout=30)
+    try:
+        c.execute("CREATE TABLE IF NOT EXISTS app_mode (k TEXT PRIMARY KEY, v TEXT)")
+        c.execute("INSERT INTO app_mode(k, v) VALUES ('backup_status', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (json.dumps(res),))
+        c.commit()
+    finally:
+        if con is None:
+            c.close()
+
+
+DRIVE_LIMIT_S = 300                 # a Google Drive copy gives up after 5 minutes; the next backup tries again
+
+
+def backup(con, folder=None, key=None, manual=False, drive="background", on_drive_fail=None):
+    """Copy the database, prove the copy works, then store sealed copies off the laptop: on Google Drive through the
+    team relay (in the background by default, so a slow upload never holds up sending) and in a folder if one is set.
+    Returns a dict for the run log and the console (the Drive result is added to the saved status when it finishes)."""
+    import threading
     out_dir = _data() / "backups"
     out_dir.mkdir(exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    stamp = _now().strftime("%Y%m%d-%H%M%S")                # UTC with seconds: two backups never share a name
     dest = out_dir / f"daily-{stamp}.db"
     con.commit()
     b = sqlite3.connect(str(dest))
@@ -352,7 +396,7 @@ def backup(con, folder=None, key=None):
     finally:
         b.close()
     live = _counts(con)
-    res = {"at": _iso(_now()), "file": dest.name, "size_mb": round(dest.stat().st_size / 1e6, 1)}
+    res = {"at": _iso(_now()), "file": dest.name, "size_mb": round(dest.stat().st_size / 1e6, 1), "manual": bool(manual)}
     ok, detail = check_copy(dest, live)
     res.update(ok=ok, detail=detail)
     for old in sorted(out_dir.glob("daily-*.db"))[:-KEEP_BACKUPS]:
@@ -360,27 +404,11 @@ def backup(con, folder=None, key=None):
     key = key if key is not None else _team_key()
     sealed = None
     if (folder or drive_ready()) and key and ok:
-        sealed = _fast_seal(key, zlib.compress(dest.read_bytes(), 6))
-    if drive_ready():
-        if not ok:
-            res.update(drive_ok=False, drive_detail="not uploaded: this copy failed its restore test")
-        elif not key:
-            res.update(drive_ok=False, drive_detail="sign this BSO in to the team first: the Drive copy is sealed with the team key")
-        else:
-            name = f"BSO-backup-{stamp}.bsobak"
-            try:
-                drive_put(name, sealed)
-                back = drive_download(name)
-                if back != sealed:
-                    raise RuntimeError("the copy read back from Google Drive doesn't match")
-                d_ok, d_detail = _check_sealed_text(back, key, live)
-                res.update(drive=name, drive_ok=d_ok, drive_detail=("read back from Google Drive: " + d_detail) if d_ok else d_detail)
-            except Exception as e:
-                res.update(drive_ok=False, drive_detail=f"Google Drive copy failed: {e}")
+        sealed = _fast_seal(key, _pack(dest.read_bytes(), _origin()))
     if folder:
         try:
             if not key:
-                raise RuntimeError("sign this BSO in to the team first: the off-laptop copy is sealed with the team key")
+                raise RuntimeError("sign this BSO in to the team first: the copy is sealed with the team key")
             if sealed is None:
                 raise RuntimeError("not copied: this backup failed its restore test")
             f = Path(folder)
@@ -394,10 +422,59 @@ def backup(con, folder=None, key=None):
             back_ok, back_detail = check_sealed(final, key, live)
             res.update(offsite=final.name, offsite_ok=back_ok, offsite_detail=back_detail)
         except Exception as e:
-            res.update(offsite_ok=False, offsite_detail=f"off-laptop copy failed: {e}")
-    con.execute("INSERT INTO app_mode(k, v) VALUES ('backup_status', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (json.dumps(res),))
-    con.commit()
+            res.update(offsite_ok=False, offsite_detail=f"backup folder copy failed: {e}")
+    job = None
+    if drive_ready():
+        if not ok:
+            res.update(drive_ok=False, drive_detail="not uploaded: this copy failed its restore test")
+        elif not key:
+            res.update(drive_ok=False, drive_detail="sign this BSO in to the team first: the Drive copy is sealed with the team key")
+        else:
+            name = f"BSO-backup-{stamp}.bsobak"
+            res.update(drive=name, drive_ok=None, drive_detail="uploading to Google Drive…")
+
+            def job():
+                out = {}
+                deadline = time.time() + DRIVE_LIMIT_S
+                try:
+                    drive_put(name, sealed, manual=manual, deadline=deadline)
+                    back = drive_download(name, deadline=deadline)
+                    if back != sealed:
+                        raise RuntimeError("the copy read back from Google Drive doesn't match")
+                    d_ok, d_detail = _check_sealed_text(back, key, live)
+                    out.update(drive_ok=d_ok, drive_detail=("read back from Google Drive: " + d_detail) if d_ok else d_detail)
+                except Exception as e:
+                    out.update(drive_ok=False, drive_detail=f"Google Drive copy failed: {e}")
+                return out
+    _save_status(res, con)
+    if job:
+        if drive == "wait":
+            res.update(job())
+            _save_status(res, con)
+        else:
+            def run():
+                out = job()
+                cur = status_file()
+                if cur.get("drive") == res["drive"]:             # a newer backup hasn't replaced this one meanwhile
+                    cur.update(out)
+                    _save_status(cur)
+                if out.get("drive_ok") is False and on_drive_fail:
+                    try:
+                        on_drive_fail(f"⚠ BSO backup problem: {out['drive_detail']}")
+                    except Exception:
+                        pass
+            threading.Thread(target=run, daemon=True, name="drive-backup").start()
     return res
+
+
+def status_file():
+    c = sqlite3.connect(str(_data() / "outreach.db"), timeout=30)
+    try:
+        return status(c)
+    except sqlite3.Error:
+        return {}
+    finally:
+        c.close()
 
 
 def check_copy(path, live=None):
@@ -425,15 +502,16 @@ def check_copy(path, live=None):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def open_sealed(path, key):
+def open_sealed(path, key, with_origin=False):
     import sealbox
-    return zlib.decompress(sealbox.open_(key, Path(path).read_text(encoding="ascii")))
+    origin, db = _unpack(zlib.decompress(sealbox.open_(key, Path(path).read_text(encoding="ascii"))))
+    return (origin, db) if with_origin else db
 
 
 def _check_sealed_text(text, key, live=None):
     import sealbox
     try:
-        raw = zlib.decompress(sealbox.open_(key, text))
+        raw = _unpack(zlib.decompress(sealbox.open_(key, text)))[1]
     except Exception as e:
         return False, f"the sealed copy can't be opened ({e})"
     fd, tmp = tempfile.mkstemp(suffix=".db")
@@ -450,7 +528,12 @@ def _check_sealed_text(text, key, live=None):
 DRIVE_PART = 4_000_000
 
 
-def _drive_call(action, body, timeout=180):
+def _drive_call(action, body, timeout=180, deadline=None):
+    if deadline is not None:
+        left = deadline - time.time()
+        if left <= 5:
+            raise RuntimeError("gave up after 5 minutes (slow connection); the next backup tries again")
+        timeout = min(timeout, left)
     import team
     s = team.state()
     code, j = team._post(s["hub"], "/" + action, body, token=team.env(team.TOKEN_KEY), timeout=timeout)
@@ -470,7 +553,7 @@ def drive_ready():
         return False
 
 
-def drive_put(name, sealed):
+def drive_put(name, sealed, manual=False, deadline=None):
     parts = [sealed[i:i + DRIVE_PART] for i in range(0, len(sealed), DRIVE_PART)] or [""]
     if len(parts) > 12:
         raise RuntimeError(f"the backup is too big for the relay ({len(sealed) // 1_000_000} MB sealed)")
@@ -478,11 +561,14 @@ def drive_put(name, sealed):
         last = None
         for attempt in range(3):
             try:
-                _drive_call("backup_put", {"name": name, "part": i, "parts": len(parts), "data": p})
+                _drive_call("backup_put", {"name": name, "part": i, "parts": len(parts), "data": p,
+                                           "kind": "manual" if manual else "scheduled"}, deadline=deadline)
                 last = None
                 break
             except Exception as e:
                 last = e
+                if i == 0 or "Start the backup again" in str(e) or (deadline and time.time() > deadline - 10):
+                    break                       # part 0 picks the slot: retrying it would take a second slot
                 time.sleep(2 * (attempt + 1))
         if last:
             raise last
@@ -493,11 +579,11 @@ def drive_list():
     return _drive_call("backup_list", {}, timeout=60).get("backups") or []
 
 
-def drive_download(name):
-    first = _drive_call("backup_get", {"name": name, "part": 0})
+def drive_download(name, deadline=None):
+    first = _drive_call("backup_get", {"name": name, "part": 0}, deadline=deadline)
     data = [first.get("data") or ""]
     for i in range(1, int(first.get("parts") or 1)):
-        data.append(_drive_call("backup_get", {"name": name, "part": i}).get("data") or "")
+        data.append(_drive_call("backup_get", {"name": name, "part": i}, deadline=deadline).get("data") or "")
     return "".join(data)
 
 
@@ -526,17 +612,36 @@ def check_sealed(path, key, live=None):
         os.unlink(tmp)
 
 
+PENDING_HOURS = 6
+
+
 def restore(src, key=None, now=True):
     """Put a backup back as this laptop's database (the current one is kept aside). src is a .db copy or a sealed .bsobak.
+    A sealed backup made under another sign-in is refused: it is someone else's (or another laptop's) work.
     now=False (the app, which has the database open): the checked copy waits as outreach.restore.db and is swapped in
-    by apply_pending_restore() the next time BSO starts, before anything opens the database."""
+    by apply_pending_restore() the next time BSO starts, before anything opens the database; it expires after
+    PENDING_HOURS so a forgotten restore can't replace days of work later."""
     src = Path(src)
+    if not src.exists():
+        raise RuntimeError("That file doesn't exist. Check the path.")
     data = _data()
+    origin = {}
     if src.suffix == ".bsobak":
         key = key if key is not None else _team_key()
         if not key:
             raise RuntimeError("Sign in to the team first: this backup is sealed with the team key.")
-        raw = open_sealed(src, key)
+        try:
+            origin, raw = open_sealed(src, key, with_origin=True)
+        except Exception:
+            raise RuntimeError("That file isn't a BSO backup of this team, or it is damaged.")
+        try:
+            import team
+            me = team.signed_in()
+        except Exception:
+            me = None
+        if origin.get("user") and me and origin["user"].lower() != me.lower():
+            raise RuntimeError(f"That backup belongs to {origin['user']}, not to {me} who is signed in here. "
+                               f"Sign in as {origin['user']} to restore it.")
     else:
         raw = src.read_bytes()
     fd, tmp = tempfile.mkstemp(suffix=".db", dir=str(data))
@@ -545,22 +650,46 @@ def restore(src, key=None, now=True):
     ok, detail = check_copy(tmp)
     if not ok:
         os.unlink(tmp)
+        if "not a database" in detail:
+            raise RuntimeError("That file isn't a BSO backup.")
         raise RuntimeError("That backup didn't pass the restore test: " + detail)
     if not now:
         os.replace(tmp, data / "outreach.restore.db")
+        (data / "outreach.restore.json").write_text(json.dumps({"at": _iso(_now()), "source": src.name, "detail": detail,
+                                                                "origin": origin}), encoding="utf-8")
         return detail
     _swap_in(tmp)
     return detail + "; " + settle_gap()
 
 
+def pending_restore():
+    """The restore waiting for BSO to restart, or None (expired ones are removed)."""
+    p, m = _data() / "outreach.restore.db", _data() / "outreach.restore.json"
+    if not p.exists():
+        return None
+    try:
+        meta = json.loads(m.read_text(encoding="utf-8"))
+    except Exception:
+        meta = {"at": _iso(datetime.fromtimestamp(p.stat().st_mtime, timezone.utc))}
+    if meta.get("at", "") < _iso(_now() - timedelta(hours=PENDING_HOURS)):
+        cancel_restore()
+        return None
+    return meta
+
+
+def cancel_restore():
+    for n in ("outreach.restore.db", "outreach.restore.json"):
+        (_data() / n).unlink(missing_ok=True)
+
+
 def apply_pending_restore():
     """Called when BSO starts: a restore chosen in the app is put in place before the database is opened."""
-    p = _data() / "outreach.restore.db"
-    if p.exists():
-        _swap_in(str(p))
-        print("restore:", settle_gap())
-        return True
-    return False
+    if not pending_restore():
+        return False
+    _swap_in(str(_data() / "outreach.restore.db"))
+    (_data() / "outreach.restore.json").unlink(missing_ok=True)
+    print("restore:", settle_gap())
+    return True
 
 
 def settle_gap():
