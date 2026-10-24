@@ -66,6 +66,11 @@ def ingest_extra(con, uid, e):
                 con.execute("INSERT OR IGNORE INTO dnc(h, at, user_id) VALUES (?,?,?)", (h, H.iso(), uid))
         return True
     if t == "__dnc_del":                               # the owner took a mistaken stop back: off the list, and off everyone's
+        who = con.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
+        if not who or who["role"] != "owner":          # nobody else can unblock anyone, whatever their laptop sends
+            con.execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)",
+                        (H.iso(), f"user {uid}", "dnc_remove_refused", "a non-owner laptop tried to take addresses off do-not-contact"))
+            return True
         _dnc_table(con)
         hs = [h for h in ((e.get("data") or {}).get("h") or [])[:500]
               if isinstance(h, str) and len(h) == 16 and all(c in "0123456789abcdef" for c in h)]

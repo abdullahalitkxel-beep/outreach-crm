@@ -520,7 +520,11 @@ def _on_team_dnc(con, addr):
 
 
 class Skipped(Exception):
-    """Not sent on purpose: the lead stopped (replied, unsubscribed...) after this round picked it."""
+    """Not sent on purpose: the lead stopped (replied, unsubscribed...) after this round picked it.
+    keep_draft: the email itself is still wanted (only this run must not send it), so an approved draft stays."""
+    def __init__(self, msg, keep_draft=False):
+        super().__init__(msg)
+        self.keep_draft = keep_draft
 
 
 # ---------------------------------------------------------------- senders
@@ -792,7 +796,7 @@ def analyze_reply(cfg, msg, body):
     """{'label', 'temperature', 'check_back', 'reason'} from the AI when it's on (else just the label from keywords).
     Stop requests are decided in code first (guard.stop_reason); the AI never sees them and can't overrule them."""
     import guard
-    stop = guard.stop_reason(msg.get("Subject", ""), body)
+    stop = None if guard.auto_reply(msg) else guard.stop_reason(msg.get("Subject", ""), body)
     if stop:
         return {"label": "unsubscribe", "temperature": "closed", "stop": stop,
                 "reason": "legal or complaint wording: a person should look" if stop == "legal" else "asked not to be contacted"}
@@ -831,7 +835,7 @@ no budget, polite no; closed = wants no more contact. check_back = the date they
 
 def classify_reply(cfg, msg, body):
     import guard
-    if guard.stop_reason(msg.get("Subject", ""), body):
+    if not guard.auto_reply(msg) and guard.stop_reason(msg.get("Subject", ""), body):
         return "unsubscribe"
     low = guard.new_text(body).lower()
     if guard.auto_reply(msg):
@@ -953,7 +957,7 @@ def send_email(sender, to, subject, body, in_reply_to=None, dry_run=False, cc=No
         if why:
             raise Skipped(why)
         if test_mode is not None and safety.test_mode_now() != bool(test_mode):
-            raise Skipped("test mode was switched on or off during this run; the next run carries on in the new mode")
+            raise Skipped("test mode was switched on or off during this run; the next run carries on in the new mode", keep_draft=True)
     if check_dnc and str((headers or {}).get("X-BSO-Kind", "")) not in INTERNAL_KINDS:
         import safety                         # every email to anyone outside: nobody on do-not-contact, whoever sends it and why
         bad = safety.blocked_recipients([to, cc, (headers or {}).get("Bcc")])
@@ -1339,7 +1343,7 @@ def _autopilot_round(cfg, con, args, due, for_campaign, usable, capacity, limits
         lead, idx, sender, steps = p["lead"], p["idx"], p["sender"], p["steps"]
         if isinstance(err, Skipped):
             print(f"Not sent to {lead['email']}: {err}")
-            if p["draft"]:
+            if p["draft"] and not err.keep_draft:
                 con.execute("UPDATE outbox SET status='cancelled', decided_at=? WHERE id=? AND status IN ('pending','approved')",
                             (iso(now_utc()), p["draft"]["id"]))
             continue
@@ -1396,7 +1400,7 @@ def cmd_run(cfg, con, args):
     if not args.dry_run:
         sync_mode(con, cfg)                     # the mode this run sends in is the database's mode, checked again before each email
     dnc_wait = False
-    if not args.dry_run and team_mod.joined() and not team_mod.dnc_ready() and \
+    if not args.dry_run and not test_on(cfg) and team_mod.joined() and not team_mod.dnc_ready() and \
             (cfg.get("team_dnc") or {}).get("required", True) and team_mod.dnc_must_wait(con):
         dnc_wait = True                # a new, rebuilt or restored bot: no FIRST emails until it has the team's whole list
         print("Waiting for the team's do-not-contact list from the Master Console: follow-ups and replies carry on, "
@@ -1679,6 +1683,8 @@ def cmd_run(cfg, con, args):
                                     lead_id=None if args.dry_run else lead["id"], test_mode=bool(redirect))
             except Skipped as e:
                 print(f"Not sent to {lead['email']}: {e}")
+                if e.keep_draft:
+                    break                               # this run stops sending; the next one carries on in the new mode
                 if draft:
                     con.execute("UPDATE outbox SET status='cancelled', decided_at=? WHERE id=? AND status IN ('pending','approved')",
                                 (iso(now_utc()), draft["id"]))
@@ -1827,6 +1833,8 @@ def nurture_tick(cfg, con, senders, redirect):
                              lead_id=lead["id"], statuses=("nurture", "active", "replied", "done", "paused"), test_mode=bool(redirect))
         except Skipped as e:
             print(f"Check-back email to {lead['email']} not sent: {e}")
+            if e.keep_draft:
+                break
             con.execute("UPDATE outbox SET status='cancelled' WHERE id=?", (d["id"],))
             continue
         convo.record_sent(con, mid, lead, "reconnect", sender["email"], to, subj, body, test=bool(redirect))
@@ -1866,8 +1874,14 @@ def get_full_text(msg):
         if ctype == "text/plain" and not plain:
             plain = text
         elif ctype == "text/html" and not html_text:
-            html_text = re.sub(r"(?i)<br\s*/?>|</p>|</div>", "\n", text)
-            html_text = _html.unescape(re.sub(r"<[^>]+>", " ", html_text))
+            h = text[:MAX_BODY]                         # cut first: hostile HTML can't make the clean-up slow
+            def _quoted(mo):                            # a quoted earlier email in HTML (<blockquote>, Gmail's quote) becomes "> " lines
+                inner = re.sub(r"(?i)<br\s*/?>|</p>|</div>", "\n", mo.group(0))
+                inner = _html.unescape(re.sub(r"<[^<>]{0,2000}>", " ", inner))
+                return "\n" + "\n".join("> " + ln for ln in inner.splitlines()) + "\n"
+            h = re.sub(r"(?is)<blockquote\b.{0,200000}?</blockquote>", _quoted, h)
+            h = re.sub(r"(?i)<br\s*/?>|</p>|</div>", "\n", h)
+            html_text = _html.unescape(re.sub(r"<[^<>]{0,2000}>", " ", h))
     text = (plain or html_text)[:MAX_BODY]
     return text.replace("\u00a0", " ")
 
@@ -2099,7 +2113,7 @@ def handle_message(cfg, con, sender, msg, folder="INBOX"):
     if m["path"]:
         convo.add_path_contacts(con, lead, m["path"])
     who_sent = "" if frm == lead["email"] else f" from {frm}"
-    stop = guard.stop_reason(msg.get("Subject", ""), full)
+    stop = None if guard.auto_reply(msg) else guard.stop_reason(msg.get("Subject", ""), full)   # an auto-reply's footer is not a stop
     tester = str(((cfg.get("test_mode") or {}).get("redirect_to")) or "").lower()
     is_test_reply = "[TEST for" in str(msg.get("Subject", "")) or (tester and frm == tester)
     own_address = frm == lead["email"] or bool(con.execute("SELECT 1 FROM lead_addresses WHERE email=? AND lead_id=?", (frm, lead["id"])).fetchone())
@@ -2486,7 +2500,8 @@ def process_inbox(cfg, con, sender, recheck=False, days=None):
                 if claimed:
                     con.execute("INSERT OR REPLACE INTO msg_pending(key, at, tries, inbox) VALUES (?,?,0,?)", (key, iso(now_utc()), sender["email"]))
                 else:                                # claimed earlier but never finished (crash, hang, error): take it over, once
-                    claimed = con.execute("UPDATE msg_pending SET at=?, tries=tries+1 WHERE key=? AND at<?",
+                    claimed = con.execute("UPDATE msg_pending SET at=?, tries=tries+(CASE WHEN error IS NULL THEN 1 ELSE 0 END), error=NULL "
+                                          "WHERE key=? AND at<?",
                                           (iso(now_utc()), key, iso(now_utc() - timedelta(minutes=10)))).rowcount
                     tries = (con.execute("SELECT tries FROM msg_pending WHERE key=?", (key,)).fetchone() or [0])[0]
                     if claimed and tries >= safety.MAX_TRIES:     # it stopped BSO itself every time: settle it without handling it
@@ -2550,6 +2565,8 @@ def cmd_check(cfg, con, args):
     """Read every inbox for replies. With many inboxes (the BSO Bot) several are read at the same time."""
     senders = [s for s in load_senders(cfg) if s["password"]]
     import safety
+    if safety.expire_pending(con):
+        con.commit()
     print(f"Reading replies in {len(senders)} inbox(es)…", flush=True)
     def one(s, c):
         try:

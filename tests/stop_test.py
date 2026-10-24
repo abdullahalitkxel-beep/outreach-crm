@@ -627,7 +627,9 @@ check(dels and _team.dnc_hash("oops@good.com") in dels[0]["data"]["h"] and not _
 hc4 = sqlite3.connect(str(hub.DB_PATH))
 hc4.row_factory = sqlite3.Row
 hc4.execute("INSERT OR IGNORE INTO dnc(h, at, user_id) VALUES (?, 'x', 1)", (_team.dnc_hash("oops@good.com"),))
-hub_bot.ingest_extra(hc4, 1, dels[0])
+hc4.execute("INSERT OR IGNORE INTO users(id, name, email, username, role, status, pw_hash, created_at, last_seen) "
+            "VALUES (4,'Omar','omar@b.com','omar','owner','active','x','2026-01-01','2026-10-24T00:00:00Z')")
+hub_bot.ingest_extra(hc4, 4, dels[0])                    # the owner's laptop
 hc4.commit()
 check(not hc4.execute("SELECT 1 FROM dnc WHERE h=?", (_team.dnc_hash("oops@good.com"),)).fetchone() and
       hc4.execute("SELECT COUNT(*) FROM notices WHERE user_id=2 AND item LIKE '%dnc_del%'").fetchone()[0] == 1,
@@ -646,5 +648,42 @@ st["dnc_list"] = "old-console"
 _team.save_state(st)
 _team._apply_decisions(con, [{"action": "config", "dnc_list": "new-console"}])
 check(not con.execute("SELECT 1 FROM dnc_reported").fetchone(), "a replaced console gets every stop reported again")
+hc5 = sqlite3.connect(str(hub.DB_PATH))
+hc5.row_factory = sqlite3.Row
+hc5.execute("INSERT OR IGNORE INTO dnc(h, at, user_id) VALUES (?, 'x', 1)", (_team.dnc_hash("keep@stopped.com"),))
+hub_bot.ingest_extra(hc5, 2, {"type": "__dnc_del", "data": {"h": [_team.dnc_hash("keep@stopped.com")]}})     # user 2 is a supervisor
+hc5.commit()
+check(hc5.execute("SELECT 1 FROM dnc WHERE h=?", (_team.dnc_hash("keep@stopped.com"),)).fetchone(),
+      "only the owner can take anyone off the team list: a supervisor's laptop can't, whatever it sends")
+hc5.close()
+
+# an automatic reply's footer, quoted HTML, hostile HTML
+m = EmailMessage()
+m["From"] = "Ooo <ooo2@x.com>"
+m["Subject"] = "Automatic reply: Quick question"
+m["Auto-Submitted"] = "auto-replied"
+m.set_content("I'm out until Monday. To unsubscribe from our newsletter or opt out of marketing emails, click here.")
+check(bot.analyze_reply({}, m, bot.get_full_text(m))["label"] == "out_of_office", "an auto-reply's unsubscribe footer is not a stop request")
+h = EmailMessage()
+h["From"] = "x@y.com"
+h.set_content("x")
+h.add_alternative('<div><div class="gmail_quote">On Mon, A wrote:<blockquote>Hi<br>Not relevant? Reply "unsubscribe" and I won\'t email again.</blockquote></div>'
+                  '<div>Please take me off your list.</div></div>', subtype="html")
+h.get_body(("plain",)).set_content("")
+hh = EmailMessage()
+hh["From"] = "x@y.com"
+hh.add_alternative('<blockquote>Hi<br>Not relevant? Reply "unsubscribe" and I won\'t email again.</blockquote><div>Please take me off your list.</div>', subtype="html")
+check(guard.stop_reason("Re: hi", bot.get_full_text(hh)) == "unsubscribe", "a stop written below a quoted email in an HTML reply is seen")
+evil = EmailMessage()
+evil["From"] = "x@y.com"
+evil.add_alternative("<" * 400_000, subtype="html")
+t0 = time.time()
+bot.get_full_text(evil)
+check(time.time() - t0 < 3, f"hostile HTML can't freeze reply handling ({time.time() - t0:.2f}s)")
+
+con.execute("INSERT INTO msg_pending(key, at, tries, inbox) VALUES ('<gone@x>', '2020-01-01T00:00:00Z', 1, 'gone@x.com')")
+con.commit()
+check(safety.expire_pending(con) >= 1 and not con.execute("SELECT 1 FROM msg_pending WHERE key='<gone@x>'").fetchone(),
+      "an email that vanished while waiting stops blocking its inbox after 24 hours, and a person gets a task")
 _team._post, _team.joined = real_post, real_joined2
 print(f"\nAll {n} stop checks passed.")

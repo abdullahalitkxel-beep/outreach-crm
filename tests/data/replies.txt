@@ -302,3 +302,22 @@ notstop | No more emails needed, just call me
 notstop | Do not contact me before Monday, then I'm free
 notstop | Our current agency doesn't stop sending us junk. Send pricing.
 notstop | Next stop: a call
+# added after the verification audit
+stop | Stop. I'm no longer interested.
+stop | Stop. Not remotely interested.
+stop | I'm not interested, please remove me
+stop | Please do not contact me further
+stop | Please stop sending unsolicited emails to this address
+stop | Please stop the emails
+stop | Stop the emails
+stop | Please stop all communication
+stop | Please don't reach out again
+stop | I do not wish to receive further emails
+stop | Please delete me from your database
+stop | I'd like to opt out of these emails.
+notstop | What's your unsubscribe rate?
+notstop | Unsubscribe links in your emails look broken, fyi. Interested though
+notstop | We want to opt out of our current contract, can you help?
+notstop | Never email me at my old address, use this one. Interested!
+notstop | Please do not contact me again until after the conference
+notstop | Interested, send pricing\n\nNewsletter: Unsubscribe | Manage preferences

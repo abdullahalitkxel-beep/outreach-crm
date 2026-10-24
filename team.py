@@ -1069,9 +1069,11 @@ def _apply_decisions(con, decisions):
                 hs = {str(h)[:16] for h in d.get("h") or []}
                 for h in hs:
                     con.execute("DELETE FROM team_dnc WHERE h=?", (h,))
-                for r in con.execute("SELECT email FROM suppression WHERE reason=?", ("on the team's do-not-contact list",)).fetchall():
-                    if dnc_hash(r["email"]) in hs:
+                con.execute("CREATE TABLE IF NOT EXISTS dnc_reported (email TEXT PRIMARY KEY)")
+                for r in con.execute("SELECT email FROM suppression WHERE reason!='bounced'").fetchall():
+                    if dnc_hash(r["email"]) in hs:     # the owner decided: wherever the stop was recorded, it goes (bounces stay)
                         con.execute("DELETE FROM suppression WHERE email=?", (r["email"],))
+                        con.execute("DELETE FROM dnc_reported WHERE email=?", (r["email"],))
                         con.execute("UPDATE leads SET status='paused' WHERE email=? AND status='unsubscribed'", (r["email"],))
                 con.commit()
                 s2 = state()

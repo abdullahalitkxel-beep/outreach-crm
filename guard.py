@@ -32,7 +32,7 @@ _QUOTE_STARTS = [
     re.compile(r"^\s*Sent from my\s", re.I),                                      # mobile signature: nothing after it is theirs
 ]
 _HEADER_NEXT = re.compile(r"^\s*(Sent|Date|Envoyé|Gesendet|Enviado|Verzonden|Inviato|To|Subject)\s*:", re.I)
-OUR_FOOTER = re.compile(r"(reply\s+[\"“']?unsubscribe[\"”']?\s+and\s+i\s+won'?t\s+email|not relevant\?\s*reply)", re.I)
+OUR_FOOTER = re.compile(r"(reply\s+[\"“”'‘’]?unsubscribe[\"“”'‘’]?\s+and\s+i\s+won['’]?t\s+e-?mail|not relevant\?\s*reply)", re.I)
 
 
 def new_text(body):
@@ -70,8 +70,10 @@ def new_text(body):
 # the same words often mean something else ("we had to stop our vendor", "remove me from the cc", "do not contact me
 # before Monday"). A false stop is permanent and team-wide, so anything unclear is left to the AI and a person.
 STOP_RE = re.compile(
-    r"\b(unsubscribe(?!\s+(me\s+)?from\s+(the\s+|your\s+)?(other|another|newsletter|blog|webinar))|unsubcribe|unsuscribe|"
-    r"opt[\s-]?(me\s)?out\b|"
+    r"\b((please\s|pls\s|kindly\s)?(unsubscribe|unsubcribe|unsuscribe)\s(me|us)\b(?!\s+from\s+(the\s+|your\s+|our\s+)?(other|another|newsletter|blog|webinar))|"
+    r"(i|we)(\swould|['’]d)?\s(like|want|wish|need)\sto\s(unsubscribe|opt[\s-]?out)\b(?!\s+(from|of)\s+(the\s+|your\s+|our\s+)?(other|another|newsletter|blog|webinar|current|contract))|"
+    r"please\s(unsubscribe|opt\sme\sout)\b(?!\s+from\s+(the\s+|your\s+|our\s+)?(other|another|newsletter|blog|webinar))|opt\sme\sout\b|"
+    r"(kindly|please)\sremove\s(me|us)\b(?!\s+from\s+(the\s+|this\s+)?(cc|c\.c\.|thread|copy|loop|chain|email\schain|call|meeting|invite))|"
     r"remove\s(me|us)(?!\s+from\s+(the\s+|this\s+)?(cc|c\.c\.|thread|copy|loop|chain|email\schain|call|meeting|invite))"
     r"(\s+from\s+(your|the|this|all|any|future|further)\s+(list|lists|mailing|mailings|database|e-?mails?|campaigns?|sequence|system|records|"
     r"messages|communications?|(e-?mail|mailing)\slists?))|"
@@ -79,8 +81,7 @@ STOP_RE = re.compile(
     r"take\s(me|us)\s(off|out\sof)\s(your|the|this|all)\s(list|lists|mailing|database|emails?)|"
     r"(?<!n't\s)(?<!not\s)(?<!never\s)(?<!why\sdid\syou\s)stop\s(emailing|e-?mailing|contacting|messaging|spamming|writing\sto)\s(me|us)\b|"
     r"(?<!n't\s)(?<!not\s)(?<!why\sdid\syou\s)stop\ssending\s(me|us)\s+(e-?mails?|these|this|messages|stuff|anything)|"
-    r"(do\s?n[o']?t|never)\s(contact|email|e-mail|write\sto|message)\s(me|us)\s(again|anymore|any\smore|ever)|"
-    r"never\s(email|e-mail|contact|write\sto)\s(me|us)\b|"
+    r"(do\s?n[o']?t|never)\s(contact|email|e-mail|write\sto|message|reach\sout\sto)\s(me|us)\s(again|anymore|any\smore|ever|further)\b(?!\s+(until|before|till|unless|at|on|via|through))|"
     r"(don'?t|do\snot|never)\s(want|wish)\s(to\s)?(hear|receive|get)\s(from\syou|any\s(more\s)?(e-?mails?|messages))|"
     r"(don'?t|do\snot)\swant\s(these|your|any\s(more\s)?)\s?(e-?mails?|messages)|"
     r"no\smore\s(e-?mails?|messages)\sfrom\syou|no\sfurther\s(e-?mails?|contact|messages|communication)\sfrom\syou|"
@@ -88,7 +89,10 @@ STOP_RE = re.compile(
     r"(this\sis|that'?s|it'?s)\s(spam|junk)|report(ed|ing)?\s(you|this|your\s(email|company))(\s(as|to|for))?\s(spam|abuse)|"
     r"mark(ed|ing)?\s((this|you|it|your\semails?)\s)?as\s(spam|junk)|"
     r"already\s(asked|told|requested)\s(you\s)?(to\s)?(stop|remove|unsubscribe|not\sto)|quit\s(emailing|e-?mailing|contacting|messaging)\s(me|us)|"
-    r"(please|pls)\sunsub\b|"
+    r"(please|pls)\sunsub\b|i\s(do\snot|don'?t)\swish\sto\sreceive\s(any\s)?(further|more|any\smore)\s(e-?mails?|messages)|"
+    r"(please\s)?(delete|remove)\sme\sfrom\s(your|the)\s(database|list|mailing\slist|system|records)|"
+    r"(please\s)?stop\s(sending\s)?(unsolicited|these|all|the|your)\s(e-?mails?|messages|communications?)\b(?!\s+(about|for|on|to\sbob))|"
+    r"(please\s)?(don'?t|do\snot)\sreach\sout\s(to\sme\s)?(again|anymore)|"
     # other languages
     r"d[ée]sinscri\w*|d[ée]sabonne[rz](-moi)?|ne\s(me|nous)\s(contactez|[ée]crivez)\splus|ne\sm['’](envoyez|[ée]crivez)\splus|"
     r"je\sne\s(souhaite|veux)\splus\s(recevoir|[eê]tre\scontact)|(arr[eê]tez|cessez)\sde\sm['’](e|é)crire|(arr[eê]tez|cessez)\sde\sm['’]envoyer|"
@@ -104,7 +108,8 @@ STOP_RE = re.compile(
     re.I)
 _SENTENCE = re.compile(
     r"(please\s|pls\s|kindly\s|just\s|i\ssaid\s|(can|could)\syou\s(please\s)?)?stop(\s(it|now|this|that|already|emailing|e-?mails|all\s(the\s)?e-?mails|"
-    r"all\s(of\s)?(this|these)|sending|these|pls|please))?|stopp|"
+    r"all\s(of\s)?(this|these)|sending|these|pls|please|the\se-?mails|all\scommunications?))?|stopp|"
+    r"(please\s)?(don'?t|do\snot)\scontact\sme\sfurther|"
     r"(please\s|pls\s|kindly\s)?(remove|unsubscribe|unsub|opt\sout)(\s(me|us))?(\sfrom\s(your|the|this)\s(list|mailing\slist|database|emails?))?|"
     r"remove\sfrom\s(your|the)\s(list|mailing\slist|database)|take\sme\soff|"
     r"not\sinterested\W+(please\s)?(stop|remove(\sme)?|unsubscribe(\sme)?|(don'?t|do\snot)\sfollow[\s-]?up|no\smore\se-?mails)|"
@@ -131,7 +136,7 @@ LEGAL_RE = re.compile(
 
 def _sentences(text):
     out = []
-    for x in re.split(r"[.!?\n;]+|,\s*(?=(?:stop|remove|unsubscribe|please\sstop|don'?t|do\snot)\b)", text, flags=re.I):
+    for x in re.split(r"[.!?\n;]+|,\s*(?=(?:stop|remove|unsubscribe|please|kindly|don'?t|do\snot|not\sinterested|i'?m\snot)\b)", text, flags=re.I):
         if not x or not x.strip():
             continue
         x = _COURTESY.sub("", x.strip().lower()).strip(" ,-–—:'\"")
@@ -164,7 +169,8 @@ def stop_reason(subject, body):
     hits = [x for x in _sentences(first[:1500]) if _SENTENCE.fullmatch(x)]
     if hits:
         bare = all(re.fullmatch(r"(please\s|pls\s|just\s)?stopp?(\s(it|now))?", x) for x in hits)
-        if bare and _POSITIVE.search(first):
+        negated = re.search(r"\b(no|not|never|no\s+longer|nothing|n't|won'?t|don'?t|isn'?t|aren'?t)\b", first, re.I)
+        if bare and _POSITIVE.search(first) and not negated:
             return None                                      # "Stop. This is exactly what we need": a person reads it
         return "unsubscribe"
     subj = re.sub(r"^\s*((re|aw|fwd?|sv|wg)\s*:\s*)+", "", subject or "", flags=re.I).strip()

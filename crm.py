@@ -437,7 +437,8 @@ def leads_bulk():
                 stop_sequence(con, lid, "stage changed")
         elif action == "pause":
             stop_sequence(con, lid, "bulk action")
-        elif action == "resume" and l["status"] in ("paused", "done"):
+        elif action == "resume" and l["status"] in ("paused", "done") and not (
+                con.execute("SELECT 1 FROM suppression WHERE email=?", (l["email"].lower(),)).fetchone() or bot._on_team_dnc(con, l["email"])):
             con.execute("UPDATE leads SET status='active', next_send_at=COALESCE(next_send_at, ?) WHERE id=?",
                         (iso(now_utc()), lid))
             log_event(con, lid, "sequence", "resumed")

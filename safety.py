@@ -188,6 +188,17 @@ def ensure(con):
         con.execute("INSERT OR REPLACE INTO app_mode(k, v) VALUES ('recovered_errors_v1', ?)", (f"{_iso(_now())} {n} email(s) to read again",))
 
 
+def expire_pending(con):
+    """An email that waited 24 hours without being seen again (deleted, moved): a person gets a task, it stops blocking."""
+    import bot
+    old = con.execute("SELECT key, inbox, error FROM msg_pending WHERE at<?", (_iso(_now() - timedelta(hours=24)),)).fetchall()
+    for r in old:
+        con.execute("DELETE FROM msg_pending WHERE key=?", (r[0],))
+        bot.add_task(con, f"An email in {r[1]} couldn't be handled and has since disappeared from the inbox ({(r[2] or 'no error recorded')[:80]}). "
+                          "Look for it in the mailbox (it may be a stop request).")
+    return len(old)
+
+
 def read_ok(con, email):
     con.execute("INSERT INTO inbox_read(email, ok_at) VALUES (?,?) ON CONFLICT(email) DO UPDATE SET ok_at=excluded.ok_at, error=NULL",
                 (email.lower(), _iso(_now())))
@@ -202,7 +213,8 @@ def unread(con, senders, minutes=READ_FRESH_MIN):
     """{email: why} for inboxes whose replies haven't been read recently. They don't send cold email until they are."""
     cut = _iso(_now() - timedelta(minutes=minutes))
     rows = {r["email"]: r for r in con.execute("SELECT * FROM inbox_read")}
-    pending = {(r[0] or "").lower() for r in con.execute("SELECT DISTINCT inbox FROM msg_pending")}
+    pending = {(r[0] or "").lower() for r in con.execute("SELECT DISTINCT inbox FROM msg_pending WHERE at>?",
+                                                           (_iso(_now() - timedelta(hours=24)),))}
     out = {}
     for s in senders:
         e = s["email"].lower()
