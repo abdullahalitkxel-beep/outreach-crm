@@ -79,8 +79,16 @@ STOP_RE = re.compile(
     r"désinscri\w*|desinscri\w*|ne\s(me|nous)\s(contactez|écrivez)\splus|"
     r"abmelden|nicht\smehr\s(kontaktieren|anschreiben|schreiben)|"
     r"darme\sde\sbaja|darse\sde\sbaja|no\s(me|nos)\s(contacte|escriba)n?|"
-    r"uitschrijven|afmelden|niet\smeer\s(mailen|contacteren))\b",
+    r"uitschrijven|afmelden|niet\smeer\s(mailen|contacteren)|"
+    r"already\s(asked|told|requested)\s(you\s)?(to\s)?(stop|remove|unsubscribe|not\sto)|(kindly|please)\sremove\b|"
+    r"remove\s(this|my|our)\s(e-?mail|address|contact)|quit\s(emailing|e-?mailing|contacting|sending|messaging|writing)|"
+    r"no\sfurther\s(emails?|e-mails?|contact|messages|communication)|"
+    r"keine\s(weiteren\s)?(e-?mails?|mails?|nachrichten|werbung)\s?(mehr)?|bitte\s(austragen|entfernen)|"
+    r"plus\sde\s(mails?|e-?mails?|messages)|no\s(m[aá]s|mas)\s(correos|e-?mails?|mensajes))\b",
     re.I)
+_SHORT_STOP = re.compile(r"\bstop\b", re.I)
+_STOP_NOT = re.compile(r"\b(stop\s(by|in|over)|non-?stop|one-?stop|full\sstop|bus\sstop|(can'?t|won'?t|don'?t|didn'?t|never)\sstop|"
+                       r"stop(ped)?\s(working|growing|selling|hiring|using|the\s(project|work|process))|stop-?gap|pit\sstop)\b", re.I)
 LEGAL_RE = re.compile(
     r"\b(gdpr|ccpa|pecr|can-?spam|data\sprotection\s(act|authority|officer)|ico\b|"
     r"(delete|erase|remove)\s(all\s)?(of\s)?my\s(personal\s)?(data|details|information|info)|right\sto\s(be\sforgotten|erasure)|"
@@ -93,10 +101,17 @@ _ALONE = re.compile(r"^\W*(stop|unsubscribe|remove|remove\sme|opt\sout|optout|un
 def stop_reason(subject, body):
     """'legal' (stop, and a person must look), 'unsubscribe' (stop), or None. Uses only the prospect's new words."""
     text = new_text(body)
+    if len(text) < 3:                                        # written below the quoted email ("bottom posting")
+        lines = (body or "").replace("\r\n", "\n").split("\n")
+        last_q = max((i for i, l in enumerate(lines) if l.lstrip().startswith(">")), default=-1)
+        if last_q >= 0:
+            text = "\n".join(l for l in lines[last_q + 1:] if not OUR_FOOTER.search(l)).strip()
     first = text[:3000]
     if LEGAL_RE.search(first):
         return "legal"
     if STOP_RE.search(first) or _ALONE.match(first.split("\n\n")[0].strip() if first else ""):
+        return "unsubscribe"
+    if len(first) <= 300 and _SHORT_STOP.search(first) and not _STOP_NOT.search(first):    # a short reply that says "stop" means stop
         return "unsubscribe"
     subj = re.sub(r"^\s*((re|aw|fwd?|sv|wg)\s*:\s*)+", "", subject or "", flags=re.I).strip()
     if _ALONE.match(subj) and len(text) < 200:            # our mailto: unsubscribe link sends the subject "unsubscribe"
@@ -238,3 +253,42 @@ COMPLAINT_RE = re.compile(r"\b(spam|junk|report(ed|ing)?\s(you|this|your)|abuse|
 def complaint(subject, body):
     """A stop that reads like a complaint (spam, abuse): counts towards the circuit breaker's complaint rate."""
     return bool(COMPLAINT_RE.search(new_text(body)[:2000] + " " + (subject or "")))
+
+
+# ---------------------------------------------------------------- reading emails safely
+
+import email as _email
+import email.policy as _policy
+
+
+class _TextHeaders(_policy.Compat32):
+    """Headers always come back as text. Mail apps often send non-English subjects unencoded; the standard parser then
+    returns a Header object instead of text, and code that expects text crashes on that one email (a stop request
+    with an accented subject was lost that way)."""
+
+    def header_fetch_parse(self, name, value):
+        v = super().header_fetch_parse(name, value)
+        if isinstance(v, str):
+            return v
+        try:
+            return value.encode("utf-8", "surrogateescape").decode("utf-8")
+        except (UnicodeError, AttributeError):
+            try:
+                return value.encode("latin-1", "surrogateescape").decode("latin-1")
+            except Exception:
+                return str(v)
+
+
+POLICY = _TextHeaders()
+
+
+def parse(raw):
+    """email.message_from_bytes with headers that are always text."""
+    return _email.message_from_bytes(raw, policy=POLICY)
+
+
+def text(v):
+    """Any header value as text (None -> "")."""
+    if v is None:
+        return ""
+    return v if isinstance(v, str) else str(v)

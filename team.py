@@ -623,6 +623,48 @@ def _h(email):
     return hashlib.sha256(("bso-trap:" + str(email or "").strip().lower()).encode()).hexdigest()[:24]
 
 
+def dnc_hash(email):
+    """How an address travels on the team's do-not-contact list: a one-way code, never the address itself."""
+    return hashlib.sha256(("bso-dnc:" + str(email or "").strip().lower()).encode()).hexdigest()[:16]
+
+
+def _dnc_table(con):
+    con.execute("CREATE TABLE IF NOT EXISTS team_dnc (h TEXT PRIMARY KEY, at TEXT)")
+
+
+def apply_dnc(con, hashes, last=False):
+    """The console's do-not-contact list (or new entries on it). Every lead here with one of those addresses stops."""
+    import bot as _bot
+    _dnc_table(con)
+    new = set()
+    for h in hashes or []:
+        h = str(h)[:16]
+        if re.fullmatch(r"[0-9a-f]{16}", h) and con.execute("INSERT OR IGNORE INTO team_dnc(h, at) VALUES (?,?)", (h, iso(now_utc()))).rowcount:
+            new.add(h)
+    stopped = 0
+    if new:
+        for r in con.execute("SELECT DISTINCT lower(email) e FROM leads WHERE status NOT IN ('unsubscribed','bounced')").fetchall():
+            if dnc_hash(r["e"]) in new:
+                _bot.suppress(con, r["e"], "on the team's do-not-contact list")
+                stopped += 1
+    if last:
+        s = state()
+        s["dnc_ready"] = iso(now_utc())
+        save_state(s)
+    con.commit()
+    return stopped
+
+
+def on_team_dnc(con, email):
+    _dnc_table(con)
+    return con.execute("SELECT 1 FROM team_dnc WHERE h=?", (dnc_hash(email),)).fetchone() is not None
+
+
+def dnc_ready():
+    """True once this BSO has the console's whole do-not-contact list (the bot sends no cold email before that)."""
+    return bool(state().get("dnc_ready"))
+
+
 def is_trap(addr):
     """Trap contacts are planted by the master console to detect copied lists. BSO never emails them."""
     traps = set(state().get("traps") or [])
@@ -924,7 +966,8 @@ def _leads_in(con, d):
         if mid:
             add_task(con, f"Continue or restart the sequence for {r.get('first_name') or email} (moved from {who}, {step} email(s) already sent)", lead_id=lid)
     for e in d.get("suppress") or []:
-        con.execute("INSERT OR IGNORE INTO suppression(email, reason, at) VALUES (?,?,?)", (e, f"do-not-contact from {who}", iso(now_utc())))
+        import bot as _bot
+        _bot.suppress(con, e, f"do-not-contact from {who}")
     con.commit()
 
 
@@ -1000,6 +1043,18 @@ def _apply_decisions(con, decisions):
                 ok = False
             if ok and d.get("handover_id"):
                 ho_done.append(d["handover_id"])
+            continue
+        if action == "dnc":
+            hid = d.get("handover_id")
+            if hid not in state().get("ho_seen", []):
+                n = apply_dnc(con, d.get("h") or [], bool(d.get("last")))
+                if n:
+                    print(f"Team do-not-contact list: {n} lead(s) here stopped")
+                s2 = state()
+                s2["ho_seen"] = (s2.get("ho_seen", []) + [hid])[-1000:]
+                save_state(s2)
+            if hid:
+                ho_done.append(hid)
             continue
         if action in ("wipe", "canary"):
             hid = d.get("handover_id")
@@ -1196,6 +1251,12 @@ def _sync(con, version=""):
         packed += [{"id": f"t{t['part']}", "type": "__transfer", "data": _tr(t)} for t in tq]
         if s.get("away_pending"):
             packed.append({"id": "away", "type": "__away", "data": {"until": s.get("away_until", "")}})
+        dnc_rows = con.execute("SELECT rowid, email FROM suppression WHERE rowid>? ORDER BY rowid LIMIT 2000",
+                               (int(s.get("dnc_sent") or 0),)).fetchall()
+        if dnc_rows:
+            packed.append({"id": "dnc", "type": "__dnc", "data": {"h": [dnc_hash(r["email"]) for r in dnc_rows]}})
+        if not s.get("dnc_ready") and (not s.get("dnc_req_at") or s["dnc_req_at"] < iso(now_utc() - timedelta(minutes=10))):
+            packed.append({"id": "dnq", "type": "__dnc_req", "data": {}})
         _access_table(con)
         acc = con.execute("SELECT * FROM access_log WHERE synced=0 ORDER BY id LIMIT 50").fetchall()
         dev = s.get("device_tag") or secrets.token_hex(4)
@@ -1239,6 +1300,10 @@ def _sync(con, version=""):
         s.pop("report_due", None)
     if any(p.get("type") == "__device" for p in packed):
         s["device_sent"] = iso(now_utc())
+    if dnc_rows:
+        s["dnc_sent"] = dnc_rows[-1]["rowid"]
+    if any(p.get("type") == "__dnc_req" for p in packed):
+        s["dnc_req_at"] = iso(now_utc())
     if events:
         s["last_event_id"] = events[-1]["id"]
     s["drafts_sent"] = sorted(set(s.get("drafts_sent", [])) | {d["id"] for d in drafts})[-2000:]

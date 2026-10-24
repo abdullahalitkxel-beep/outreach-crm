@@ -12,6 +12,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 
+import guard
 import sealbox
 
 SCHEMA = """
@@ -259,7 +260,7 @@ def check_archive_box(con, conf, password, people, own_domains, allow_domains, g
     raws = fetcher() if fetcher else _fetch_box(conf, password)
     found = 0
     for raw in raws:
-        msg = _email.message_from_bytes(raw)
+        msg = guard.parse(raw)
         mid = (msg.get("Message-ID") or "").strip()
         if not mid or con.execute("SELECT 1 FROM archive_box_seen WHERE msg_id=?", (mid,)).fetchone():
             continue

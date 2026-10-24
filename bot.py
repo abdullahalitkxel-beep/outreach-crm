@@ -33,6 +33,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 import yaml
+
+import guard
 from dotenv import load_dotenv
 
 # ROOT = where the code (and default config.yaml) lives.
@@ -339,7 +341,7 @@ def sync_mode(con, cfg):
     if row and row[0] == want:
         return
     if row and row[0] == "1" and want == "0":
-        clear_test_results(con)
+        clear_test_results(con, (cfg.get("test_mode") or {}).get("redirect_to"))
     if not row:
         _adopt_old_tests(con)
     con.execute("INSERT INTO app_mode(k, v) VALUES ('test', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (want,))
@@ -362,7 +364,7 @@ def test_counts(con):
             "events": con.execute("SELECT COUNT(*) FROM test_rows WHERE tbl='events'").fetchone()[0]}
 
 
-def clear_test_results(con):
+def clear_test_results(con, tester=None):
     """Put every lead back as it was before test mode touched it and remove what the test added. Returns leads restored."""
     was = con.execute("SELECT v FROM app_mode WHERE k='test'").fetchone()
     con.execute("UPDATE app_mode SET v='0' WHERE k='test'")      # so the restore itself isn't recorded
@@ -373,11 +375,32 @@ def clear_test_results(con):
         if data:
             con.execute(f"UPDATE leads SET {', '.join(k + '=?' for k in data)} WHERE id=?", (*data.values(), r["lead_id"]))
             n += 1
+    # Real people can reply, bounce or unsubscribe while test mode is on (to emails sent before it). Those are kept:
+    # only stops caused by a test reply ("[TEST for ...]" in the subject) are undone.
+    rows = con.execute("SELECT r.frm, r.subject, l.email FROM received r LEFT JOIN leads l ON l.id=r.lead_id "
+                       "WHERE r.rowid IN (SELECT CAST(rid AS INTEGER) FROM test_rows WHERE tbl='received')").fetchall()
+    tester = (tester or "").lower()
+    def is_test(r):                    # your own reply in a test thread, or anything tagged [TEST for ...]
+        frm = (r["frm"] or "").lower()
+        return "[TEST for" in (r["subject"] or "") or (tester and frm == tester) or (not tester and frm != (r["email"] or "").lower())
+    test_emails = {(r["email"] or "").lower() for r in rows if is_test(r)}
+    real_emails = {x.lower() for r in rows if not is_test(r) for x in (r["frm"] or "", r["email"] or "") if x}
     for t in TEST_TRACKED:
         if t == "suppression":
-            con.execute("DELETE FROM suppression WHERE email IN (SELECT rid FROM test_rows WHERE tbl='suppression')")
+            for r in con.execute("SELECT rid FROM test_rows WHERE tbl='suppression'").fetchall():
+                e = (r[0] or "").lower()
+                if e in test_emails and e not in real_emails:
+                    con.execute("DELETE FROM suppression WHERE email=?", (e,))
+        elif t == "received":
+            for r in con.execute("SELECT r.rowid, r.frm, r.subject, l.email FROM received r LEFT JOIN leads l ON l.id=r.lead_id "
+                                 "WHERE r.rowid IN (SELECT CAST(rid AS INTEGER) FROM test_rows WHERE tbl='received')").fetchall():
+                if is_test(r):
+                    con.execute("DELETE FROM received WHERE rowid=?", (r[0],))
         else:
             con.execute(f"DELETE FROM {t} WHERE rowid IN (SELECT CAST(rid AS INTEGER) FROM test_rows WHERE tbl=?)", (t,))
+    for r in con.execute("SELECT email, reason FROM suppression").fetchall():      # every stop that stands stays applied to its leads
+        con.execute("UPDATE leads SET status=? WHERE lower(email)=? AND status NOT IN ('unsubscribed','bounced')",
+                    ("bounced" if r["reason"] == "bounced" else "unsubscribed", r["email"]))
     con.execute("DELETE FROM test_snapshot")
     con.execute("DELETE FROM test_rows")
     if was:
@@ -423,10 +446,30 @@ def cancel_drafts(con, lead_id):
 
 
 def suppress(con, addr, reason):
+    """Put an address on do-not-contact, and stop every lead with that address at once (sequence, drafts)."""
+    addr = (addr or "").lower().strip()
+    if not addr:
+        return
     con.execute(
         "INSERT OR IGNORE INTO suppression(email, reason, at) VALUES (?,?,?)",
-        (addr.lower(), reason, iso(now_utc())),
+        (addr, reason, iso(now_utc())),
     )
+    new = "bounced" if reason == "bounced" else "unsubscribed"
+    for r in con.execute("SELECT id FROM leads WHERE lower(email)=? AND status NOT IN ('unsubscribed','bounced')", (addr,)).fetchall():
+        con.execute("UPDATE leads SET status=? WHERE id=?", (new, r[0]))
+        cancel_drafts(con, r[0])
+
+
+def _on_team_dnc(con, addr):
+    try:
+        import team
+        return team.joined() and team.on_team_dnc(con, addr)
+    except Exception:
+        return False
+
+
+class Skipped(Exception):
+    """Not sent on purpose: the lead stopped (replied, unsubscribed...) after this round picked it."""
 
 
 # ---------------------------------------------------------------- senders
@@ -815,7 +858,8 @@ def render(template, lead, sender, cfg):
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def send_email(sender, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None):
+def send_email(sender, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None,
+               statuses=("active",)):
     """key: a name for this one email (e.g. "lead12-step2"). With a key the email is written in the send journal before
     the mail server is contacted, and a key that was already sent is never sent again (its first Message-ID is returned)."""
     try:
@@ -849,6 +893,11 @@ def send_email(sender, to, subject, body, in_reply_to=None, dry_run=False, cc=No
         print(body)
         return msg_id
 
+    if lead_id is not None:                  # the last check, right before the mail server: did they stop in the meantime?
+        import safety
+        why = safety.why_not_send(lead_id, statuses)
+        if why:
+            raise Skipped(why)
     if key:
         import safety
         earlier = safety.before_send(key, msg_id, sender["email"], to, subject)
@@ -893,9 +942,11 @@ def send_key(lead, idx, redirect=None):
     return f"lead{lead['id']}-c{lead.get('campaign_id') or 1}-s{idx}-{lead.get('next_send_at') or ''}" + ("-test" if redirect else "")
 
 
-def unsub_headers(con, sender, lead):
+def unsub_headers(con, sender, lead, test=False):
     try:
         import safety
+        if test:                      # a test email goes to you: its unsubscribe button must never stop the real lead
+            return {"List-Unsubscribe": f"<mailto:{sender['email']}?subject=unsubscribe>"}
         return safety.unsub_headers(con, sender["email"], lead["email"])
     except Exception as e:
         log.warning("Unsubscribe link not added: %s", e)
@@ -1208,14 +1259,14 @@ def _autopilot_round(cfg, con, args, due, for_campaign, usable, capacity, limits
         p["full_body"] = full_body
         p["to"], p["shown"] = (redirect, f"[TEST for {lead['email']}] {p['subject']}") if redirect else (lead["email"], p["subject"])
         p["key"] = send_key(lead, idx, redirect)
-        p["headers"] = unsub_headers(con, sender, lead)
+        p["headers"] = unsub_headers(con, sender, lead, bool(redirect))
         to_send.append(p)
     con.commit()
 
     def deliver(p):
         try:
             return send_email(p["sender"], p["to"], p["shown"], p["full_body"], p["lead"]["first_msg_id"] if p["idx"] > 0 else None, False,
-                              headers=p["headers"], key=p["key"]), None
+                              headers=p["headers"], key=p["key"], lead_id=p["lead"]["id"]), None
         except Exception as e:
             return None, e
     if to_send:
@@ -1225,6 +1276,12 @@ def _autopilot_round(cfg, con, args, due, for_campaign, usable, capacity, limits
         results = []
     for p, (msg_id, err) in zip(to_send, results):
         lead, idx, sender, steps = p["lead"], p["idx"], p["sender"], p["steps"]
+        if isinstance(err, Skipped):
+            print(f"Not sent to {lead['email']}: {err}")
+            if p["draft"]:
+                con.execute("UPDATE outbox SET status='cancelled', decided_at=? WHERE id=? AND status IN ('pending','approved')",
+                            (iso(now_utc()), p["draft"]["id"]))
+            continue
         if err is not None:
             if isinstance(err, smtplib.SMTPAuthenticationError):
                 guard_login(cfg, con, sender["email"], False)
@@ -1246,7 +1303,8 @@ def _autopilot_round(cfg, con, args, due, for_campaign, usable, capacity, limits
         nxt = idx + 1
         next_at, status = (iso(now_utc() + timedelta(days=steps[nxt]["delay_days"])), "active") if nxt < len(steps) else (None, "done")
         con.execute("UPDATE leads SET step=?, sender=?, next_send_at=?, status=?, first_msg_id=COALESCE(first_msg_id, ?), "
-                    "first_subject=COALESCE(first_subject, ?) WHERE id=?", (nxt, sender["email"], next_at, status, msg_id, p["subject"], lead["id"]))
+                    "first_subject=COALESCE(first_subject, ?) WHERE id=? AND status='active'",      # a stop that arrived meanwhile stays
+                    (nxt, sender["email"], next_at, status, msg_id, p["subject"], lead["id"]))
         log_event(con, lead["id"], "sent", f"step {idx + 1}" + (" (test)" if redirect else "") + (" (sent on its own)" if p["alone"] else ""),
                   sender["email"], p["variant"])
         if lead["stage"] == "new":
@@ -1274,6 +1332,11 @@ def cmd_run(cfg, con, args):
         if not ok:
             print("PROBLEM:", why)
             sys.exit(1)
+        if team_mod.joined() and team_mod.works_as_bot() and not team_mod.dnc_ready() and \
+                (cfg.get("team_dnc") or {}).get("required", True):
+            print("Waiting for the team's do-not-contact list from the Master Console before sending cold email "
+                  "(it arrives with the next check-ins; the Master Console must be on this version or later).")
+            return
     ap_on = autopilot.active(cfg) and not args.dry_run
     if ap_on:
         try:
@@ -1379,6 +1442,7 @@ def cmd_run(cfg, con, args):
     due = con.execute(
         "SELECT l.* FROM leads l LEFT JOIN campaigns c ON c.id=COALESCE(l.campaign_id,1) "
         "WHERE l.status='active' AND l.next_send_at<=? AND COALESCE(c.status,'active')='active' "
+        "AND NOT EXISTS (SELECT 1 FROM suppression s WHERE s.email=lower(l.email)) "
         "ORDER BY l.step DESC, COALESCE(l.fit_score, 50) DESC, l.id LIMIT ?",  # running sequences first, then the likeliest new leads; paused campaigns wait
         (iso(now_utc()), args.limit if not ap_on else max(args.limit, 400, 3 * len(senders))),
     ).fetchall()
@@ -1545,8 +1609,17 @@ def cmd_run(cfg, con, args):
             if sent > 0 and not args.dry_run:
                 time.sleep(random.uniform(lo, hi))  # human-ish pacing
             try:
+                con.commit()
                 msg_id = send_email(sender, to, shown_subject, full_body, reply_to, args.dry_run,
-                                    headers=None if args.dry_run else unsub_headers(con, sender, lead), key=send_key(lead, idx, redirect))
+                                    headers=None if args.dry_run else unsub_headers(con, sender, lead, bool(redirect)), key=send_key(lead, idx, redirect),
+                                    lead_id=None if args.dry_run else lead["id"])
+            except Skipped as e:
+                print(f"Not sent to {lead['email']}: {e}")
+                if draft:
+                    con.execute("UPDATE outbox SET status='cancelled', decided_at=? WHERE id=? AND status IN ('pending','approved')",
+                                (iso(now_utc()), draft["id"]))
+                con.commit()
+                continue
             except smtplib.SMTPAuthenticationError as e:
                 log.error("Login failed for %s: %s — skipping this inbox", sender["email"], e)
                 capacity[sender["email"]] = 0
@@ -1590,7 +1663,7 @@ def cmd_run(cfg, con, args):
             con.execute(
                 "UPDATE leads SET step=?, sender=?, next_send_at=?, status=?, "
                 "first_msg_id=COALESCE(first_msg_id, ?), first_subject=COALESCE(first_subject, ?) "
-                "WHERE id=?",
+                "WHERE id=? AND status='active'",                       # a stop that arrived meanwhile stays
                 (nxt, sender["email"], next_at, status, msg_id, subject, lead["id"]),
             )
             log_event(con, lead["id"], "sent", f"step {idx + 1}" + (" (test)" if redirect else "") + (" (sent on its own)" if alone and ap_on else ""),
@@ -1684,7 +1757,14 @@ def nurture_tick(cfg, con, senders, redirect):
             continue
         to, subj = (redirect, f"[TEST for {lead['email']}] {d['subject']}") if redirect else (lead["email"], d["subject"])
         body = d["body"] + "\n\n" + render(cfg.get("footer") or "", lead, sender, cfg)
-        mid = send_email(sender, to, subj, body, lead.get("first_msg_id"), headers=unsub_headers(con, sender, lead), key=f"outbox{d['id']}")
+        con.commit()
+        try:
+            mid = send_email(sender, to, subj, body, lead.get("first_msg_id"), headers=unsub_headers(con, sender, lead, bool(redirect)), key=f"outbox{d['id']}",
+                             lead_id=lead["id"], statuses=("nurture", "active", "replied", "done"))
+        except Skipped as e:
+            print(f"Check-back email to {lead['email']} not sent: {e}")
+            con.execute("UPDATE outbox SET status='cancelled' WHERE id=?", (d["id"],))
+            continue
         convo.record_sent(con, mid, lead, "reconnect", sender["email"], to, subj, body, test=bool(redirect))
         con.execute("UPDATE outbox SET status='sent', sent_at=? WHERE id=?", (iso(now_utc()), d["id"]))
         con.execute("UPDATE leads SET check_back=NULL WHERE id=?", (lead["id"],))
@@ -2267,9 +2347,20 @@ def _junk_folder(M):
 def process_inbox(cfg, con, sender, recheck=False, days=None):
     """Read new messages in one inbox (and its Spam folder, for replies to BSO's own threads). Returns how many were new.
     recheck=True looks again at everything from the last `days` days that hasn't been handled as a reply yet."""
+    import safety
     n_new = 0
-    since = (datetime.now() - timedelta(days=days or cfg.get("reply_lookback_days", 14))).strftime("%d-%b-%Y")
-    M = imaplib.IMAP4_SSL(sender["imap_host"], sender.get("imap_port", 993))
+    back = days or cfg.get("reply_lookback_days", 14)
+    if not days:                                   # after a long outage: read from the last successful read, not a fixed window
+        r = con.execute("SELECT ok_at FROM inbox_read WHERE email=?", (sender["email"].lower(),)).fetchone()
+        if r and r[0]:
+            try:
+                gap = (now_utc() - datetime.fromisoformat(r[0].replace("Z", "+00:00"))).days + 2
+                back = min(max(back, gap), 120)
+            except ValueError:
+                pass
+    since = (datetime.now() - timedelta(days=back)).strftime("%d-%b-%Y")
+    failed = []
+    M = imaplib.IMAP4_SSL(sender["imap_host"], sender.get("imap_port", 993), timeout=60)
     try:
         M.login(sender.get("username", sender["email"]), sender["password"])
         folders = ["INBOX"]
@@ -2288,15 +2379,25 @@ def process_inbox(cfg, con, sender, recheck=False, days=None):
             for uid in (data[0].split() if data and data[0] else []):
                 # cheap header fetch first; full body only for new messages
                 _, hdr = M.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT)])")
-                head = email.message_from_bytes(hdr[0][1]) if hdr and hdr[0] and isinstance(hdr[0], tuple) else {}
+                head = guard.parse(hdr[0][1]) if hdr and hdr[0] and isinstance(hdr[0], tuple) else {}
                 mid = (head.get("Message-ID") or "").strip()
                 key = mid or f"{sender['email']}:{label}:{uid.decode()}"
                 if "[TEST for" in str(head.get("Subject") or ""):
                     key = "t:" + key                 # test replies are matched differently since v1.0.45: look at them once more
-                # claim it first, so the live reply watcher and a run never handle the same message twice
+                # claim it first, so the live reply watcher and a run never handle the same message twice. The claim is
+                # "pending" until the message is handled: a crash or an error in between means it is read again later.
                 claimed = con.execute("INSERT OR IGNORE INTO seen_messages VALUES (?)", (key,)).rowcount
+                if claimed:
+                    con.execute("INSERT OR REPLACE INTO msg_pending(key, at, tries, inbox) VALUES (?,?,0,?)", (key, iso(now_utc()), sender["email"]))
+                else:
+                    stale = con.execute("SELECT tries FROM msg_pending WHERE key=? AND at<?", (key, iso(now_utc() - timedelta(minutes=10)))).fetchone()
+                    if stale is not None:              # claimed earlier but never finished (crash, or an error): take it over
+                        claimed = 1
+                        con.execute("UPDATE msg_pending SET at=? WHERE key=?", (iso(now_utc()), key))
                 con.commit()                         # always end the transaction, or other readers of this inbox would wait
                 if not claimed:
+                    if con.execute("SELECT 1 FROM msg_pending WHERE key=?", (key,)).fetchone():
+                        continue                     # another reader is on it right now
                     if not recheck or not mid:
                         continue
                     done_before = con.execute("SELECT 1 FROM received WHERE msg_id=?", (mid,)).fetchone() or con.execute(
@@ -2305,15 +2406,16 @@ def process_inbox(cfg, con, sender, recheck=False, days=None):
                     if done_before:
                         continue
                 _, full = M.uid("fetch", uid, "(BODY.PEEK[])")
-                msg = email.message_from_bytes(full[0][1])
+                msg = guard.parse(full[0][1])
                 try:
                     handle_message(cfg, con, sender, msg, label)
+                    con.execute("DELETE FROM msg_pending WHERE key=?", (key,))
                     con.commit()
                 except Exception as e:
                     con.rollback()
                     log.error("Couldn't handle a message in %s: %s", sender["email"], e)
-                    import convo
-                    convo.log_inbox(con, sender["email"], msg, f"error: {e}"[:200], None, label)
+                    if safety.message_failed(cfg, con, sender, key, msg, e):
+                        failed.append(str(e)[:120])  # tried again later; until then this inbox doesn't count as read
                     con.commit()
                 n_new += 1
     finally:
@@ -2321,6 +2423,8 @@ def process_inbox(cfg, con, sender, recheck=False, days=None):
             M.logout()
         except Exception:
             pass
+    if failed:
+        raise RuntimeError(f"{len(failed)} email(s) couldn't be handled yet and will be read again ({failed[0]})")
     return n_new
 
 
@@ -2444,6 +2548,8 @@ def add_lead(con, row, status="active", why=None):
         reason = "shared inbox (e.g. info@, hello@)"
     elif con.execute("SELECT 1 FROM suppression WHERE email=?", (addr,)).fetchone():
         reason = "on do-not-contact list"
+    elif _on_team_dnc(con, addr):
+        reason = "on the team's do-not-contact list"
     elif con.execute("SELECT 1 FROM leads WHERE email=?", (addr,)).fetchone():
         reason = "already in CRM"
     if reason:

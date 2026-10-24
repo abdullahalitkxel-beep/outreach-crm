@@ -1572,6 +1572,30 @@ def bot_argv(cmd, max_leads=None, force=False):
     return argv
 
 
+JOB_MAX_MINUTES = 90        # a run that takes longer than this is stuck (a frozen mail server): it is stopped and marked failed
+PROCS = {}                  # job id -> process, for runs started by this app
+
+
+def clear_stale_jobs(con=None):
+    """Runs left "running" by a crash, a power cut, an update restart or a restored backup are closed as interrupted.
+    Without this one leftover row blocks every later run, for good."""
+    own = con is None
+    con = con or db_connect(load_config(CONFIG_PATH).get("database", "outreach.db"))
+    try:
+        mine = list(PROCS)
+        q = "UPDATE jobs SET status='failed', finished_at=?, output=COALESCE(output,'') || ? WHERE status='running'"
+        args = [iso(now_utc()), "\n(interrupted: BSO was closed or restarted during this run)"]
+        if mine:
+            q += f" AND id NOT IN ({','.join('?' * len(mine))})"
+            args += mine
+        n = con.execute(q, args).rowcount
+        con.commit()
+        return n
+    finally:
+        if own:
+            con.close()
+
+
 def _run_job(job_id, argv):
     """Run a bot command as a separate process, streaming its output (via a log file) into the jobs table."""
     import time as _t
@@ -1586,8 +1610,17 @@ def _run_job(job_id, argv):
         p = subprocess.Popen(argv, cwd=DATA, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, creationflags=flags,
                              env={**os.environ, "PYTHONUNBUFFERED": "1", "OUTREACH_JOB_LOG": str(log)})
+        PROCS[job_id] = p
+        started = _t.time()
         while True:
             done = p.poll() is not None
+            if not done and (_t.time() - started > JOB_MAX_MINUTES * 60 or STOP_JOBS.pop(job_id, False)):
+                why = "stopped by you" if _t.time() - started <= JOB_MAX_MINUTES * 60 else f"stopped after {JOB_MAX_MINUTES} minutes (stuck)"
+                p.kill()
+                p.wait(timeout=30)
+                with open(log, "a", encoding="utf-8") as f:
+                    f.write(f"\nPROBLEM: run {why}. Emails already sent are recorded; the next run carries on.\n")
+                done = True
             con.execute("UPDATE jobs SET output=? WHERE id=?",
                         (log.read_text(encoding="utf-8", errors="replace")[-20000:], job_id))
             con.commit()
@@ -1598,6 +1631,8 @@ def _run_job(job_id, argv):
     except Exception as e:
         with open(log, "a", encoding="utf-8") as f:
             f.write(f"\n{e}")
+    finally:
+        PROCS.pop(job_id, None)
     out = log.read_text(encoding="utf-8", errors="replace")[-20000:]
     con.execute("UPDATE jobs SET status=?, output=?, finished_at=? WHERE id=?",
                 (status, out or "(no output)", iso(now_utc()), job_id))
@@ -1605,8 +1640,12 @@ def _run_job(job_id, argv):
     con.close()
 
 
+STOP_JOBS = {}
+
+
 def start_job(con, cmd, max_leads=None):
     """Start a bot run in the background. Returns (job_id, already_running)."""
+    clear_stale_jobs(con)                     # a "running" row no process of this app is running is a leftover
     running = con.execute("SELECT id FROM jobs WHERE status='running'").fetchone()
     if running:
         return running["id"], True
@@ -1719,6 +1758,15 @@ def _autorun_loop():
                 last = _t.time()
         except Exception as e:  # never let the timer die
             print("autorun:", e)
+
+
+@app.post("/jobs/<int:job_id>/stop")
+def job_stop(job_id):
+    if job_id in PROCS:
+        STOP_JOBS[job_id] = True
+    else:
+        clear_stale_jobs()
+    return redirect(url_for("job", job_id=job_id))
 
 
 @app.route("/jobs/<int:job_id>")
@@ -2240,7 +2288,7 @@ def save_replies():
 
 @app.post("/settings/test/clear")
 def clear_test():
-    n = bot.clear_test_results(db())
+    n = bot.clear_test_results(db(), (cfg().get("test_mode") or {}).get("redirect_to"))
     return redirect(url_for("settings", tab="safety", result=f"Test results cleared: {n} lead(s) are back as they were before testing.", ok=1))
 
 

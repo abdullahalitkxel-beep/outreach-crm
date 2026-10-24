@@ -9,7 +9,7 @@ import json
 import math
 import re
 import zipfile
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from flask import abort, g, redirect, request, send_file, url_for
 
@@ -58,6 +58,24 @@ def ingest_extra(con, uid, e):
         rp = H.open_team(d.get("box")) if d.get("box") else d
         if isinstance(rp, dict):
             con.execute("UPDATE users SET bot_report=? WHERE id=?", (json.dumps(rp)[:2_000_000], uid))
+        return True
+    if t == "__dnc":                                   # new do-not-contact codes from a laptop: kept here, passed to everyone else
+        con.execute("CREATE TABLE IF NOT EXISTS dnc (h TEXT PRIMARY KEY, at TEXT, user_id INTEGER)")
+        new = [h for h in ((e.get("data") or {}).get("h") or [])[:5000]
+               if isinstance(h, str) and len(h) == 16 and all(c in "0123456789abcdef" for c in h)
+               and con.execute("INSERT OR IGNORE INTO dnc(h, at, user_id) VALUES (?,?,?)", (h, H.iso(), uid)).rowcount]
+        if new:
+            for u in con.execute("SELECT id FROM users WHERE id!=? AND status NOT IN ('removed','disabled')", (uid,)).fetchall():
+                con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)", (u["id"], json.dumps({"action": "dnc", "h": new})))
+        return True
+    if t == "__dnc_req":                               # a laptop that doesn't have the whole list yet (new, rebuilt or restored)
+        con.execute("CREATE TABLE IF NOT EXISTS dnc (h TEXT PRIMARY KEY, at TEXT, user_id INTEGER)")
+        if not con.execute("SELECT 1 FROM notices WHERE user_id=? AND delivered=0 AND item LIKE ?", (uid, '{"action": "dnc"%"last": true%')).fetchone():
+            allh = [r["h"] for r in con.execute("SELECT h FROM dnc ORDER BY rowid")]
+            chunks = [allh[i:i + 3000] for i in range(0, len(allh), 3000)] or [[]]
+            for i, ch in enumerate(chunks):
+                con.execute("INSERT INTO notices(user_id, item) VALUES (?,?)",
+                            (uid, json.dumps({"action": "dnc", "h": ch, "last": i == len(chunks) - 1})))
         return True
     if t == "__device":
         info = e.get("data") or {}
@@ -120,6 +138,59 @@ def watch(con):
         con.execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)",
                     (H.iso(), "console", "bot_silent", f"{u['name']} last seen {u['last_seen']}"))
         con.commit()
+    for u in bots(con):                     # online but sending nothing: a stuck run, every inbox paused, the kill switch...
+        why = not_sending(u)
+        if not why:
+            continue
+        key = f"nosend_{u['id']}"
+        last = H._m_get(con, key) or ""
+        if last and H.parse(last) and H.now() - H.parse(last) < timedelta(hours=6):
+            continue
+        H._m_set(con, key, H.iso())
+        owner = con.execute("SELECT email FROM users WHERE role='owner' LIMIT 1").fetchone()
+        try:
+            if owner:
+                H.send_mail(owner["email"], f"BSO Bot not sending: {u['name']}",
+                            f"The BSO Bot \"{u['name']}\" is online but hasn't sent an email for over 3 hours while leads are waiting.\n\n{why}\n\n"
+                            "Open Master Console → BSO Bot to see why (\"Why not more emails today?\").")
+        except Exception as e:
+            print("bot not-sending alert:", e)
+        con.execute("INSERT INTO audit(at, actor, action, detail) VALUES (?,?,?,?)", (H.iso(), "console", "bot_not_sending", f"{u['name']}: {why}"[:500]))
+        con.commit()
+
+
+def not_sending(u, hours=3, loc=None):
+    """Why an online bot is not sending (None when it's fine, off-hours, in test mode or has nothing due)."""
+    if u["status"] != "active" or not u["last_seen"] or not u["bot_report"]:
+        return None
+    ts = H.parse(u["last_seen"])
+    if not ts or H.now() - ts > timedelta(hours=2):
+        return None                                       # silent altogether: the other alert covers it
+    try:
+        rp = json.loads(u["bot_report"])
+    except ValueError:
+        return None
+    if rp.get("test_mode") or not rp.get("due_now"):
+        return None
+    loc = loc or datetime.now()
+    if loc.weekday() >= 5 or not (9 <= loc.hour < 18):
+        return None
+    last = H.parse(rp.get("last_sent_at") or "") if rp.get("last_sent_at") else None
+    if last and H.now() - last < timedelta(hours=hours):
+        return None
+    lr = rp.get("last_run") or {}
+    parts = [f"{rp.get('due_now')} lead(s) are due."]
+    if rp.get("killed"):
+        parts.append(f"Sending is stopped: {rp.get('killed_why') or 'kill switch on'}.")
+    if lr.get("status") == "running" and lr.get("started_at") and H.parse(lr["started_at"]) and H.now() - H.parse(lr["started_at"]) > timedelta(hours=2):
+        parts.append(f"A run has been 'running' since {lr['started_at'][:16]} UTC: it is probably stuck. Restart BSO on the bot laptop.")
+    if rp.get("breakers"):
+        parts.append(f"{len(rp['breakers'])} campaign(s) or list(s) paused by the safety breaker.")
+    paused = [i for i in rp.get("inboxes") or [] if i.get("paused")]
+    if paused:
+        parts.append(f"{len(paused)} of {len(rp.get('inboxes') or [])} inboxes are paused.")
+    parts += [f"Why not more emails: {w[1] if isinstance(w, (list, tuple)) else w}" for w in (rp.get("why_not") or [])[:3]]
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------- the bot page

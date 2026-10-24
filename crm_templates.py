@@ -736,7 +736,8 @@ JOB = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title
 <div class="card"><div class="card-h"><h2>{{ m.status_badge(j.status, {'running':'Running…','ok':'Finished','failed':'Failed'}) }}</h2><span class="muted">started {{ j.started_at[:19].replace('T',' ') }} UTC</span></div>
 <div class="card-b">{% for p in problems %}<div class="toast err">⚠️ {{ p }}</div>{% endfor %}
 {% if problems and 'Settings' in problems|join %}<p><a class="btn brand" href="{{ url_for('settings') }}">Open Settings</a></p>{% endif %}
-{% if j.status == 'running' %}<p class="muted">This page refreshes itself until the run finishes. Sending can take a few minutes because emails are spaced out on purpose.</p>{% endif %}
+{% if j.status == 'running' %}<p class="muted">This page refreshes itself until the run finishes. Sending can take a few minutes because emails are spaced out on purpose.</p>
+<form method="post" action="{{ url_for('job_stop', job_id=j.id) }}" onsubmit="return confirm('Stop this run? Emails already sent are recorded; the next run carries on.')"><button class="btn">■ Stop this run</button></form>{% endif %}
 {% if j.cmd == 'run' %}<h3 style="font-size:14px;margin:4px 0 6px">Sent in this run ({{ sent_now|length }}){% if j.status == 'running' %} <span class="muted">· updating live</span>{% endif %}</h3>
 {% if sent_now %}<div class="scroll" style="max-height:340px;margin-bottom:10px"><table class="tbl"><thead><tr><th>Time (UTC)</th><th>To</th><th>Email</th><th>From inbox</th><th></th></tr></thead>
 {% for t in sent_now %}<tr><td class="nowrap muted">{{ t.at[11:19] }}</td><td>{{ t.first_name or '' }} <span class="muted">&lt;{{ t.lead_email }}&gt;</span>{% if t.company %}<br><small class="muted">{{ t.company }}</small>{% endif %}{% if t.test %} <span class="badge">TEST: went to your inbox</span>{% endif %}</td>

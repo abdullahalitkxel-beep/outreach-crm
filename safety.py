@@ -175,6 +175,7 @@ def ensure(con):
     con.executescript("""
     CREATE TABLE IF NOT EXISTS inbox_read (email TEXT PRIMARY KEY, ok_at TEXT, fail_at TEXT, error TEXT);
     CREATE TABLE IF NOT EXISTS unsub_tokens (token TEXT PRIMARY KEY, email TEXT UNIQUE, at TEXT);
+    CREATE TABLE IF NOT EXISTS msg_pending (key TEXT PRIMARY KEY, at TEXT, tries INTEGER DEFAULT 0, inbox TEXT, error TEXT);
     """)
     ensure_breaker(con)
 
@@ -449,6 +450,10 @@ def settle_gap():
                                   "folders, then resume to send the rest"))
         c.execute("INSERT INTO app_mode(k, v) VALUES ('kill', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                   ("restored from a backup: check Status, then press Start sending " + now[:16],))
+        try:                        # the backup was taken during a run: that run's "running" mark must not block every later run
+            c.execute("UPDATE jobs SET status='failed', finished_at=? WHERE status='running'", (now,))
+        except sqlite3.Error:
+            pass
         c.commit()
         return (f"backup last activity {last[:16]}; {len(ups)} follow-up(s) due since then counted as sent, {len(firsts)} first email(s) held; "
                 "sending stays stopped until you start it")
@@ -599,3 +604,66 @@ def resume_breaker(con, bid, who="owner"):
     con.execute("UPDATE breakers SET resumed_at=?, resumed_by=? WHERE id=?", (_iso(_now()), who, bid))
     con.commit()
     return True
+
+
+# ---------------------------------------------------------------- an email that couldn't be handled
+
+MAX_TRIES = 3
+
+
+def message_failed(cfg, con, sender, key, msg, err):
+    """Record a failed attempt. Returns True while it will be tried again; after MAX_TRIES it is settled the cautious
+    way: if it reads like a stop request the sender is put on do-not-contact anyway, and a person gets a task."""
+    import bot
+    import guard
+    from email.utils import parseaddr
+    con.execute("INSERT INTO msg_pending(key, at, tries, inbox, error) VALUES (?,?,1,?,?) ON CONFLICT(key) DO UPDATE SET "
+                "tries=tries+1, error=excluded.error", (key, _iso(_now()), sender["email"], str(err)[:300]))
+    tries = con.execute("SELECT tries FROM msg_pending WHERE key=?", (key,)).fetchone()[0]
+    if tries < MAX_TRIES:
+        return True
+    con.execute("DELETE FROM msg_pending WHERE key=?", (key,))
+    frm = parseaddr(guard.text(msg.get("From", "")))[1].lower()
+    subj = guard.text(msg.get("Subject", ""))
+    try:
+        body = bot.get_text_body(msg)
+    except Exception:
+        body = ""
+    stop = guard.stop_reason(subj, body) if frm else None
+    if stop and frm:
+        bot.suppress(con, frm, "stop request in an email BSO couldn't fully handle")
+    bot.add_task(con, f"An email from {frm or 'an unknown sender'} in {sender['email']} couldn't be handled after {MAX_TRIES} tries"
+                      f"{' (it reads like a stop request: all email to them is stopped)' if stop else ''}. Please read it: \"{subj[:80]}\"")
+    try:
+        import convo
+        convo.log_inbox(con, sender["email"], msg, f"error after {MAX_TRIES} tries: {err}"[:200], None, "INBOX")
+    except Exception:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------- the last check before an email goes out
+
+def why_not_send(lead_id, statuses=("active",)):
+    """Why this lead must not get an email right now (None = it may). Read fresh from the database, right before the
+    mail server is contacted: a reply, an unsubscribe or a do-not-contact entry that arrived a moment ago counts."""
+    c = sqlite3.connect(str(_data() / "outreach.db"), timeout=30)
+    c.row_factory = sqlite3.Row
+    try:
+        r = c.execute("SELECT email, status FROM leads WHERE id=?", (lead_id,)).fetchone()
+        if not r:
+            return "the lead no longer exists"
+        if r["status"] not in statuses:
+            return f"it is now {r['status'].replace('_', ' ')}"
+        if c.execute("SELECT 1 FROM suppression WHERE email=?", ((r["email"] or "").lower(),)).fetchone():
+            return "the address is on do-not-contact"
+        try:
+            import team
+            if team.joined() and c.execute("SELECT 1 FROM sqlite_master WHERE name='team_dnc'").fetchone() and \
+                    c.execute("SELECT 1 FROM team_dnc WHERE h=?", (team.dnc_hash(r["email"]),)).fetchone():
+                return "the address is on the team's do-not-contact list"
+        except Exception:
+            pass
+        return None
+    finally:
+        c.close()

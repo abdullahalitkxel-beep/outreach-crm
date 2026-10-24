@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 import autopilot
 import bot
+import guard
 from bot import iso, log, now_utc
 
 TEMPLATE_COLUMNS = [
@@ -123,7 +124,7 @@ def _fetch_new(b, con, days=3):
     if b.get("imap_security") == "none":
         M = imaplib.IMAP4(b["imap_host"], port)
     else:
-        M = imaplib.IMAP4_SSL(b["imap_host"], port, ssl_context=ssl.create_default_context())
+        M = imaplib.IMAP4_SSL(b["imap_host"], port, ssl_context=ssl.create_default_context(), timeout=60)
     out = []
     try:
         M.login(b.get("username") or b["email"], b["password"])
@@ -135,7 +136,7 @@ def _fetch_new(b, con, days=3):
             raw = next((x[1] for x in d if isinstance(x, tuple)), None)
             if not raw:
                 continue
-            msg = email.message_from_bytes(raw)
+            msg = guard.parse(raw)
             mid = "intake:" + (msg.get("Message-ID") or f"{b['email']}:{num.decode()}").strip()
             if con.execute("SELECT 1 FROM seen_messages WHERE msg_id=?", (mid,)).fetchone():
                 continue
@@ -509,7 +510,7 @@ def readiness(cfg, con, s, send=True):
     problems = []
     try:
         if s.get("imap_host"):
-            M = imaplib.IMAP4_SSL(s["imap_host"], int(s.get("imap_port") or 993), ssl_context=ssl.create_default_context())
+            M = imaplib.IMAP4_SSL(s["imap_host"], int(s.get("imap_port") or 993), ssl_context=ssl.create_default_context(), timeout=60)
             M.login(s.get("username", s["email"]), s["password"])
             M.logout()
     except Exception as e:
@@ -592,7 +593,7 @@ def collect_seed_results(cfg, con):
         if not x.get("password") or not x["imap_host"]:
             continue
         try:
-            M = imaplib.IMAP4_SSL(x["imap_host"], 993, ssl_context=ssl.create_default_context())
+            M = imaplib.IMAP4_SSL(x["imap_host"], 993, ssl_context=ssl.create_default_context(), timeout=60)
             M.login(x["email"], x["password"])
             folders = {"inbox": ["INBOX"], "spam": ["[Gmail]/Spam", "Junk", "Junk Email", "Spam"]}
             for e, f in found.items():

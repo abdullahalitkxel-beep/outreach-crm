@@ -173,6 +173,12 @@ def main():
 
     import crm
     import team
+    try:
+        n = crm.clear_stale_jobs()             # runs cut off by a crash, power cut or update restart
+        if n:
+            print(f"BSO: closed {n} run(s) left unfinished by the last shutdown")
+    except Exception as e:
+        print("stale runs:", e)
     if team.resume():
         print("BSO Bot: still signed in, carrying on")
     tray_ref = {}

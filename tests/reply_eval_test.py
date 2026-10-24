@@ -51,7 +51,7 @@ for line in (root / "tests" / "data" / "replies.txt").read_text(encoding="utf-8"
     if line.strip() and not line.startswith("#"):
         cls, text = line.split("|", 1)
         rows.append((cls.strip(), text.strip().replace("\\n", "\n")))
-check(len(rows) == 200, f"the test set has 200 replies ({len(rows)})")
+check(len(rows) >= 219, f"the test set has {len(rows)} replies (200 first, then the wording the audits found missing)")
 
 FOOTER = '--\nCole Reed · NeoSOFT, Raleigh NC\nNot relevant? Reply "unsubscribe" and I won\'t email again.'
 OUR = "Hi Dana,\n\nQuick question about your engineering plans for next year.\n\n" + FOOTER
@@ -60,6 +60,7 @@ QUOTES = {
     "outlook": lambda t: f"{t}\n\n________________________________\nFrom: Cole Reed <cole@neosoft-mail.com>\nSent: Monday, October 19, 2026 9:02 AM\n"
                          f"To: Dana Smith <dana@acme.com>\nSubject: Quick question\n\n{OUR}",
     "outlook-old": lambda t: f"{t}\n\n-----Original Message-----\nFrom: Cole Reed\nSent: 19 October 2026 09:02\n\n{OUR}",
+    "below the quote": lambda t: "On Mon, 19 Oct 2026 at 09:02, Cole Reed <cole@neosoft-mail.com> wrote:\n" + "\n".join("> " + x for x in OUR.splitlines()) + f"\n\n{t}",
     "mobile": lambda t: f"{t}\n\nSent from my iPhone\n\n{OUR}",
 }
 STOPS = ("stop", "legal")

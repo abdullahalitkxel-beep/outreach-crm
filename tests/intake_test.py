@@ -176,7 +176,7 @@ con.execute("UPDATE campaigns SET info_mode='template', info_text=? WHERE id=1",
             ("Hi {first_name},\n\nHappy to. In short: we provide senior engineers on a monthly basis. Shall I send two short case studies?\n\n{sender_name}",))
 con.commit()
 replies = []
-bot.send_email = lambda s, to, subj, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None: replies.append((to, subj, body, in_reply_to)) or "<r@x>"
+bot.send_email = lambda s, to, subj, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None, statuses=None: replies.append((to, subj, body, in_reply_to)) or "<r@x>"
 q = EmailMessage()
 q["From"], q["Subject"], q["Message-ID"] = "jane@acme.co.uk", "Re: Development partner for Acme?", "<q1@acme>"
 q.set_content("Could you send me some more information about what you do?")

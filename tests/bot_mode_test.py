@@ -37,7 +37,7 @@ cfg["lead_intake"] = {"enabled": True, "inbox": "cole.reed@getneosofttech.com", 
                       "add_to_sequence": True, "verified_only": True}
 sender = {"email": "cole.reed@getneosofttech.com", "name": "Cole Reed"}
 sent = []
-bot.send_email = lambda s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None: sent.append(dict(to=to, subject=subject, body=body)) or "<x>"
+bot.send_email = lambda s, to, subject, body, in_reply_to=None, dry_run=False, cc=None, headers=None, key=None, lead_id=None, statuses=None: sent.append(dict(to=to, subject=subject, body=body)) or "<x>"
 bot.notify = lambda *a, **k: None
 
 def mail(frm, files=(), verified=True, to="cole.reed@getneosofttech.com", subject="New leads"):

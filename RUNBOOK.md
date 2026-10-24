@@ -2,11 +2,16 @@
 
 What happens on its own, what you do, and in what order. Keep a printed copy with the spare laptop.
 
+> **Known gaps until the next release** (from the October 2026 audit):
+> - With the Google relay, **revoking a laptop in Devices doesn't stop it**. Before signing in on the spare, use **Users → BSO Bot → Disconnect laptops** (or reset the bot's password) so the old laptop can't come back and send too.
+> - **Restore** needs the owner signed in on the bot laptop; the BSO Bot account itself can't restore yet.
+> - A spare laptop has no send journal from the dead one: leads that were already overdue at backup time could get one repeated email. Check the Sent folders of the busiest inboxes before pressing Start sending.
+
 ## What happens on its own
 
 - **Sending stops.** Nothing goes out while the bot is down. That's the safe way to fail.
 - **Replies wait in the inboxes.** They're on Google's or SiteGround's servers, not on the laptop, so none are lost. That includes stop requests and unsubscribe-link clicks.
-- **You're alerted.** The Master Console emails you when the bot hasn't checked in for 2 hours.
+- **You're alerted.** The Master Console emails you when the bot hasn't checked in for 2 hours, and also when it is online but has sent nothing for 3 working hours while leads are due (a stuck run, everything paused). These alerts need the Master Console running and its email set up.
 - **Unsubscribe links keep working.** Your Google relay records the clicks while the bot is down. The bot applies them when it's back, before it sends anything.
 
 ## The first hour: is it really dead?
@@ -41,7 +46,7 @@ You need:
    - **Follow-ups due since the backup:** counted as sent, so nobody gets the same follow-up twice. A few people may miss one follow-up.
    - **First emails due since the backup:** held, and listed under **Paused by the safety breaker → After a restore**. Look at those inboxes' Sent folders. If you're unsure, leave them held. Otherwise press **Resume** to send them.
    - **Sending:** stays stopped until you press **Start sending**.
-6. **Start sending.** BSO first reads every inbox, then any unsubscribe-link clicks waiting in the relay, and only then sends.
+6. **Start sending.** BSO first reads every inbox (from before the outage, however long it lasted), then any unsubscribe-link clicks waiting in the relay, and waits for the team's do-not-contact list from the Master Console. Only then does it send.
 7. **Set the backup folder again** on the new laptop: BSO Bot page → **Backups** → **Save folder**.
 
 ## If there is no off-laptop backup

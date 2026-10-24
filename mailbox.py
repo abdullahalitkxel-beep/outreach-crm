@@ -12,6 +12,7 @@ from email import message_from_bytes
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 
 import bot
+import guard
 from bot import env, get_text_body, iso, log, log_event, now_utc
 
 PW_KEY = "PROSPECT_MAILBOX_PASSWORD"
@@ -228,7 +229,7 @@ def outside(cfg, con, lead_id, lead_email, me, addrs):
 
 
 def store(con, raw, people, me, folder="", cfg=None):
-    msg = message_from_bytes(raw)
+    msg = guard.parse(raw)
     hit = match(msg, people, me)
     if not hit:
         return None

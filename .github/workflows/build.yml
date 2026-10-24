@@ -125,6 +125,9 @@ jobs:
       - name: Test sending safety (no double sends after a crash, replies first, breaker, backups that restore)
         run: python tests/safety_test.py
 
+      - name: Test stop requests are always honoured (mid-run stops, test mode, lost replies, team list, stuck runs)
+        run: python tests/stop_test.py
+
       - name: Test from source
         run: python tests/smoke_test.py app.py
 
