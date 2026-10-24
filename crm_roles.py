@@ -74,7 +74,7 @@ def settings_tabs():
 def nav(default_nav):
     m = mode()
     if m == "full":
-        return default_nav + []
+        return default_nav + ([("botroom", "BSO Bot", None)] if is_owner() else [])
     extra = {ep: n for ep, _, n in default_nav}
     if m == "bot":
         return [(ep, label, extra.get(ep)) for ep, label in BOT_NAV]
@@ -399,7 +399,9 @@ def ctx():
     """Extra values every page needs (update banner, owner's view, inboxes shared with the bot)."""
     senders = [x["email"].lower() for x in (crm.cfg().get("senders") or []) if x.get("email") and "example" not in x["email"]]
     shared = sorted(set(senders) & bot_inboxes()) if team.joined() and not team.is_bot() else []
+    r = role()
     out = {"role_mode": mode(), "settings_tabs": settings_tabs(), "is_owner": is_owner(), "view_as": view_as() if is_owner() else None,
+           "role_label": {"owner": "Owner", "bot": "BSO Bot", "supervisor": "Supervisor", "manager": "Manager", "member": "Supervisor"}.get(r, ""),
            "shared_inboxes": shared, "cold_here": len(senders) if mode() == "workspace" and not is_owner() else 0}
     try:
         import updater

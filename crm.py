@@ -266,8 +266,8 @@ def render(name, **ctx):
     active = {"lead": "leads", "new_lead": "leads", "import_page": "leads", "account": "accounts",
               "opp": "opportunities", "job": "setup", "jobs": "setup"}.get(request.endpoint, request.endpoint)
     import crm_roles
+    nav = crm_roles.nav(nav)                           # full mode: the owner also gets a BSO Bot link
     if crm_roles.mode() != "full":
-        nav = crm_roles.nav(nav)
         active = crm_roles.active_for(request.endpoint)
         if crm_roles.mode() == "bot" and request.endpoint in ("job", "jobs"):
             active = "bot_activity"

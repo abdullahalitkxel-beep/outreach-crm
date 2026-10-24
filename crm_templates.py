@@ -36,6 +36,11 @@ h1,h2,h3{margin:0;font-weight:700}
 .menu a,.menu button{display:block;width:100%;padding:9px 14px;color:var(--ink);background:none;border:0;font:inherit;text-align:left;cursor:pointer}
 .menu a:hover,.menu button:hover{background:var(--bg);text-decoration:none}
 .open .menu{display:block}
+.userchip{position:relative;display:flex;align-items:center;gap:6px;height:32px;padding:0 10px 0 4px;border:1px solid var(--line);border-radius:16px;background:#fff;cursor:pointer;font-size:13px;white-space:nowrap}
+.userchip .av{width:24px;height:24px;border-radius:50%;background:var(--brand);color:#fff;display:grid;place-items:center;font-weight:700;font-size:12px}
+.userchip .un{font-weight:600;max-width:160px;overflow:hidden;text-overflow:ellipsis}
+.userchip .rl{color:var(--muted)}
+@media (max-width:700px){.userchip .un,.userchip .rl{display:none}}
 /* app nav */
 .nav{display:flex;align-items:stretch;background:#fff;border-bottom:3px solid var(--brand);box-shadow:var(--sh);padding:0 12px;overflow-x:auto;white-space:nowrap}
 .nav .app{display:flex;align-items:center;gap:8px;font-size:18px;font-weight:400;padding-right:18px;margin-right:6px;border-right:1px solid var(--line2)}
@@ -183,6 +188,14 @@ details.variant{border-top:1px solid var(--line2);padding:8px 0}details.variant 
   <input name="q" placeholder="Search leads, prospects, emails, comments, campaigns…" value="{{ request.args.get('q','') if request.endpoint=='search' else '' }}">
  </form>{% else %}<div style="flex:1"></div>{% endif %}
  <div class="tools">
+  {% if team_user %}<div class="userchip" id="userchip" title="Who is signed in" onclick="this.classList.toggle('open')">
+   <span class="av">{{ (team_name or team_user)[:1]|upper }}</span><span class="un">{{ team_name or team_user }}</span>{% if role_label %}<span class="rl">{{ role_label }}{% if is_owner and view_as != 'full' %} · acting as {{ 'BSO Bot' if view_as == 'bot' else 'Supervisor' }}{% endif %}</span>{% endif %} ▾
+   <div class="menu" onclick="event.stopPropagation()">
+    <div class="muted" style="padding:8px 14px">Signed in as <b>{{ team_name or team_user }}</b>{{ ' (' ~ team_user ~ ')' if team_name and team_name != team_user }}</div>
+    {% if is_owner %}<form method="post" action="{{ url_for('view_as_set') }}"><div class="muted" style="padding:4px 14px">Act as (that role's layout and work, with full access)</div>{% for v, l in [('full','Owner: everything'),('bot','BSO Bot'),('workspace','Supervisor')] %}<button name="view" value="{{ v }}" style="{{ 'font-weight:700' if view_as == v }}">{{ '✓ ' if view_as == v else '' }}{{ l }}</button>{% endfor %}</form>{% endif %}
+    <form method="post" action="{{ url_for('signout') }}"><button>Sign out</button></form>
+   </div>
+  </div>{% endif %}
   <div class="iconbtn" id="helpbtn" title="Help" onclick="this.classList.toggle('open')">?
    <div class="menu">
     <button onclick="startTour(true)">Take the guided tour</button>
@@ -355,7 +368,8 @@ MACROS = r"""
 """
 
 HOME = r"""{% extends 'base.html' %}{% import 'macros.html' as m %}{% block title %}Home{% endblock %}{% block body %}
-{% call m.header('t-home', '⌂', 'Home', 'Good to see you') %}
+{% call m.header('t-home', '⌂', ('Home · ' ~ (team_name or team_user) ~ (' · ' ~ role_label if role_label else '')) if team_user else 'Home',
+                  ('Good to see you, ' ~ (team_name or team_user).split(' ')[0].split('@')[0].split('.')[0]|capitalize) if team_user else 'Good to see you') %}
  <a class="btn" href="{{ url_for('setup') }}">Getting started ({{ setup_done }}/{{ setup_total }})</a>
  <form method="post" action="{{ url_for('job_start') }}" style="display:inline"><input type="hidden" name="cmd" value="run"><button class="btn brand">▶ Run bot now</button></form>
 {% endcall %}

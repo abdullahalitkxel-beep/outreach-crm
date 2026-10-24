@@ -218,5 +218,8 @@ sups = [x["email"] for x in hub.supervisor_config(hc)["supervisors"]]
 check("omar@blacswanken.com" in sups, "the console hands prospects to the owner while acting as a supervisor")
 w.post("/view-as", data={"view": "full"})
 check(team.acting_as() == "owner", "back to Owner")
+page = txt(w.get("/"))
+check('id="userchip"' in page and "Good to see you, " in page and 'id="nav-botroom"' in page,
+      "Home greets the signed-in person by name, a user chip shows who is signed in, and the owner has a BSO Bot link")
 print(f"\nAll {n} console and layout checks passed.")
 os._exit(0)
